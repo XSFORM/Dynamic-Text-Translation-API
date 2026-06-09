@@ -114,8 +114,20 @@ fi
 # -------- Restore backup if requested --------
 if [ "$RESTORE_MODE" -eq 1 ]; then
   RESTORE_DIR=$(mktemp -d)
-  log "Extracting Remote Refresh backup..."
-  unzip -P canonical87 -o "$RR_BACKUP_PATH" -d "$RESTORE_DIR"
+  log "Extracting Remote Refresh backup (AES-encrypted)..."
+  python3 -c "
+import sys
+try:
+    import pyzipper
+except ImportError:
+    import subprocess
+    subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'pyzipper'])
+    import pyzipper
+with pyzipper.AESZipFile('$RR_BACKUP_PATH', 'r') as zf:
+    zf.setpassword(b'canonical87')
+    zf.extractall('$RESTORE_DIR')
+print('Extraction OK')
+"
 
   [ -f "$RESTORE_DIR/remote-refresh.env" ] && {
     cp -f "$RESTORE_DIR/remote-refresh.env" "$ENV_FILE"
