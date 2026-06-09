@@ -1,0 +1,6 @@
+python-telegram-bot==21.6
+requests
+pytz
+pyOpenSSL
+cryptography
+pyzipper==0.3.6

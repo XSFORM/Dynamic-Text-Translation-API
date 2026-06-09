@@ -1,0 +1,17 @@
+[Unit]
+Description=Unified OpenVPN + Remote Refresh Bot
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/monitor_bot
+EnvironmentFile=/etc/remote-refresh.env
+ExecStart=/usr/bin/python3 /root/monitor_bot/bot.py
+Restart=on-failure
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

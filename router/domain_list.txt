@@ -1,0 +1,14 @@
+# domain_list.txt
+# One domain per line. Lines starting with '#' are ignored.
+# This file is served at http://<domain>/router/domain_list.txt
+# and cached locally on each router at /etc/storage/remote_domains.list.
+# The companion file domain_list.txt.sha256 must be kept in sync
+# (generated automatically by the bot after each edit).
+#
+# Format: plain hostname, no protocol, no path, no port.
+# Example:
+#   example-a.com
+#   example-b.com
+
+example-a.com
+example-b.com
