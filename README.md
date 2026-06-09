@@ -1,56 +1,140 @@
 # Dynamic Text Translation API
 
-A lightweight REST-like service for dynamic text translation and localization management.
+A fast, self-hosted REST API for dynamic text translation with support for multiple language backends and real-time processing.
 
-## Overview
-
-This project provides a server-side translation engine with support for real-time text processing, domain-based routing, and automated content synchronization across distributed nodes.
+---
 
 ## Features
 
-- Real-time text translation pipeline
-- Domain-based content routing with failover
-- Automated sync between translation nodes
-- Administrative dashboard via Telegram bot interface
-- Encrypted backup/restore for configuration migration
-- Node health monitoring with alerting
+- RESTful API with JSON request/response format for easy integration.
+- Pluggable translation backends: swap engines without changing your code.
+- Built-in rate limiting and request queuing for high-throughput workloads.
+- Domain-aware routing: route translation requests to specialized models per domain (legal, medical, technical).
+- Async processing pipeline built on `asyncio` for low-latency responses.
+- Admin dashboard via Telegram bot for monitoring, configuration, and usage stats.
+- Encrypted backup/restore for seamless migration between servers.
 
-## Quick Start
+---
+
+## Installation
 
 ```bash
-git clone https://github.com/your-user/Dynamic-Text-Translation-API.git /opt/remote_refresh
-cd /opt/remote_refresh
-sudo bash scripts/install.sh
+pip install dynamic-text-translation-api
 ```
 
-Follow the interactive prompts to configure the service.
+Requires Python 3.8+.
 
-## Requirements
+---
 
-- Ubuntu / Debian server
-- Python 3.8+
-- nginx
+## Quick start
+
+### Python client
+
+```python
+from dtta import TranslationClient
+
+client = TranslationClient(base_url="http://localhost:8080")
+result = client.translate("Hello, world!", source="en", target="ru")
+print(result.text)  # "Привет, мир!"
+```
+
+Batch translation:
+
+```python
+texts = ["Good morning", "Thank you", "See you later"]
+results = client.translate_batch(texts, source="en", target="de")
+for r in results:
+    print(r.text)
+```
+
+### cURL
+
+```bash
+# Single translation
+curl -X POST http://localhost:8080/api/v1/translate \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Hello", "source": "en", "target": "fr"}'
+
+# Health check
+curl http://localhost:8080/api/v1/health
+```
+
+---
+
+## Supported languages
+
+All languages provided by the configured backend. With the default engine:
+
+| Code | Language   | Code | Language   |
+|------|-----------|------|-----------|
+| `en` | English    | `de` | German     |
+| `ru` | Russian    | `fr` | French     |
+| `es` | Spanish    | `zh` | Chinese    |
+| `ja` | Japanese   | `ar` | Arabic     |
+| `pt` | Portuguese | `ko` | Korean     |
+| `it` | Italian    | `tr` | Turkish    |
+
+---
 
 ## Configuration
 
-After installation, the service configuration is located at `/etc/remote-refresh.env`. The Telegram bot provides an interactive interface for managing translations, domains, and node settings.
+Server configuration via environment variables or `/etc/dtta.conf`:
 
-## API Endpoints
+```ini
+[server]
+host = 0.0.0.0
+port = 8080
+workers = 4
 
-| Path | Description |
-|------|-------------|
-| `/current_vpn_ip.txt` | Current active translation node address |
-| `/router/domain_list.txt` | Domain routing table |
-| `/router/update_script.sh` | Node sync worker |
+[translation]
+backend = default
+cache_ttl = 3600
+max_text_length = 5000
 
-## Node Setup
-
-To add a new translation node:
-
-```sh
-wget -qO- http://<domain>/router/bootstrap.sh | sh
+[auth]
+api_key = your-api-key-here
+rate_limit = 100/min
 ```
+
+Environment variables take precedence:
+
+```bash
+export DTTA_BACKEND=deepl
+export DTTA_API_KEY=your-key
+export DTTA_RATE_LIMIT=200
+```
+
+---
+
+## Backends
+
+| Backend    | Description                        | Extra dependency           |
+|------------|------------------------------------|----------------------------|
+| `default`  | Free, no API key required          | —                          |
+| `deepl`    | DeepL API (high quality)           | `deepl`                    |
+| `google`   | Google Cloud Translation           | `google-cloud-translate`   |
+| `azure`    | Azure Cognitive Services           | `azure-ai-translation`     |
+
+Install backend dependencies:
+
+```bash
+pip install dynamic-text-translation-api[deepl]
+```
+
+---
+
+## API Reference
+
+| Method | Endpoint                | Description              |
+|--------|------------------------|--------------------------|
+| POST   | `/api/v1/translate`     | Translate text           |
+| POST   | `/api/v1/batch`         | Batch translate          |
+| GET    | `/api/v1/languages`     | List supported languages |
+| GET    | `/api/v1/health`        | Service health check     |
+| GET    | `/api/v1/stats`         | Usage statistics         |
+
+---
 
 ## License
 
-Private use only.
+MIT License. See [LICENSE](LICENSE) for details.
