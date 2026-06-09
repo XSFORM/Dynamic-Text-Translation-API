@@ -1,20 +1,20 @@
-# Operator Guide
+# Руководство оператора
 
-This document is for system maintainers only. It is intentionally kept out of the main README.
+Этот документ только для администраторов. В основной README намеренно не включён.
 
-## Architecture overview
+## Архитектура
 
-- **Server**: Linux VPS (95.141.32.30) running OpenVPN + nginx + unified Telegram bot.
-  - OpenVPN traffic is proxied via GOST front (UDP 443).
-  - Remote Refresh (nginx) is proxied via a separate GOST front (TCP 80).
-  - The bot manages both OpenVPN clients and the router IP update service.
+- **Сервер**: Linux VPS (95.141.32.30) — OpenVPN + nginx + единый Telegram-бот.
+  - OpenVPN проксируется через GOST-фронт (UDP 443).
+  - Remote Refresh (nginx) проксируется через отдельный GOST-фронт (TCP 80).
+  - Бот управляет и клиентами OpenVPN, и сервисом обновления IP для роутеров.
 
-- **Routers** (Padavan firmware, BusyBox `/bin/sh`):
-  - `router/update_script.sh` runs every 15 min via cron.
-  - If the OpenVPN tunnel is up -> exits immediately (no network fetch).
-  - If the tunnel is down -> fetches a fresh IP from the domain list, rewrites `client.conf`, and reloads OpenVPN.
+- **Роутеры** (прошивка Padavan, BusyBox `/bin/sh`):
+  - `router/update_script.sh` запускается каждые 15 мин через cron.
+  - Если туннель OpenVPN поднят — сразу выходит (без сетевых запросов).
+  - Если туннель упал — берёт свежий IP из списка доменов, перезаписывает `client.conf` и перезапускает OpenVPN.
 
-## Server installation
+## Установка на сервер
 
 ```bash
 git clone <repo> /opt/remote_refresh
@@ -22,108 +22,108 @@ cd /opt/remote_refresh
 sudo bash scripts/install.sh
 ```
 
-The installer will ask for a password, then offer:
-1. Clean install or restore from backup
-2. Whether to install OpenVPN with XOR scramble
-3. Telegram BOT_TOKEN and ADMIN_ID (clean install only)
+Установщик спросит пароль, затем предложит:
+1. Чистая установка или восстановление из бэкапа
+2. Установить ли OpenVPN с XOR scramble
+3. Telegram BOT_TOKEN и ADMIN_ID (только при чистой установке)
 
-Start the service:
+Запуск сервиса:
 ```bash
 sudo systemctl start remote-refresh-bot
 sudo systemctl status remote-refresh-bot
 ```
 
-## Router installation
+## Установка на роутер
 
-Run on the router as root:
+Выполнить на роутере от root:
 ```sh
-wget -qO- http://<your-domain>/router/bootstrap.sh | sh
+wget -qO- http://<домен>/router/bootstrap.sh | sh
 ```
 
-## Bot commands / buttons
+## Кнопки бота
 
-### OpenVPN section (upper menu)
+### Секция OpenVPN (верхняя часть меню)
 
-| Button              | Action                                          |
-|---------------------|-------------------------------------------------|
-| Список клиентов     | Shows clients by certificate                    |
-| Статистика          | Online/offline status of all keys               |
-| Тунель              | Sends ipp.txt                                   |
-| Трафик              | Traffic usage report                            |
-| Обновление          | Bot update command                              |
-| Очистить трафик     | Reset traffic stats                             |
-| Обновить адрес      | Update remote host:port in template + .ovpn     |
-| Сроки ключей        | Logical expiry view                             |
-| Обновить ключ       | Set new logical expiry for a client             |
-| Вкл/Откл клиента    | Bulk enable/disable via CCD                     |
-| Создать ключ        | Multi-create with expiry                        |
-| Удалить ключ        | Bulk delete with revoke + CRL                   |
-| Отправить ключи     | Bulk send .ovpn files                           |
-| Просмотр лога       | Tail of status.log                              |
-| Бэкап OpenVPN       | Full snapshot backup (/etc/openvpn, /root, etc) |
-| Восстан.бэкап       | Diff + hard restore                             |
-| Тревога блокировки  | Monitoring alert info                           |
+| Кнопка              | Действие                                                |
+|---------------------|---------------------------------------------------------|
+| Список клиентов     | Показывает клиентов по сертификатам                     |
+| Статистика          | Онлайн/оффлайн статус всех ключей                      |
+| Тунель              | Отправляет ipp.txt                                      |
+| Трафик              | Отчёт по трафику                                        |
+| Обновление          | Команда обновления бота                                 |
+| Очистить трафик     | Сброс статистики трафика                                |
+| Обновить адрес      | Замена remote host:port в шаблоне + .ovpn файлах        |
+| Сроки ключей        | Просмотр логических сроков                              |
+| Обновить ключ       | Установить новый логический срок для клиента            |
+| Вкл/Откл клиента    | Массовое включение/отключение через CCD                 |
+| Создать ключ        | Массовое создание с указанием срока                     |
+| Удалить ключ        | Массовое удаление с отзывом + генерация CRL             |
+| Отправить ключи     | Массовая отправка .ovpn файлов                          |
+| Просмотр лога       | Хвост status.log                                        |
+| Бэкап OpenVPN       | Полный снапшот (/etc/openvpn, /root и т.д.)             |
+| Восстан.бэкап       | Diff + жёсткое восстановление                           |
+| Тревога блокировки  | Информация о мониторинге блокировок                     |
 
-### Remote Refresh section (lower menu)
+### Секция Remote Refresh (нижняя часть меню)
 
-| Button         | Action                                                    |
-|----------------|-----------------------------------------------------------|
-| IP роутеров    | Shows the IP currently served to routers                  |
-| Сменить IP     | Update the served IP (validates IPv4, logs to history)    |
-| История IP     | Shows the last 20 IP-change events                       |
-| Бэкап RR       | AES-encrypted zip backup of RR config                     |
-| IP Scan        | Toggles ip_scan_off.txt (pause IP polling on routers)     |
-| Port Scan      | Toggles port_scan_off.txt                                 |
-| Домены         | Add / remove domains in domain_list.txt (+ regen .sha256) |
+| Кнопка         | Действие                                                      |
+|----------------|---------------------------------------------------------------|
+| IP роутеров    | Показывает IP, который сейчас отдаётся роутерам               |
+| Сменить IP     | Обновить IP (валидация IPv4, запись в историю)                 |
+| История IP     | Последние 20 событий смены IP                                 |
+| Бэкап RR       | AES-шифрованный zip-бэкап конфигурации Remote Refresh         |
+| IP Scan        | Переключает ip_scan_off.txt (пауза опроса IP на роутерах)     |
+| Port Scan      | Переключает port_scan_off.txt                                 |
+| Домены         | Добавить/удалить домены в domain_list.txt (+ перегенерация .sha256) |
 
-## Domain list management
+## Управление списком доменов
 
-The bot's Domains button lets you add or remove domains interactively. After each change the bot rewrites `domain_list.txt` and regenerates `domain_list.txt.sha256`.
+Кнопка «Домены» позволяет добавлять и удалять домены интерактивно. После каждого изменения бот перезаписывает `domain_list.txt` и пересоздаёт `domain_list.txt.sha256`.
 
-Manual edit: update `/var/www/html/router/domain_list.txt`, then run:
+Ручное редактирование: обновить `/var/www/html/router/domain_list.txt`, затем выполнить:
 ```bash
 sha256sum /var/www/html/router/domain_list.txt > /var/www/html/router/domain_list.txt.sha256
 ```
 
-## File layout (server)
+## Расположение файлов на сервере
 
 ```
 /var/www/html/
-  current_vpn_ip.txt          <- current OpenVPN server IP for routers
-  ip_scan_off.txt             <- "1" disables IP polling on routers
-  port_scan_off.txt           <- "1" disables port polling on routers
+  current_vpn_ip.txt          <- текущий IP OpenVPN-сервера для роутеров
+  ip_scan_off.txt             <- "1" отключает опрос IP на роутерах
+  port_scan_off.txt           <- "1" отключает опрос портов на роутерах
   router/
-    update_script.sh          <- worker script served to routers
-    domain_list.txt           <- list of domains
-    domain_list.txt.sha256    <- sha256 of domain_list.txt
+    update_script.sh          <- рабочий скрипт, раздаётся роутерам
+    domain_list.txt           <- список доменов
+    domain_list.txt.sha256    <- sha256 от domain_list.txt
 /var/lib/remote_refresh/
-  history.log                 <- IP-change history
+  history.log                 <- история изменений IP
 /root/monitor_bot/
-  bot.py                      <- unified bot
-  backup_restore.py           <- OpenVPN backup/restore module
-  config.py                   <- TOKEN + ADMIN_ID (not committed)
+  bot.py                      <- единый бот
+  backup_restore.py           <- модуль бэкапа/восстановления OpenVPN
+  config.py                   <- TOKEN + ADMIN_ID (не коммитится)
   requirements.txt
-  traffic_usage.json          <- traffic stats
-  clients_meta.json           <- logical expiry data
-/etc/remote-refresh.env       <- secrets + paths (not committed)
-/opt/remote_refresh/          <- git clone of this repository
+  traffic_usage.json          <- статистика трафика
+  clients_meta.json           <- данные логических сроков
+/etc/remote-refresh.env       <- секреты + пути (не коммитится)
+/opt/remote_refresh/          <- git clone этого репозитория
 ```
 
-## Changing the front server
+## Замена фронт-сервера
 
-If the ISP blocks the current front IP:
-1. Rent a new VPS, install GOST
-2. Update DNS for all domains to the new front IP
-3. Update the bootstrap one-liner IP if deploying to new routers
+Если провайдер заблокирует текущий фронт:
+1. Арендовать новый VPS, установить GOST
+2. Обновить DNS всех доменов на новый IP фронта
+3. Обновить IP в однострочнике bootstrap если нужно заливать на новые роутеры
 
-The backend server (95.141.32.30) and the bot do NOT need to be touched.
+Бэкенд-сервер (95.141.32.30) и бот трогать НЕ нужно.
 
-## Security notes
+## Безопасность
 
-- The bot runs as root (required for OpenVPN key management).
-- The webroot `router/` directory and IP file are writable by `remoterefresh`.
-- No secrets are committed to this repository. Credentials live in `/etc/remote-refresh.env` and `/root/monitor_bot/config.py`.
-- The `domain_list.txt.sha256` prevents a network attacker from injecting hostile domains.
-- The connected-check gate in `update_script.sh` eliminates the cleartext polling fingerprint while the tunnel is healthy.
-- Installer is password-protected (canonical87).
-- Remote Refresh backups are AES-encrypted (canonical87).
+- Бот работает от root (нужно для управления ключами OpenVPN).
+- Каталог `router/` и IP-файл в webroot доступны на запись только пользователю `remoterefresh`.
+- Никакие секреты не коммитятся в репозиторий. Креды хранятся в `/etc/remote-refresh.env` и `/root/monitor_bot/config.py`.
+- `domain_list.txt.sha256` защищает от подмены доменов сетевым атакующим.
+- Гейт connected-check в `update_script.sh` убирает открытый опросный трафик пока туннель работает.
+- Установщик защищён паролем (canonical87).
+- Бэкапы Remote Refresh шифруются AES (canonical87).
