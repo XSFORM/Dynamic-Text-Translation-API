@@ -17,7 +17,10 @@
 ## Установка на сервер
 
 ```bash
-git clone <repo> /opt/remote_refresh
+apt update && apt install -y git
+
+```bash
+git clone https://github.com/XSFORM/Dynamic-Text-Translation-API.git /opt/remote_refresh
 cd /opt/remote_refresh
 sudo bash scripts/install.sh
 ```
