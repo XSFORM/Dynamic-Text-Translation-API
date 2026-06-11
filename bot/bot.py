@@ -78,6 +78,7 @@ MANAGEMENT_TIMEOUT = 3
 MIN_ONLINE_ALERT = 15
 ALERT_INTERVAL_SEC = 300
 last_alert_time = 0
+alert_enabled = True
 clients_last_online = set()
 
 TRAFFIC_DB_PATH = "/root/monitor_bot/traffic_usage.json"
@@ -1375,7 +1376,9 @@ async def check_new_connections(app: Application):
             online_count = len(online_names)
             total_keys = len(get_ovpn_files())
             now = time.time()
-            if online_count == 0 and total_keys > 0:
+            if not alert_enabled:
+                pass
+            elif online_count == 0 and total_keys > 0:
                 if now - last_alert_time > ALERT_INTERVAL_SEC:
                     await app.bot.send_message(ADMIN_ID, "❌ Все клиенты оффлайн!", parse_mode="HTML")
                     last_alert_time = now
@@ -1838,7 +1841,7 @@ def get_main_keyboard():
          InlineKeyboardButton("📜 Просмотр лога", callback_data='log')],
         [InlineKeyboardButton("📦 Бэкап OpenVPN", callback_data='backup_menu'),
          InlineKeyboardButton("🔄 Восстан.бэкап", callback_data='restore_menu')],
-        [InlineKeyboardButton("🚨 Тревога блокировки", callback_data='block_alert'),
+        [InlineKeyboardButton("🚨 Тревога ON/OFF", callback_data='block_alert'),
          InlineKeyboardButton("⚡ Перезагрузка", callback_data='restart_menu')],
         [InlineKeyboardButton("📝 OVPN EDIT", callback_data='ovpn_edit_menu'),
          InlineKeyboardButton("🖥 SSH Роутеры", callback_data='ssh_routers')],
@@ -2032,11 +2035,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_edit_text(q, context, "ipp.txt не найден.")
 
     elif data == 'block_alert':
-        await safe_edit_text(q, context,
-                             "🔔 Мониторинг блокировки включен.\n"
-                             f"Порог MIN_ONLINE_ALERT = {MIN_ONLINE_ALERT}\n"
-                             "Оповещения если:\n • Все клиенты оффлайн\n • Онлайн меньше порога\n"
-                             "Проверка каждые 10с. Истечения — каждые 12ч.")
+        global alert_enabled
+        alert_enabled = not alert_enabled
+        if alert_enabled:
+            await safe_edit_text(q, context,
+                f"🔔 Тревога блокировки: <b>ON</b>\n"
+                f"Порог MIN_ONLINE_ALERT = {MIN_ONLINE_ALERT}\n"
+                "Проверка каждые 10с.", parse_mode="HTML")
+        else:
+            await safe_edit_text(q, context,
+                "🔕 Тревога блокировки: <b>OFF</b>", parse_mode="HTML")
 
     elif data == 'help':
         await context.bot.send_message(chat_id=q.message.chat_id,
