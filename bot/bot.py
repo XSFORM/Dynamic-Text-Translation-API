@@ -114,6 +114,14 @@ RR_ENV_FILE = "/etc/remote-refresh.env"
 RR_BACKUP_PASSWORD = b"canonical87"
 
 # =====================================================================
+#  OVPN EDIT — file paths
+# =====================================================================
+OVPN_EDIT_FILES = {
+    "server_conf": "/etc/openvpn/server.conf",
+    "client_template": "/etc/openvpn/client-template.txt",
+}
+
+# =====================================================================
 #  NATURAL SORT
 # =====================================================================
 _nat_num_re = re.compile(r'(\d+)')
@@ -1871,6 +1879,25 @@ async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_T
         await create_key_handler(update, context); return
     if context.user_data.get('await_remote_input'):
         await process_remote_input(update, context); return
+    # OVPN EDIT text input
+    if context.user_data.get('await_ovpn_edit'):
+        file_key = context.user_data.pop('await_ovpn_edit')
+        path = OVPN_EDIT_FILES.get(file_key)
+        if path:
+            new_content = update.message.text
+            try:
+                # Save backup copy
+                if os.path.exists(path):
+                    shutil.copy2(path, path + ".bak")
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(new_content)
+                fname = os.path.basename(path)
+                await update.message.reply_text(
+                    f"\u2705 {fname} обновлён.\nБэкап сохранён в {fname}.bak\n"
+                    "Перезагрузка сервисов НЕ выполнена.")
+            except Exception as exc:
+                await update.message.reply_text(f"\u274c Ошибка записи: {exc}")
+        return
     # Remote Refresh text inputs
     if context.user_data.get('await_rr_ip'):
         await rr_set_ip_receive(update, context); return
