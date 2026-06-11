@@ -1840,6 +1840,7 @@ def get_main_keyboard():
          InlineKeyboardButton("🔄 Восстан.бэкап", callback_data='restore_menu')],
         [InlineKeyboardButton("🚨 Тревога блокировки", callback_data='block_alert'),
          InlineKeyboardButton("⚡ Перезагрузка", callback_data='restart_menu')],
+        [InlineKeyboardButton("📝 OVPN EDIT", callback_data='ovpn_edit_menu')],
         # --- Remote Refresh section ---
         [InlineKeyboardButton("─── Remote Refresh ───", callback_data='noop')],
         [InlineKeyboardButton("📡 IP роутеров", callback_data='rr_current_ip'),
