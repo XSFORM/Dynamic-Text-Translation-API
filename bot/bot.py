@@ -1831,7 +1831,7 @@ def get_main_keyboard():
         [InlineKeyboardButton("📦 Бэкап OpenVPN", callback_data='backup_menu'),
          InlineKeyboardButton("🔄 Восстан.бэкап", callback_data='restore_menu')],
         [InlineKeyboardButton("🚨 Тревога блокировки", callback_data='block_alert'),
-         InlineKeyboardButton("🔄 Перезагрузка", callback_data='restart_menu')],
+         InlineKeyboardButton("⚡ Перезагрузка", callback_data='restart_menu')],
         # --- Remote Refresh section ---
         [InlineKeyboardButton("─── Remote Refresh ───", callback_data='noop')],
         [InlineKeyboardButton("📡 IP роутеров", callback_data='rr_current_ip'),
