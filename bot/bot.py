@@ -1830,7 +1830,8 @@ def get_main_keyboard():
          InlineKeyboardButton("📜 Просмотр лога", callback_data='log')],
         [InlineKeyboardButton("📦 Бэкап OpenVPN", callback_data='backup_menu'),
          InlineKeyboardButton("🔄 Восстан.бэкап", callback_data='restore_menu')],
-        [InlineKeyboardButton("🚨 Тревога блокировки", callback_data='block_alert')],
+        [InlineKeyboardButton("🚨 Тревога блокировки", callback_data='block_alert'),
+         InlineKeyboardButton("🔄 Перезагрузка", callback_data='restart_menu')],
         # --- Remote Refresh section ---
         [InlineKeyboardButton("─── Remote Refresh ───", callback_data='noop')],
         [InlineKeyboardButton("📡 IP роутеров", callback_data='rr_current_ip'),
@@ -2026,6 +2027,39 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == 'noop':
         pass  # separator button
+
+    # --- Restart callbacks ---
+    elif data == 'restart_menu':
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔁 OpenVPN", callback_data='rst_openvpn')],
+            [InlineKeyboardButton("🤖 Бот", callback_data='rst_bot')],
+            [InlineKeyboardButton("❌ Отмена", callback_data='rst_cancel')],
+        ])
+        await safe_edit_text(q, context, "Что перезагрузить?", reply_markup=kb)
+
+    elif data == 'rst_openvpn':
+        await safe_edit_text(q, context, "Перезагрузка OpenVPN...")
+        try:
+            result = subprocess.run(
+                ["systemctl", "restart", "openvpn@server"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode == 0:
+                await safe_edit_text(q, context, "✅ OpenVPN перезагружен.")
+            else:
+                err = result.stderr.strip() or "неизвестная ошибка"
+                await safe_edit_text(q, context, f"❌ Ошибка:\n{err}")
+        except Exception as exc:
+            await safe_edit_text(q, context, f"❌ Ошибка: {exc}")
+
+    elif data == 'rst_bot':
+        await safe_edit_text(q, context, "🔄 Перезагрузка бота через 2 сек...")
+        import asyncio
+        await asyncio.sleep(2)
+        subprocess.Popen(["systemctl", "restart", "remote-refresh-bot"])
+
+    elif data == 'rst_cancel':
+        await safe_edit_text(q, context, "Отменено.")
 
     # --- Remote Refresh callbacks ---
     elif data == 'rr_current_ip':
