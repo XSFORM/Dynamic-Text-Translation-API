@@ -2056,6 +2056,63 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == 'noop':
         pass  # separator button
 
+    # --- OVPN EDIT callbacks ---
+    elif data == 'ovpn_edit_menu':
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("⚙️ server.conf", callback_data='ovpn_view_server_conf')],
+            [InlineKeyboardButton("📄 client-template.txt", callback_data='ovpn_view_client_template')],
+            [InlineKeyboardButton("❌ Отмена", callback_data='ovpn_edit_cancel')],
+        ])
+        await safe_edit_text(q, context, "Выберите файл для просмотра/редактирования:", reply_markup=kb)
+
+    elif data == 'ovpn_view_server_conf':
+        path = OVPN_EDIT_FILES["server_conf"]
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                file_content = f.read()
+        except OSError as exc:
+            await safe_edit_text(q, context, f"❌ Не удалось прочитать: {exc}")
+            return
+        if len(file_content) > 3900:
+            await q.message.reply_document(
+                document=file_content.encode("utf-8"),
+                filename="server.conf",
+                caption="Отправьте новое содержимое файла целиком для замены, или /cancel для отмены."
+            )
+            await safe_edit_text(q, context, "Файл отправлен выше (слишком длинный для сообщения).")
+        else:
+            await safe_edit_text(q, context,
+                f"<b>server.conf:</b>\n<pre>{escape(file_content)}</pre>\n\n"
+                "Отправьте новое содержимое файла целиком для замены.",
+                parse_mode="HTML")
+        context.user_data['await_ovpn_edit'] = 'server_conf'
+
+    elif data == 'ovpn_view_client_template':
+        path = OVPN_EDIT_FILES["client_template"]
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                file_content = f.read()
+        except OSError as exc:
+            await safe_edit_text(q, context, f"❌ Не удалось прочитать: {exc}")
+            return
+        if len(file_content) > 3900:
+            await q.message.reply_document(
+                document=file_content.encode("utf-8"),
+                filename="client-template.txt",
+                caption="Отправьте новое содержимое файла целиком для замены, или /cancel для отмены."
+            )
+            await safe_edit_text(q, context, "Файл отправлен выше (слишком длинный для сообщения).")
+        else:
+            await safe_edit_text(q, context,
+                f"<b>client-template.txt:</b>\n<pre>{escape(file_content)}</pre>\n\n"
+                "Отправьте новое содержимое файла целиком для замены.",
+                parse_mode="HTML")
+        context.user_data['await_ovpn_edit'] = 'client_template'
+
+    elif data == 'ovpn_edit_cancel':
+        context.user_data.pop('await_ovpn_edit', None)
+        await safe_edit_text(q, context, "Отменено.")
+
     # --- Restart callbacks ---
     elif data == 'restart_menu':
         kb = InlineKeyboardMarkup([
