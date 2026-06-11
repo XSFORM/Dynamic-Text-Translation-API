@@ -1840,7 +1840,8 @@ def get_main_keyboard():
          InlineKeyboardButton("🔄 Восстан.бэкап", callback_data='restore_menu')],
         [InlineKeyboardButton("🚨 Тревога блокировки", callback_data='block_alert'),
          InlineKeyboardButton("⚡ Перезагрузка", callback_data='restart_menu')],
-        [InlineKeyboardButton("📝 OVPN EDIT", callback_data='ovpn_edit_menu')],
+        [InlineKeyboardButton("📝 OVPN EDIT", callback_data='ovpn_edit_menu'),
+         InlineKeyboardButton("🖥 SSH Роутеры", callback_data='ssh_routers')],
         # --- Remote Refresh section ---
         [InlineKeyboardButton("─── Remote Refresh ───", callback_data='noop')],
         [InlineKeyboardButton("📡 IP роутеров", callback_data='rr_current_ip'),
@@ -2145,6 +2146,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == 'rst_cancel':
         await safe_edit_text(q, context, "Отменено.")
+
+    # --- SSH Routers (stub) ---
+    elif data == 'ssh_routers':
+        await safe_edit_text(q, context,
+            "🖥 <b>SSH Роутеры</b>\n\n"
+            "🚧 В разработке.\n"
+            "Здесь будет удалённое управление роутерами по SSH.",
+            parse_mode="HTML")
 
     # --- Remote Refresh callbacks ---
     elif data == 'rr_current_ip':
