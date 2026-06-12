@@ -1527,18 +1527,18 @@ async def backup_delete_apply(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception as e:
         await safe_edit_text(update.callback_query, context, f"Ошибка удаления: {e}")
 
-async def ovpn_backup_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def backup_hub(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🆕 Создать бэкап", callback_data="backup_create")],
-        [InlineKeyboardButton("📦 Список бэкапов", callback_data="backup_list")],
+        [InlineKeyboardButton("📦 Бэкап OpenVPN", callback_data="backup_create"),
+         InlineKeyboardButton("💾 Бэкап RR", callback_data="rr_backup")],
+        [InlineKeyboardButton("📋 Список бэкапов", callback_data="backup_list")],
+        [InlineKeyboardButton("📤 Загрузить архив", callback_data="backup_upload_prompt")],
+        [InlineKeyboardButton("🔄 Восстановить OpenVPN", callback_data="backup_list")],
+        [InlineKeyboardButton("🔄 Восстановить RR", callback_data="rr_restore_prompt")],
+        [InlineKeyboardButton("❌ Назад", callback_data="home")],
     ])
-    await safe_edit_text(q, context, "Меню бэкапов OpenVPN:", reply_markup=kb)
-
-async def restore_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("📦 Список бэкапов", callback_data="backup_list")]])
-    await safe_edit_text(q, context, "Восстановление: выбери бэкап → Diff → Применить.", reply_markup=kb)
+    await safe_edit_text(q, context, "📦 <b>Меню бэкапов</b>", parse_mode="HTML", reply_markup=kb)
 
 # =====================================================================
 #  REMOTE REFRESH — File helpers
@@ -1734,7 +1734,6 @@ async def rr_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id=q.message.chat_id, text="Создаю бэкап Remote Refresh...")
 
     files_to_backup = {
-        "remote-refresh.env": RR_ENV_FILE,
         "current_vpn_ip.txt": RR_IP_FILE,
         "domain_list.txt": RR_DOMAIN_LIST_FILE,
         "history.log": RR_HISTORY_FILE,
@@ -1838,10 +1837,9 @@ def get_main_keyboard():
          InlineKeyboardButton("⚠️ Откл.клиента", callback_data='bulk_disable_start')],
         [InlineKeyboardButton("➕ Создать ключ", callback_data='create_key'),
          InlineKeyboardButton("🗑️ Удалить ключ", callback_data='bulk_delete_start')],
-        [InlineKeyboardButton("📤 Отправить ключи", callback_data='bulk_send_start'),
+        [InlineKeyboardButton("📤 Отправить ключи", callback_data='bulk_send_start')],
+        [InlineKeyboardButton("📦 Бэкап", callback_data='backup_hub'),
          InlineKeyboardButton("📜 Просмотр лога", callback_data='log')],
-        [InlineKeyboardButton("📦 Бэкап OpenVPN", callback_data='backup_menu'),
-         InlineKeyboardButton("🔄 Восстан.бэкап", callback_data='restore_menu')],
         [InlineKeyboardButton("🚨 Тревога ON/OFF", callback_data='block_alert'),
          InlineKeyboardButton("⚡ Перезагрузка", callback_data='restart_menu')],
         [InlineKeyboardButton("📝 OVPN EDIT", callback_data='ovpn_edit_menu'),
@@ -1850,8 +1848,7 @@ def get_main_keyboard():
         [InlineKeyboardButton("─── Remote Refresh ───", callback_data='noop')],
         [InlineKeyboardButton("📡 IP роутеров", callback_data='rr_current_ip'),
          InlineKeyboardButton("✏️ Сменить IP", callback_data='rr_set_ip')],
-        [InlineKeyboardButton("📋 История IP", callback_data='rr_history'),
-         InlineKeyboardButton("💾 Бэкап RR", callback_data='rr_backup')],
+        [InlineKeyboardButton("📋 История IP", callback_data='rr_history')],
         [InlineKeyboardButton("🔍 IP Scan", callback_data='rr_ip_scan'),
          InlineKeyboardButton("🔍 Port Scan", callback_data='rr_port_scan')],
         [InlineKeyboardButton("🌐 Домены", callback_data='rr_domains')],
@@ -1969,10 +1966,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == 'cancel_renew':
         await renew_cancel(update, context)
 
-    elif data == 'backup_menu':
-        await ovpn_backup_menu(update, context)
-    elif data == 'restore_menu':
-        await restore_menu(update, context)
+    elif data == 'backup_hub':
+        await backup_hub(update, context)
     elif data == 'backup_create':
         await perform_backup_and_send(update, context)
     elif data == 'backup_list':
@@ -2065,6 +2060,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == 'noop':
         pass  # separator button
+
+    # --- Backup hub callbacks ---
+    elif data == 'backup_upload_prompt':
+        await safe_edit_text(q, context,
+            "Отправьте файл бэкапа OpenVPN (.tar.gz) в чат.\n"
+            "Бот сохранит его в /root для последующего восстановления.")
+        context.user_data['await_backup_upload'] = True
+
+    elif data == 'rr_restore_prompt':
+        await safe_edit_text(q, context,
+            "Отправьте файл бэкапа Remote Refresh (.zip) в чат.\n"
+            "Бот восстановит IP, домены, историю и флаги.")
+        context.user_data['await_rr_restore'] = True
 
     # --- OVPN EDIT callbacks ---
     elif data == 'ovpn_edit_menu':
@@ -2193,6 +2201,78 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit_text(q, context, "Неизвестная команда.")
 
 # =====================================================================
+#  DOCUMENT HANDLER (backup upload / RR restore)
+# =====================================================================
+async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID: return
+    doc = update.message.document
+    if not doc:
+        return
+
+    # --- Upload OpenVPN backup ---
+    if context.user_data.get('await_backup_upload'):
+        context.user_data.pop('await_backup_upload', None)
+        fname = doc.file_name or "uploaded_backup.tar.gz"
+        if not fname.endswith(".tar.gz") and not fname.endswith(".tgz"):
+            await update.message.reply_text("Ожидается файл .tar.gz")
+            return
+        dest = os.path.join("/root", fname)
+        await update.message.reply_text(f"Скачиваю {fname}...")
+        tg_file = await context.bot.get_file(doc.file_id)
+        await tg_file.download_to_drive(dest)
+        await update.message.reply_text(f"\u2705 Сохранён: {dest}\nТеперь можно восстановить через меню Бэкап.")
+        return
+
+    # --- Upload + restore RR backup ---
+    if context.user_data.get('await_rr_restore'):
+        context.user_data.pop('await_rr_restore', None)
+        fname = doc.file_name or "rr_backup.zip"
+        if not fname.endswith(".zip"):
+            await update.message.reply_text("Ожидается файл .zip")
+            return
+        await update.message.reply_text(f"Восстанавливаю {fname}...")
+        tmp_path = None
+        try:
+            fd, tmp_path = tempfile.mkstemp(suffix=".zip")
+            os.close(fd)
+            tg_file = await context.bot.get_file(doc.file_id)
+            await tg_file.download_to_drive(tmp_path)
+
+            restore_dir = tempfile.mkdtemp()
+            with pyzipper.AESZipFile(tmp_path, 'r') as zf:
+                zf.setpassword(RR_BACKUP_PASSWORD)
+                zf.extractall(restore_dir)
+
+            restored = []
+            mapping = {
+                "current_vpn_ip.txt": RR_IP_FILE,
+                "domain_list.txt": RR_DOMAIN_LIST_FILE,
+                "history.log": RR_HISTORY_FILE,
+                "ip_scan_off.txt": RR_IP_SCAN_FLAG,
+                "port_scan_off.txt": RR_PORT_SCAN_FLAG,
+            }
+            for arcname, dest_path in mapping.items():
+                src = os.path.join(restore_dir, arcname)
+                if os.path.exists(src):
+                    os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
+                    shutil.copy2(src, dest_path)
+                    restored.append(arcname)
+
+            # Regenerate sha256 for domain_list
+            if "domain_list.txt" in restored:
+                rr_write_sha256(RR_DOMAIN_LIST_FILE)
+
+            shutil.rmtree(restore_dir, ignore_errors=True)
+            result = ", ".join(restored) if restored else "ничего"
+            await update.message.reply_text(f"\u2705 RR восстановлен:\n{result}")
+        except Exception as exc:
+            await update.message.reply_text(f"\u274c Ошибка: {exc}")
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        return
+
+# =====================================================================
 #  COMMANDS
 # =====================================================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2285,6 +2365,7 @@ def main():
     app.add_handler(CommandHandler("backup_restore", cmd_backup_restore))
     app.add_handler(CommandHandler("backup_restore_apply", cmd_backup_restore_apply))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, universal_text_handler))
+    app.add_handler(MessageHandler(filters.Document.ALL, document_handler))
     app.add_handler(CallbackQueryHandler(button_handler))
     import asyncio
     loop = asyncio.get_event_loop()
