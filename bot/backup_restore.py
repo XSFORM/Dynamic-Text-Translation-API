@@ -294,6 +294,46 @@ def regenerate_crl_if_possible():
     except Exception as e:
         return False, f"CRL regen failed: {e}"
 
+# ---------- Auto-fix iptables interface ----------
+
+def _get_default_interface() -> Optional[str]:
+    """Detect the default outgoing network interface from routing table."""
+    try:
+        result = subprocess.run(
+            ["ip", "route", "show", "default"],
+            capture_output=True, text=True, timeout=5,
+        )
+        # Example: "default via 185.62.57.1 dev eth0 onlink"
+        for part in result.stdout.split():
+            if part == "dev":
+                idx = result.stdout.split().index("dev")
+                return result.stdout.split()[idx + 1]
+    except Exception:
+        pass
+    return None
+
+def _fix_iptables_interface(rules_path: str):
+    """Replace wrong interface names in MASQUERADE rules with the actual default interface."""
+    real_iface = _get_default_interface()
+    if not real_iface:
+        return
+    try:
+        with open(rules_path, "r") as f:
+            content = f.read()
+        import re
+        # Match -o <interface> in MASQUERADE lines
+        new_content = re.sub(
+            r'(-A POSTROUTING.*-o )\S+( -j MASQUERADE)',
+            rf'\g<1>{real_iface}\2',
+            content,
+        )
+        if new_content != content:
+            with open(rules_path, "w") as f:
+                f.write(new_content)
+            print(f"[iptables fix] Replaced interface with {real_iface} in {rules_path}")
+    except Exception as e:
+        print(f"[iptables fix] Error: {e}")
+
 # ---------- Restore ----------
 
 def apply_restore(archive_path: str, dry_run: bool = True) -> Dict:
@@ -330,6 +370,8 @@ def apply_restore(archive_path: str, dry_run: bool = True) -> Dict:
         iptables_rules = "/etc/iptables/rules.v4"
         if os.path.exists(iptables_rules):
             try:
+                # Fix MASQUERADE interface before applying
+                _fix_iptables_interface(iptables_rules)
                 subprocess.run(f"iptables-restore < {iptables_rules}", shell=True, check=True)
                 report["iptables_restore"] = "OK"
             except Exception as e:

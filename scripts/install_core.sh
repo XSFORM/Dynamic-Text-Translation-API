@@ -188,8 +188,15 @@ if [ "$RESTORE_OVPN" -eq 1 ]; then
     mkdir -p /etc/iptables
     cp -a "$OVPN_STAGING/etc/iptables/." /etc/iptables/
     log "Restored /etc/iptables"
-    # Apply iptables rules
-    [ -f /etc/iptables/rules.v4 ] && iptables-restore < /etc/iptables/rules.v4 && log "Applied iptables rules.v4"
+    # Auto-fix MASQUERADE interface before applying
+    if [ -f /etc/iptables/rules.v4 ]; then
+      REAL_IFACE=$(ip route show default 2>/dev/null | awk '/default/{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -1)
+      if [ -n "$REAL_IFACE" ]; then
+        sed -i 's/\(-A POSTROUTING.*-o \)[^ ]*\( -j MASQUERADE\)/\1'"$REAL_IFACE"'\2/g' /etc/iptables/rules.v4
+        log "Fixed MASQUERADE interface to $REAL_IFACE in rules.v4"
+      fi
+      iptables-restore < /etc/iptables/rules.v4 && log "Applied iptables rules.v4"
+    fi
     [ -f /etc/iptables/rules.v6 ] && ip6tables-restore < /etc/iptables/rules.v6 2>/dev/null || true
   fi
 
@@ -370,7 +377,7 @@ log "nginx restarted"
 
 log ""
 log "=== Installation complete ==="
-if [ "$RESTORE_MODE" -eq 1 ]; then
+if [ "$RESTORE_RR" -eq 1 ] || [ "$RESTORE_OVPN" -eq 1 ]; then
   log "Restored from backup. Start the service:"
 else
   log "Config created. Start the service:"
