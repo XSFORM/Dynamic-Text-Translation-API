@@ -38,6 +38,7 @@ EXCLUDE_PATHS = {
     "/root/.bash_history",
     "/root/.cache",
     "/root/backups/.tmp",
+    "/root/monitor_bot/config.py",
 }
 
 EXCLUDE_SUFFIXES = {
