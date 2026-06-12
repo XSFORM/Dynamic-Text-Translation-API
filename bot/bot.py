@@ -1498,6 +1498,7 @@ async def restore_apply(update: Update, context: ContextTypes.DEFAULT_TYPE, fnam
                 f"Missing: {len(diff['missing'])}\n"
                 f"Changed: {len(diff['changed'])}\n"
                 f"CRL: {report.get('crl_action')}\n"
+                f"iptables: {report.get('iptables_restore', 'skipped')}\n"
                 f"OpenVPN restart: {report.get('service_restart')}")
         await safe_edit_text(update.callback_query, context, text, parse_mode="HTML")
     except Exception as e:

@@ -324,6 +324,24 @@ def apply_restore(archive_path: str, dry_run: bool = True) -> Dict:
         success, msg = regenerate_crl_if_possible()
         report["crl_action"] = msg
 
+        # Restore iptables rules
+        report["iptables_restore"] = None
+        iptables_rules = "/etc/iptables/rules.v4"
+        if os.path.exists(iptables_rules):
+            try:
+                subprocess.run(f"iptables-restore < {iptables_rules}", shell=True, check=True)
+                report["iptables_restore"] = "OK"
+            except Exception as e:
+                report["iptables_restore"] = f"Failed: {e}"
+                report["errors"].append(f"iptables: {e}")
+        # Also try rules.v6 if exists
+        ip6_rules = "/etc/iptables/rules.v6"
+        if os.path.exists(ip6_rules):
+            try:
+                subprocess.run(f"ip6tables-restore < {ip6_rules}", shell=True, check=True)
+            except Exception:
+                pass
+
         try:
             subprocess.run("systemctl restart openvpn@server || systemctl restart openvpn", shell=True, check=True)
             report["service_restart"] = "OK"
