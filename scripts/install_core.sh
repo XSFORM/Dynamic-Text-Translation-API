@@ -45,8 +45,12 @@ require_root() {
 require_root
 
 # -------- Install mode --------
-RESTORE_MODE=0
+RESTORE_RR=0
+RESTORE_OVPN=0
 INSTALL_OPENVPN=0
+RR_BACKUP_PATH=""
+OVPN_BACKUP_PATH=""
+
 echo ""
 echo "  1) Clean install (default)"
 echo "  2) Restore from backup"
@@ -55,19 +59,27 @@ read -rp "Choose [1]: " INSTALL_CHOICE
 INSTALL_CHOICE="${INSTALL_CHOICE:-1}"
 
 if [ "$INSTALL_CHOICE" = "2" ]; then
-  read -rp "Path to Remote Refresh backup .zip: " RR_BACKUP_PATH
+  read -rp "Path to Remote Refresh backup .zip (Enter to skip): " RR_BACKUP_PATH
   if [ -n "$RR_BACKUP_PATH" ] && [ -f "$RR_BACKUP_PATH" ]; then
-    RESTORE_MODE=1
+    RESTORE_RR=1
     log "Will restore Remote Refresh from: $RR_BACKUP_PATH"
-  else
-    log "WARNING: file not found, proceeding with clean install"
+  elif [ -n "$RR_BACKUP_PATH" ]; then
+    log "WARNING: RR backup not found, skipping"
+  fi
+
+  read -rp "Path to OpenVPN backup .tar.gz (Enter to skip): " OVPN_BACKUP_PATH
+  if [ -n "$OVPN_BACKUP_PATH" ] && [ -f "$OVPN_BACKUP_PATH" ]; then
+    RESTORE_OVPN=1
+    log "Will restore OpenVPN from: $OVPN_BACKUP_PATH"
+  elif [ -n "$OVPN_BACKUP_PATH" ]; then
+    log "WARNING: OpenVPN backup not found, skipping"
   fi
 fi
 
 echo ""
 echo "Install OpenVPN with XOR scramble?"
 echo "  1) Yes (default)"
-echo "  2) No (OpenVPN already installed)"
+echo "  2) No (OpenVPN already installed or restoring from backup)"
 echo ""
 read -rp "Choose [1]: " OPENVPN_CHOICE
 OPENVPN_CHOICE="${OPENVPN_CHOICE:-1}"
@@ -104,15 +116,13 @@ chown "$BOT_USER:$BOT_GROUP" "$DATA_DIR"
 chown "$BOT_USER:$BOT_GROUP" "$ROUTER_DIR"
 chmod 755 "$ROUTER_DIR"
 
-# -------- Telegram bot credentials --------
-if [ "$RESTORE_MODE" -eq 0 ]; then
-  echo ""
-  read -rp "Enter Telegram BOT TOKEN: " BOT_TOKEN_INPUT
-  read -rp "Enter your Telegram ID: " ADMIN_ID_INPUT
-fi
+# -------- Telegram bot credentials (always ask) --------
+echo ""
+read -rp "Enter Telegram BOT TOKEN: " BOT_TOKEN_INPUT
+read -rp "Enter your Telegram ID: " ADMIN_ID_INPUT
 
-# -------- Restore backup if requested --------
-if [ "$RESTORE_MODE" -eq 1 ]; then
+# -------- Restore Remote Refresh backup if requested --------
+if [ "$RESTORE_RR" -eq 1 ]; then
   RESTORE_DIR=$(mktemp -d)
   log "Extracting Remote Refresh backup (AES-encrypted)..."
   python3 -c "
@@ -129,14 +139,6 @@ with pyzipper.AESZipFile('$RR_BACKUP_PATH', 'r') as zf:
 print('Extraction OK')
 "
 
-  [ -f "$RESTORE_DIR/remote-refresh.env" ] && {
-    cp -f "$RESTORE_DIR/remote-refresh.env" "$ENV_FILE"
-    chmod 640 "$ENV_FILE"; chown "root:$BOT_GROUP" "$ENV_FILE"
-    log "Restored $ENV_FILE"
-    # Extract TOKEN and ADMIN_ID from env file for config.py
-    BOT_TOKEN_INPUT=$(grep '^BOT_TOKEN=' "$ENV_FILE" | cut -d= -f2-)
-    ADMIN_ID_INPUT=$(grep '^ALLOWED_IDS=' "$ENV_FILE" | cut -d= -f2- | cut -d, -f1)
-  }
   [ -f "$RESTORE_DIR/current_vpn_ip.txt" ] && {
     cp -f "$RESTORE_DIR/current_vpn_ip.txt" "$IP_FILE"
     chown "$BOT_USER:$BOT_GROUP" "$IP_FILE"; chmod 644 "$IP_FILE"
@@ -166,7 +168,61 @@ print('Extraction OK')
   }
 
   rm -rf "$RESTORE_DIR"
-  log "Backup restore complete"
+  log "Remote Refresh backup restore complete"
+fi
+
+# -------- Restore OpenVPN backup if requested --------
+if [ "$RESTORE_OVPN" -eq 1 ]; then
+  log "Extracting OpenVPN backup..."
+  OVPN_STAGING=$(mktemp -d)
+  tar xzf "$OVPN_BACKUP_PATH" -C "$OVPN_STAGING"
+
+  # Restore /etc/openvpn
+  if [ -d "$OVPN_STAGING/etc/openvpn" ]; then
+    cp -a "$OVPN_STAGING/etc/openvpn/." /etc/openvpn/
+    log "Restored /etc/openvpn"
+  fi
+
+  # Restore /etc/iptables
+  if [ -d "$OVPN_STAGING/etc/iptables" ]; then
+    mkdir -p /etc/iptables
+    cp -a "$OVPN_STAGING/etc/iptables/." /etc/iptables/
+    log "Restored /etc/iptables"
+    # Apply iptables rules
+    [ -f /etc/iptables/rules.v4 ] && iptables-restore < /etc/iptables/rules.v4 && log "Applied iptables rules.v4"
+    [ -f /etc/iptables/rules.v6 ] && ip6tables-restore < /etc/iptables/rules.v6 2>/dev/null || true
+  fi
+
+  # Restore .ovpn files from /root
+  if [ -d "$OVPN_STAGING/root" ]; then
+    find "$OVPN_STAGING/root" -maxdepth 1 -name "*.ovpn" -exec cp -f {} /root/ \;
+    log "Restored .ovpn files to /root"
+    # Restore traffic and client meta
+    [ -f "$OVPN_STAGING/root/monitor_bot/traffic_usage.json" ] && {
+      cp -f "$OVPN_STAGING/root/monitor_bot/traffic_usage.json" "$BOT_DIR/traffic_usage.json"
+      log "Restored traffic_usage.json"
+    }
+    [ -f "$OVPN_STAGING/root/monitor_bot/clients_meta.json" ] && {
+      cp -f "$OVPN_STAGING/root/monitor_bot/clients_meta.json" "$BOT_DIR/clients_meta.json"
+      log "Restored clients_meta.json"
+    }
+  fi
+
+  # Regenerate CRL if easy-rsa exists
+  if [ -d "/etc/openvpn/easy-rsa/pki" ] && [ -f "/etc/openvpn/easy-rsa/easyrsa" ]; then
+    cd /etc/openvpn/easy-rsa && EASYRSA_CRL_DAYS=3650 ./easyrsa gen-crl 2>/dev/null && {
+      cp -f /etc/openvpn/easy-rsa/pki/crl.pem /etc/openvpn/crl.pem
+      chmod 644 /etc/openvpn/crl.pem
+      log "Regenerated CRL"
+    } || log "WARNING: CRL regeneration failed"
+  fi
+
+  rm -rf "$OVPN_STAGING"
+  log "OpenVPN backup restore complete"
+
+  # Restart OpenVPN
+  systemctl restart openvpn@server 2>/dev/null || systemctl restart openvpn 2>/dev/null || log "WARNING: Could not restart OpenVPN"
+  log "OpenVPN restarted"
 fi
 
 # -------- Copy router worker from repo --------
@@ -180,10 +236,9 @@ else
   log "WARNING: $WORKER_SRC not found"
 fi
 
-# -------- Stubs and placeholders (clean install only) --------
-if [ "$RESTORE_MODE" -eq 0 ]; then
-
-  # Publish domain_list.txt
+# -------- Stubs and placeholders (if not restored) --------
+# domain_list.txt
+if [ ! -f "$DOMAIN_LIST_FILE" ]; then
   DOMAIN_LIST_SRC="$REPO_DIR/router/domain_list.txt"
   if [ -f "$DOMAIN_LIST_SRC" ]; then
     cp -f "$DOMAIN_LIST_SRC" "$DOMAIN_LIST_FILE"
@@ -195,27 +250,28 @@ if [ "$RESTORE_MODE" -eq 0 ]; then
   sha256sum "$DOMAIN_LIST_FILE" > "${DOMAIN_LIST_FILE}.sha256"
   chown "$BOT_USER:$BOT_GROUP" "${DOMAIN_LIST_FILE}.sha256"
   log "Published domain_list.txt"
+fi
 
-  # Scan flags
-  for flag in ip_scan_off.txt port_scan_off.txt; do
-    dst="$WEBROOT/$flag"
-    if [ ! -f "$dst" ]; then
-      echo "0" > "$dst"
-      chown "$BOT_USER:$BOT_GROUP" "$dst"
-      log "Created flag file $dst"
-    fi
-  done
-
-  # IP file placeholder
-  if [ ! -f "$IP_FILE" ]; then
-    echo "" > "$IP_FILE"
-    chown "$BOT_USER:$BOT_GROUP" "$IP_FILE"
-    chmod 644 "$IP_FILE"
-    log "Created $IP_FILE"
+# Scan flags
+for flag in ip_scan_off.txt port_scan_off.txt; do
+  dst="$WEBROOT/$flag"
+  if [ ! -f "$dst" ]; then
+    echo "0" > "$dst"
+    chown "$BOT_USER:$BOT_GROUP" "$dst"
+    log "Created flag file $dst"
   fi
+done
 
-  # Environment file
-  cat > "$ENV_FILE" <<EOF
+# IP file placeholder
+if [ ! -f "$IP_FILE" ]; then
+  echo "" > "$IP_FILE"
+  chown "$BOT_USER:$BOT_GROUP" "$IP_FILE"
+  chmod 644 "$IP_FILE"
+  log "Created $IP_FILE"
+fi
+
+# -------- Environment file (always create with fresh credentials) --------
+cat > "$ENV_FILE" <<EOF
 # /etc/remote-refresh.env  --  runtime config
 BOT_TOKEN=${BOT_TOKEN_INPUT}
 ALLOWED_IDS=${ADMIN_ID_INPUT}
@@ -227,11 +283,9 @@ PORT_SCAN_FLAG=$WEBROOT/port_scan_off.txt
 DOMAIN_LIST_FILE=$DOMAIN_LIST_FILE
 ENV_FILE=$ENV_FILE
 EOF
-  chmod 640 "$ENV_FILE"
-  chown "root:$BOT_GROUP" "$ENV_FILE"
-  log "Created $ENV_FILE"
-
-fi  # end RESTORE_MODE == 0
+chmod 640 "$ENV_FILE"
+chown "root:$BOT_GROUP" "$ENV_FILE"
+log "Created $ENV_FILE"
 
 # -------- Copy bot files --------
 log "Copying bot files to $BOT_DIR..."
