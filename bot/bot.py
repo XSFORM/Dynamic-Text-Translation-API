@@ -1824,7 +1824,7 @@ async def safe_edit_text(q, context, text, **kwargs):
 def get_main_keyboard():
     keyboard = [
         # --- OpenVPN section ---
-        [InlineKeyboardButton("🔄 Список клиентов", callback_data='refresh')],
+        [InlineKeyboardButton("──── OPENVPN ────", callback_data='noop')],
         [InlineKeyboardButton("📊 Статистика", callback_data='stats'),
          InlineKeyboardButton("🛣️ Тунель", callback_data='send_ipp')],
         [InlineKeyboardButton("📶 Трафик", callback_data='traffic'),
@@ -1837,7 +1837,8 @@ def get_main_keyboard():
          InlineKeyboardButton("⚠️ Откл.клиента", callback_data='bulk_disable_start')],
         [InlineKeyboardButton("➕ Создать ключ", callback_data='create_key'),
          InlineKeyboardButton("🗑️ Удалить ключ", callback_data='bulk_delete_start')],
-        [InlineKeyboardButton("📤 Отправить ключи", callback_data='bulk_send_start')],
+        [InlineKeyboardButton("🔄 Список клиентов", callback_data='refresh'),
+         InlineKeyboardButton("📤 Отправить ключи", callback_data='bulk_send_start')],
         [InlineKeyboardButton("📦 Бэкап", callback_data='backup_hub'),
          InlineKeyboardButton("📜 Просмотр лога", callback_data='log')],
         [InlineKeyboardButton("🚨 Тревога ON/OFF", callback_data='block_alert'),
@@ -1848,10 +1849,10 @@ def get_main_keyboard():
         [InlineKeyboardButton("─── Remote Refresh ───", callback_data='noop')],
         [InlineKeyboardButton("📡 IP роутеров", callback_data='rr_current_ip'),
          InlineKeyboardButton("✏️ Сменить IP", callback_data='rr_set_ip')],
-        [InlineKeyboardButton("📋 История IP", callback_data='rr_history')],
         [InlineKeyboardButton("🔍 IP Scan", callback_data='rr_ip_scan'),
          InlineKeyboardButton("🔍 Port Scan", callback_data='rr_port_scan')],
-        [InlineKeyboardButton("🌐 Домены", callback_data='rr_domains')],
+        [InlineKeyboardButton("📋 История IP", callback_data='rr_history'),
+         InlineKeyboardButton("🌐 Домены", callback_data='rr_domains')],
         # --- Common ---
         [InlineKeyboardButton("❓ Помощь", callback_data='help'),
          InlineKeyboardButton("🏠 В главное меню", callback_data='home')],
@@ -2283,6 +2284,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.delete_message(chat_id=MENU_CHAT_ID, message_id=MENU_MESSAGE_ID)
         except: pass
+    # Persistent /start button in message input area
+    from telegram import ReplyKeyboardMarkup, KeyboardButton
+    reply_kb = ReplyKeyboardMarkup([[KeyboardButton("/start")]], resize_keyboard=True)
+    await update.message.reply_text("⌨️", reply_markup=reply_kb)
     sent = await update.message.reply_text(f"Добро пожаловать! Версия: {BOT_VERSION}", reply_markup=kb)
     MENU_MESSAGE_ID = sent.message_id; MENU_CHAT_ID = sent.chat.id
 
