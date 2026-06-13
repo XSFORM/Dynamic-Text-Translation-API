@@ -2284,10 +2284,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.delete_message(chat_id=MENU_CHAT_ID, message_id=MENU_MESSAGE_ID)
         except: pass
-    # Persistent /start button in message input area
-    from telegram import ReplyKeyboardMarkup, KeyboardButton
-    reply_kb = ReplyKeyboardMarkup([[KeyboardButton("/start")]], resize_keyboard=True)
-    await update.message.reply_text("⌨️", reply_markup=reply_kb)
+    # Set persistent /start button (only once per session)
+    if not context.user_data.get('reply_kb_set'):
+        from telegram import ReplyKeyboardMarkup, KeyboardButton
+        reply_kb = ReplyKeyboardMarkup([[KeyboardButton("/start")]], resize_keyboard=True)
+        await update.message.reply_text("🔘", reply_markup=reply_kb)
+        context.user_data['reply_kb_set'] = True
     sent = await update.message.reply_text(f"Добро пожаловать! Версия: {BOT_VERSION}", reply_markup=kb)
     MENU_MESSAGE_ID = sent.message_id; MENU_CHAT_ID = sent.chat.id
 
