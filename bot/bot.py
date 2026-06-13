@@ -2284,6 +2284,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.delete_message(chat_id=MENU_CHAT_ID, message_id=MENU_MESSAGE_ID)
         except: pass
+    # Delete the /start message to keep chat clean
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
     sent = await update.message.reply_text(f"Добро пожаловать! Версия: {BOT_VERSION}", reply_markup=kb)
     MENU_MESSAGE_ID = sent.message_id; MENU_CHAT_ID = sent.chat.id
 
