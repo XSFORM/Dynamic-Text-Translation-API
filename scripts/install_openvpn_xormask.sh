@@ -1,18 +1,30 @@
 #!/bin/bash
+# install_openvpn_xormask.sh — standalone, no external downloads.
+# All required scripts are bundled in scripts/openvpn/
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+OPENVPN_DIR="$SCRIPT_DIR/openvpn"
+
+if [ ! -f "$OPENVPN_DIR/openvpn-install.sh" ] || [ ! -f "$OPENVPN_DIR/openvpn_xor_install.sh" ]; then
+    echo "ERROR: Missing files in $OPENVPN_DIR"
+    echo "Expected: openvpn-install.sh, openvpn_xor_install.sh"
+    exit 1
+fi
 
 echo "[*] Устанавливаем обычный OpenVPN ..."
-wget -q https://raw.githubusercontent.com/XSFORM/OpenVpn-scramble-xormask/main/openvpn-install.sh -O openvpn-install.sh && bash openvpn-install.sh
+cp "$OPENVPN_DIR/openvpn-install.sh" /tmp/openvpn-install.sh
+bash /tmp/openvpn-install.sh
 
 echo "[*] Удаляем обычный OpenVPN ..."
 apt remove openvpn -y
 
 echo "[*] Устанавливаем OpenVPN с поддержкой XOR ..."
-wget -q https://raw.githubusercontent.com/x0r2d2/openvpn-xor/main/openvpn_xor_install.sh -O openvpn_xor_install.sh
-chmod +x openvpn_xor_install.sh
-bash openvpn_xor_install.sh
+cp "$OPENVPN_DIR/openvpn_xor_install.sh" /tmp/openvpn_xor_install.sh
+chmod +x /tmp/openvpn_xor_install.sh
+bash /tmp/openvpn_xor_install.sh
 
 echo "[*] Перемещаем openvpn-install.sh в /root/ ..."
-mv openvpn-install.sh /root/
+cp /tmp/openvpn-install.sh /root/
 
 # Подождём немного, чтобы файлы конфигурации появились
 sleep 2
