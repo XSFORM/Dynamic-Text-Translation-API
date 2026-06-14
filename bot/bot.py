@@ -20,6 +20,7 @@ import requests
 import shutil
 import socket
 import logging
+import paramiko
 
 from OpenSSL import crypto
 import pytz
@@ -121,6 +122,81 @@ OVPN_EDIT_FILES = {
     "server_conf": "/etc/openvpn/server.conf",
     "client_template": "/etc/openvpn/client-template.txt",
 }
+
+# =====================================================================
+#  SSH ROUTERS — config
+# =====================================================================
+ROUTERS_FILE = "/root/monitor_bot/routers.json"
+IPP_FILE = "/etc/openvpn/ipp.txt"
+SSH_TIMEOUT = 10
+SSH_CMD_TIMEOUT = 15
+
+def load_routers() -> Dict:
+    try:
+        with open(ROUTERS_FILE, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+def save_routers(data: Dict):
+    with open(ROUTERS_FILE, "w") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+def get_router_ip(cn: str) -> Optional[str]:
+    """Get router VPN IP from ipp.txt by CN name."""
+    try:
+        with open(IPP_FILE, "r") as f:
+            for line in f:
+                parts = line.strip().split(",")
+                if len(parts) >= 2 and parts[0] == cn:
+                    return parts[1]
+    except FileNotFoundError:
+        pass
+    return None
+
+def get_online_clients() -> set:
+    """Get set of currently connected client CNs from status.log."""
+    online = set()
+    try:
+        with open(STATUS_LOG, "r") as f:
+            in_routing = False
+            for line in f:
+                line = line.strip()
+                if line.startswith("ROUTING TABLE"):
+                    in_routing = True
+                    continue
+                if line.startswith("GLOBAL STATS"):
+                    break
+                if in_routing and "," in line and not line.startswith("Virtual"):
+                    parts = line.split(",")
+                    if len(parts) >= 2:
+                        online.add(parts[1])
+    except FileNotFoundError:
+        pass
+    return online
+
+def ssh_exec(ip: str, port: int, user: str, password: str, command: str) -> Tuple[bool, str]:
+    """Execute SSH command on router. Returns (success, output)."""
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        client.connect(ip, port=port, username=user, password=password,
+                       timeout=SSH_TIMEOUT, look_for_keys=False, allow_agent=False)
+        stdin, stdout, stderr = client.exec_command(command, timeout=SSH_CMD_TIMEOUT)
+        out = stdout.read().decode("utf-8", errors="replace").strip()
+        err = stderr.read().decode("utf-8", errors="replace").strip()
+        result = out if out else err
+        return True, result if result else "(пустой вывод)"
+    except paramiko.AuthenticationException:
+        return False, "Ошибка авторизации (неверный логин/пароль)"
+    except paramiko.SSHException as e:
+        return False, f"SSH ошибка: {e}"
+    except socket.timeout:
+        return False, "Таймаут подключения"
+    except Exception as e:
+        return False, f"Ошибка: {e}"
+    finally:
+        client.close()
 
 # =====================================================================
 #  NATURAL SORT
@@ -1883,6 +1959,57 @@ async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_T
         await create_key_handler(update, context); return
     if context.user_data.get('await_remote_input'):
         await process_remote_input(update, context); return
+    # SSH Routers text inputs
+    if context.user_data.get('await_ssh_add'):
+        context.user_data.pop('await_ssh_add')
+        parts = update.message.text.strip().split()
+        if len(parts) < 2:
+            await update.message.reply_text("Формат: имя пароль [порт]")
+            return
+        cn = parts[0]
+        password = parts[1]
+        port = int(parts[2]) if len(parts) > 2 else 22
+        routers = load_routers()
+        routers[cn] = {"user": "admin", "password": password, "port": port}
+        save_routers(routers)
+        await update.message.reply_text(f"✅ Роутер <b>{cn}</b> добавлен.", parse_mode="HTML")
+        return
+    if context.user_data.get('await_ssh_edit'):
+        cn = context.user_data.pop('await_ssh_edit')
+        parts = update.message.text.strip().split(":")
+        routers = load_routers()
+        if cn not in routers:
+            await update.message.reply_text("Роутер не найден.")
+            return
+        if len(parts) == 1:
+            routers[cn]["password"] = parts[0]
+        elif len(parts) == 2:
+            routers[cn]["user"] = parts[0]
+            routers[cn]["password"] = parts[1]
+        elif len(parts) >= 3:
+            routers[cn]["user"] = parts[0]
+            routers[cn]["password"] = parts[1]
+            routers[cn]["port"] = int(parts[2])
+        save_routers(routers)
+        await update.message.reply_text(f"✅ Роутер <b>{cn}</b> обновлён.", parse_mode="HTML")
+        return
+    if context.user_data.get('await_ssh_cmd'):
+        cn = context.user_data.pop('await_ssh_cmd')
+        routers = load_routers()
+        r = routers.get(cn)
+        if not r:
+            await update.message.reply_text("Роутер не найден.")
+            return
+        ip = get_router_ip(cn)
+        if not ip:
+            await update.message.reply_text(f"🔴 {cn} — нет IP.")
+            return
+        cmd = update.message.text.strip()
+        msg = await update.message.reply_text(f"💻 Выполняю на <b>{cn}</b>...", parse_mode="HTML")
+        ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'), r.get('password', ''), cmd)
+        result = f"💻 <b>{cn}</b> ({ip}):\n<pre>{escape(out[:3800])}</pre>"
+        await msg.edit_text(result, parse_mode="HTML")
+        return
     # OVPN EDIT text input
     if context.user_data.get('await_ovpn_edit'):
         file_key = context.user_data.pop('await_ovpn_edit')
@@ -2165,13 +2292,64 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == 'rst_cancel':
         await safe_edit_text(q, context, "Отменено.")
 
-    # --- SSH Routers (stub) ---
+    # --- SSH Routers ---
     elif data == 'ssh_routers':
+        await ssh_menu(update, context)
+    elif data == 'ssh_list':
+        await ssh_list_routers(update, context)
+    elif data == 'ssh_add':
+        await ssh_add_start(update, context)
+    elif data == 'ssh_ping_all':
+        await ssh_ping_all(update, context)
+    elif data.startswith('ssh_status:'):
+        cn = data[len('ssh_status:'):]
+        await ssh_router_status(update, context, cn)
+    elif data == 'ssh_select_status':
+        await ssh_select_router(update, context, 'ssh_status')
+    elif data == 'ssh_select_update':
+        await ssh_select_router(update, context, 'ssh_update')
+    elif data == 'ssh_select_heal':
+        await ssh_select_router(update, context, 'ssh_heal')
+    elif data == 'ssh_select_reboot':
+        await ssh_select_router(update, context, 'ssh_reboot')
+    elif data == 'ssh_select_cmd':
+        await ssh_select_router(update, context, 'ssh_cmd')
+    elif data == 'ssh_select_edit':
+        await ssh_select_router(update, context, 'ssh_edit')
+    elif data == 'ssh_select_delete':
+        await ssh_select_router(update, context, 'ssh_delete')
+    elif data.startswith('ssh_update:'):
+        cn = data[len('ssh_update:'):]
+        await ssh_update_script(update, context, cn)
+    elif data.startswith('ssh_heal:'):
+        cn = data[len('ssh_heal:'):]
+        await ssh_heal_router(update, context, cn)
+    elif data.startswith('ssh_reboot:'):
+        cn = data[len('ssh_reboot:'):]
+        await ssh_reboot_router(update, context, cn)
+    elif data.startswith('ssh_cmd:'):
+        cn = data[len('ssh_cmd:'):]
+        context.user_data['await_ssh_cmd'] = cn
+        await safe_edit_text(q, context, f"💻 Введите команду для <b>{cn}</b>:", parse_mode="HTML")
+    elif data.startswith('ssh_edit:'):
+        cn = data[len('ssh_edit:'):]
+        context.user_data['await_ssh_edit'] = cn
+        routers = load_routers()
+        r = routers.get(cn, {})
         await safe_edit_text(q, context,
-            "🖥 <b>SSH Роутеры</b>\n\n"
-            "🚧 В разработке.\n"
-            "Здесь будет удалённое управление роутерами по SSH.",
+            f"✏️ <b>Редактировать {cn}</b>\n\n"
+            f"Текущие: user=<code>{r.get('user','admin')}</code> port=<code>{r.get('port',22)}</code>\n\n"
+            f"Введите новый пароль (или user:password или user:password:port):",
             parse_mode="HTML")
+    elif data.startswith('ssh_delete:'):
+        cn = data[len('ssh_delete:'):]
+        routers = load_routers()
+        if cn in routers:
+            del routers[cn]
+            save_routers(routers)
+            await safe_edit_text(q, context, f"🗑️ Роутер <b>{cn}</b> удалён.", parse_mode="HTML")
+        else:
+            await safe_edit_text(q, context, "Роутер не найден.")
 
     # --- Remote Refresh callbacks ---
     elif data == 'rr_current_ip':
@@ -2200,6 +2378,232 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     else:
         await safe_edit_text(q, context, "Неизвестная команда.")
+
+# =====================================================================
+#  SSH ROUTERS — handlers
+# =====================================================================
+
+async def ssh_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    routers = load_routers()
+    count = len(routers)
+    kb = [
+        [InlineKeyboardButton(f"📋 Список роутеров ({count})", callback_data='ssh_list')],
+        [InlineKeyboardButton("➕ Добавить", callback_data='ssh_add'),
+         InlineKeyboardButton("✏️ Редактировать", callback_data='ssh_select_edit')],
+        [InlineKeyboardButton("🗑️ Удалить", callback_data='ssh_select_delete')],
+        [InlineKeyboardButton("📡 Пинг всех", callback_data='ssh_ping_all')],
+        [InlineKeyboardButton("🔍 Статус роутера", callback_data='ssh_select_status')],
+        [InlineKeyboardButton("🔄 Обновить скрипт", callback_data='ssh_select_update')],
+        [InlineKeyboardButton("🩹 Лечение", callback_data='ssh_select_heal')],
+        [InlineKeyboardButton("🔁 Перезагрузка", callback_data='ssh_select_reboot')],
+        [InlineKeyboardButton("💻 Команда", callback_data='ssh_select_cmd')],
+        [InlineKeyboardButton("🏠 В главное меню", callback_data='home')],
+    ]
+    await safe_edit_text(q, context,
+        "🖥 <b>SSH Роутеры</b>\n\n"
+        f"Сохранено роутеров: {count}",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+async def ssh_list_routers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    routers = load_routers()
+    if not routers:
+        await safe_edit_text(q, context, "Список пуст. Добавьте роутеры через ➕ Добавить.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')]]))
+        return
+    online = get_online_clients()
+    lines = []
+    for cn, info in sorted(routers.items(), key=lambda x: natural_sort_key(x[0])):
+        ip = get_router_ip(cn)
+        status = "🟢" if cn in online else "🔴"
+        ip_str = ip or "—"
+        lines.append(f"{status} <b>{cn}</b>  {ip_str}")
+    text = "📋 <b>Роутеры:</b>\n\n" + "\n".join(lines)
+    kb = [[InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')]]
+    await safe_edit_text(q, context, text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+async def ssh_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    context.user_data['await_ssh_add'] = True
+    # Show list of clients from ipp.txt that are NOT yet in routers.json
+    routers = load_routers()
+    available = []
+    try:
+        with open(IPP_FILE, "r") as f:
+            for line in f:
+                parts = line.strip().split(",")
+                if len(parts) >= 2 and parts[0] not in routers:
+                    available.append(parts[0])
+    except FileNotFoundError:
+        pass
+    if available:
+        avail_str = ", ".join(sorted(available, key=natural_sort_key))
+        hint = f"\n\nДоступные клиенты:\n<code>{avail_str}</code>"
+    else:
+        hint = "\n\nВсе клиенты из ipp.txt уже добавлены."
+    await safe_edit_text(q, context,
+        f"➕ <b>Добавить роутер</b>{hint}\n\n"
+        "Формат: <code>имя пароль</code>\n"
+        "или: <code>имя пароль порт</code>\n"
+        "User по умолчанию: admin",
+        parse_mode="HTML")
+
+async def ssh_select_router(update: Update, context: ContextTypes.DEFAULT_TYPE, action: str):
+    q = update.callback_query
+    routers = load_routers()
+    if not routers:
+        await safe_edit_text(q, context, "Список роутеров пуст.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')]]))
+        return
+    online = get_online_clients()
+    kb = []
+    for cn in sorted(routers.keys(), key=natural_sort_key):
+        status = "🟢" if cn in online else "🔴"
+        kb.append([InlineKeyboardButton(f"{status} {cn}", callback_data=f'{action}:{cn}')])
+    kb.append([InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')])
+    titles = {
+        'ssh_status': '🔍 Выберите роутер для статуса',
+        'ssh_update': '🔄 Выберите роутер для обновления скрипта',
+        'ssh_heal': '🩹 Выберите роутер для лечения',
+        'ssh_reboot': '🔁 Выберите роутер для перезагрузки',
+        'ssh_cmd': '💻 Выберите роутер для команды',
+        'ssh_edit': '✏️ Выберите роутер для редактирования',
+        'ssh_delete': '🗑️ Выберите роутер для удаления',
+    }
+    await safe_edit_text(q, context, titles.get(action, "Выберите роутер:"),
+        reply_markup=InlineKeyboardMarkup(kb))
+
+async def ssh_ping_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    routers = load_routers()
+    if not routers:
+        await safe_edit_text(q, context, "Список роутеров пуст.")
+        return
+    await safe_edit_text(q, context, "📡 Проверяю роутеры...")
+    online = get_online_clients()
+    results = []
+    for cn in sorted(routers.keys(), key=natural_sort_key):
+        ip = get_router_ip(cn)
+        if cn not in online:
+            results.append(f"🔴 <b>{cn}</b> — оффлайн")
+            continue
+        if not ip:
+            results.append(f"🟡 <b>{cn}</b> — нет IP в ipp.txt")
+            continue
+        r = routers[cn]
+        ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'), r.get('password', ''), "uptime")
+        if ok:
+            results.append(f"🟢 <b>{cn}</b> ({ip}) — {out[:80]}")
+        else:
+            results.append(f"🟠 <b>{cn}</b> ({ip}) — {out[:60]}")
+    text = "📡 <b>Пинг всех роутеров:</b>\n\n" + "\n".join(results)
+    kb = [[InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')]]
+    await q.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+async def ssh_router_status(update: Update, context: ContextTypes.DEFAULT_TYPE, cn: str):
+    q = update.callback_query
+    routers = load_routers()
+    r = routers.get(cn)
+    if not r:
+        await safe_edit_text(q, context, "Роутер не найден.")
+        return
+    ip = get_router_ip(cn)
+    online = get_online_clients()
+    if cn not in online or not ip:
+        await safe_edit_text(q, context, f"🔴 <b>{cn}</b> — оффлайн, SSH невозможен.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')]]))
+        return
+    await safe_edit_text(q, context, f"🔍 Подключаюсь к <b>{cn}</b>...", parse_mode="HTML")
+    cmd = (
+        "echo UPTIME: $(uptime) && "
+        "echo MEMORY: $(free 2>/dev/null | head -2 || cat /proc/meminfo | head -3) && "
+        "echo VPN_STATUS: $(ifconfig tun0 2>/dev/null | grep 'inet addr' || echo 'tun0 not found') && "
+        "echo CRON: $(crontab -l 2>/dev/null | grep update_script || echo 'no cron') && "
+        "echo SCRIPT: $(head -3 /tmp/update_script.sh 2>/dev/null || echo 'not found') && "
+        "echo FIRMWARE: $(cat /etc/storage/firmware_version 2>/dev/null || uname -r)"
+    )
+    ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'), r.get('password', ''), cmd)
+    if ok:
+        text = f"🔍 <b>Статус {cn}</b> ({ip}):\n\n<pre>{escape(out[:3500])}</pre>"
+    else:
+        text = f"❌ <b>{cn}</b>: {out}"
+    kb = [[InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')]]
+    await q.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+async def ssh_update_script(update: Update, context: ContextTypes.DEFAULT_TYPE, cn: str):
+    q = update.callback_query
+    routers = load_routers()
+    r = routers.get(cn)
+    if not r:
+        await safe_edit_text(q, context, "Роутер не найден.")
+        return
+    ip = get_router_ip(cn)
+    if not ip:
+        await safe_edit_text(q, context, f"🔴 {cn} — нет IP.")
+        return
+    await safe_edit_text(q, context, f"🔄 Обновляю скрипт на <b>{cn}</b>...", parse_mode="HTML")
+    # Read domains from domain_list.txt to build the wget command
+    domains = []
+    try:
+        with open(RR_DOMAIN_LIST_FILE, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    domains.append(line)
+    except FileNotFoundError:
+        pass
+    if domains:
+        domain = domains[0]
+        cmd = f"wget -qO /tmp/update_script.sh http://{domain}/router/update_script.sh && echo OK || echo FAIL"
+    else:
+        cmd = "echo 'No domains configured'"
+    ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'), r.get('password', ''), cmd)
+    text = f"🔄 <b>{cn}</b>: {out}" if ok else f"❌ <b>{cn}</b>: {out}"
+    kb = [[InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')]]
+    await q.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+async def ssh_heal_router(update: Update, context: ContextTypes.DEFAULT_TYPE, cn: str):
+    q = update.callback_query
+    routers = load_routers()
+    r = routers.get(cn)
+    if not r:
+        await safe_edit_text(q, context, "Роутер не найден.")
+        return
+    ip = get_router_ip(cn)
+    if not ip:
+        await safe_edit_text(q, context, f"🔴 {cn} — нет IP.")
+        return
+    await safe_edit_text(q, context, f"🩹 Лечу <b>{cn}</b>...", parse_mode="HTML")
+    cmd = "cat /dev/null > /etc/storage/started_script.sh && mtd_storage.sh save && echo HEALED_OK"
+    ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'), r.get('password', ''), cmd)
+    if ok and "HEALED_OK" in out:
+        text = f"🩹 <b>{cn}</b>: Вылечен. Перезагрузите роутер для применения."
+        kb = [
+            [InlineKeyboardButton(f"🔁 Перезагрузить {cn}", callback_data=f'ssh_reboot:{cn}')],
+            [InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')],
+        ]
+    else:
+        text = f"❌ <b>{cn}</b>: {out}"
+        kb = [[InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')]]
+    await q.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+async def ssh_reboot_router(update: Update, context: ContextTypes.DEFAULT_TYPE, cn: str):
+    q = update.callback_query
+    routers = load_routers()
+    r = routers.get(cn)
+    if not r:
+        await safe_edit_text(q, context, "Роутер не найден.")
+        return
+    ip = get_router_ip(cn)
+    if not ip:
+        await safe_edit_text(q, context, f"🔴 {cn} — нет IP.")
+        return
+    ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'), r.get('password', ''), "reboot")
+    text = f"🔁 <b>{cn}</b>: команда reboot отправлена." if ok else f"❌ <b>{cn}</b>: {out}"
+    kb = [[InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')]]
+    await q.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
 # =====================================================================
 #  DOCUMENT HANDLER (backup upload / RR restore)

@@ -4,3 +4,4 @@ pytz
 pyOpenSSL
 cryptography
 pyzipper==0.3.6
+paramiko
