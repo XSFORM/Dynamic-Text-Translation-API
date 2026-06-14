@@ -2414,7 +2414,7 @@ async def ssh_list_routers(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     online = get_online_clients()
     lines = []
-    for cn, info in sorted(routers.items(), key=lambda x: natural_sort_key(x[0])):
+    for cn, info in sorted(routers.items(), key=lambda x: _natural_key(x[0])):
         ip = get_router_ip(cn)
         status = "🟢" if cn in online else "🔴"
         ip_str = ip or "—"
@@ -2438,7 +2438,7 @@ async def ssh_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except FileNotFoundError:
         pass
     if available:
-        avail_str = ", ".join(sorted(available, key=natural_sort_key))
+        avail_str = ", ".join(sorted(available, key=_natural_key))
         hint = f"\n\nДоступные клиенты:\n<code>{avail_str}</code>"
     else:
         hint = "\n\nВсе клиенты из ipp.txt уже добавлены."
@@ -2458,7 +2458,7 @@ async def ssh_select_router(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         return
     online = get_online_clients()
     kb = []
-    for cn in sorted(routers.keys(), key=natural_sort_key):
+    for cn in sorted(routers.keys(), key=_natural_key):
         status = "🟢" if cn in online else "🔴"
         kb.append([InlineKeyboardButton(f"{status} {cn}", callback_data=f'{action}:{cn}')])
     kb.append([InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')])
@@ -2483,7 +2483,7 @@ async def ssh_ping_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_edit_text(q, context, "📡 Проверяю роутеры...")
     online = get_online_clients()
     results = []
-    for cn in sorted(routers.keys(), key=natural_sort_key):
+    for cn in sorted(routers.keys(), key=_natural_key):
         ip = get_router_ip(cn)
         if cn not in online:
             results.append(f"🔴 <b>{cn}</b> — оффлайн")
