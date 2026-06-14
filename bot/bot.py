@@ -1994,21 +1994,42 @@ async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text(f"✅ Роутер <b>{cn}</b> обновлён.", parse_mode="HTML")
         return
     if context.user_data.get('await_ssh_cmd'):
-        cn = context.user_data.pop('await_ssh_cmd')
-        routers = load_routers()
-        r = routers.get(cn)
-        if not r:
-            await update.message.reply_text("Роутер не найден.")
-            return
-        ip = get_router_ip(cn)
-        if not ip:
-            await update.message.reply_text(f"🔴 {cn} — нет IP.")
-            return
+        target = context.user_data.pop('await_ssh_cmd')
         cmd = update.message.text.strip()
-        msg = await update.message.reply_text(f"💻 Выполняю на <b>{cn}</b>...", parse_mode="HTML")
-        ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'), r.get('password', ''), cmd)
-        result = f"💻 <b>{cn}</b> ({ip}):\n<pre>{escape(out[:3800])}</pre>"
-        await msg.edit_text(result, parse_mode="HTML")
+        routers = load_routers()
+        # Determine target list
+        if target == '__all__':
+            targets = sorted(routers.keys(), key=_natural_key)
+            label = "ВСЕХ роутеров"
+        elif isinstance(target, list):
+            targets = target
+            label = f"{len(targets)} роутеров"
+        else:
+            # Single router (legacy)
+            targets = [target]
+            label = target
+        if len(targets) == 1:
+            cn = targets[0]
+            r = routers.get(cn)
+            if not r:
+                await update.message.reply_text("Роутер не найден.")
+                return
+            ip = get_router_ip(cn)
+            if not ip:
+                await update.message.reply_text(f"🔴 {cn} — нет IP.")
+                return
+            msg = await update.message.reply_text(f"💻 Выполняю на <b>{cn}</b>...", parse_mode="HTML")
+            ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'), r.get('password', ''), cmd)
+            result = f"💻 <b>{cn}</b> ({ip}):\n<pre>{escape(out[:3800])}</pre>"
+            await msg.edit_text(result, parse_mode="HTML")
+        else:
+            msg = await update.message.reply_text(f"💻 Выполняю на {label}...\nЭто может занять время.", parse_mode="HTML")
+            report = await ssh_exec_multi(msg, routers, targets, cmd, context)
+            # Split if too long for Telegram
+            if len(report) > 4000:
+                await msg.edit_text(report[:4000] + "\n\n<i>...обрезано</i>", parse_mode="HTML")
+            else:
+                await msg.edit_text(report, parse_mode="HTML")
         return
     # OVPN EDIT text input
     if context.user_data.get('await_ovpn_edit'):
@@ -2313,7 +2334,33 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == 'ssh_select_reboot':
         await ssh_select_router(update, context, 'ssh_reboot')
     elif data == 'ssh_select_cmd':
+        await ssh_cmd_mode_menu(update, context)
+    elif data == 'ssh_cmd_one':
         await ssh_select_router(update, context, 'ssh_cmd')
+    elif data == 'ssh_cmd_all':
+        context.user_data['await_ssh_cmd'] = '__all__'
+        await safe_edit_text(q, context, "💻 Введите команду для <b>ВСЕХ</b> роутеров:", parse_mode="HTML")
+    elif data == 'ssh_cmd_multi':
+        context.user_data['ssh_cmd_selected'] = []
+        await ssh_cmd_multi_select(update, context)
+    elif data.startswith('ssh_cmd_toggle:'):
+        cn = data[len('ssh_cmd_toggle:'):]
+        sel = context.user_data.get('ssh_cmd_selected', [])
+        if cn in sel:
+            sel.remove(cn)
+        else:
+            sel.append(cn)
+        context.user_data['ssh_cmd_selected'] = sel
+        await ssh_cmd_multi_select(update, context)
+    elif data == 'ssh_cmd_multi_done':
+        sel = context.user_data.get('ssh_cmd_selected', [])
+        if not sel:
+            await safe_edit_text(q, context, "Ни один роутер не выбран.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='ssh_select_cmd')]]))
+        else:
+            context.user_data['await_ssh_cmd'] = sel
+            names = ", ".join(sel)
+            await safe_edit_text(q, context, f"💻 Введите команду для: <b>{names}</b>", parse_mode="HTML")
     elif data == 'ssh_select_edit':
         await ssh_select_router(update, context, 'ssh_edit')
     elif data == 'ssh_select_delete':
@@ -2382,6 +2429,70 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =====================================================================
 #  SSH ROUTERS — handlers
 # =====================================================================
+
+async def ssh_cmd_mode_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show command target selection: one / several / all."""
+    q = update.callback_query
+    routers = load_routers()
+    if not routers:
+        await safe_edit_text(q, context, "Список роутеров пуст.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')]]))
+        return
+    kb = [
+        [InlineKeyboardButton("🖥 Один роутер", callback_data='ssh_cmd_one')],
+        [InlineKeyboardButton("☑️ Несколько роутеров", callback_data='ssh_cmd_multi')],
+        [InlineKeyboardButton("🌐 Все роутеры", callback_data='ssh_cmd_all')],
+        [InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')],
+    ]
+    await safe_edit_text(q, context, "💻 <b>Команда</b>\nВыберите режим:",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+async def ssh_cmd_multi_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show router list with toggle checkboxes for multi-select."""
+    q = update.callback_query
+    routers = load_routers()
+    online = get_online_clients()
+    selected = context.user_data.get('ssh_cmd_selected', [])
+    kb = []
+    for cn in sorted(routers.keys(), key=_natural_key):
+        status = "🟢" if cn in online else "🔴"
+        check = "☑️" if cn in selected else "☐"
+        kb.append([InlineKeyboardButton(f"{check} {status} {cn}", callback_data=f'ssh_cmd_toggle:{cn}')])
+    count = len(selected)
+    kb.append([InlineKeyboardButton(f"✅ Готово ({count})", callback_data='ssh_cmd_multi_done')])
+    kb.append([InlineKeyboardButton("◀️ Назад", callback_data='ssh_select_cmd')])
+    await safe_edit_text(q, context, "💻 Выберите роутеры для команды:\n(нажмите чтобы выбрать/убрать)",
+        reply_markup=InlineKeyboardMarkup(kb))
+
+async def ssh_exec_multi(msg, routers_dict, targets, cmd, context):
+    """Execute SSH command on multiple routers and return report."""
+    results = []
+    total = len(targets)
+    for i, cn in enumerate(targets, 1):
+        r = routers_dict.get(cn)
+        if not r:
+            results.append((cn, False, "не найден в routers.json"))
+            continue
+        ip = get_router_ip(cn)
+        online = get_online_clients()
+        if cn not in online:
+            results.append((cn, False, "оффлайн"))
+            continue
+        if not ip:
+            results.append((cn, False, "нет IP"))
+            continue
+        ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'), r.get('password', ''), cmd)
+        results.append((cn, ok, out))
+    # Build report
+    success = sum(1 for _, ok, _ in results if ok)
+    fail = total - success
+    lines = [f"💻 <b>Команда:</b> <code>{escape(cmd[:200])}</code>",
+             f"✅ Успешно: {success}  ❌ Ошибки: {fail}\n"]
+    for cn, ok, out in results:
+        icon = "✅" if ok else "❌"
+        short = out.strip()[:300] if out else "—"
+        lines.append(f"{icon} <b>{cn}</b>:\n<pre>{escape(short)}</pre>")
+    return "\n".join(lines)
 
 async def ssh_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -2663,7 +2774,7 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     shutil.copy2(src, dest_path)
                     restored.append(arcname)
 
-            # Regenerate sha256 for domain_list
+            # nerate sha256 for domain_list
             if "domain_list.txt" in restored:
                 rr_write_sha256(RR_DOMAIN_LIST_FILE)
 
