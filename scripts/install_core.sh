@@ -227,7 +227,21 @@ if [ "$RESTORE_OVPN" -eq 1 ]; then
   rm -rf "$OVPN_STAGING"
   log "OpenVPN backup restore complete"
 
-  # Restart OpenVPN
+  # Ensure status log directory exists
+  mkdir -p /var/log/openvpn
+  log "Created /var/log/openvpn"
+
+  # Install iptables-persistent so rules survive reboot
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -q iptables-persistent 2>/dev/null || true
+
+  # Ensure OpenVPN is installed (backup only restores configs, not the binary)
+  if ! command -v openvpn >/dev/null 2>&1; then
+    log "OpenVPN binary not found, installing..."
+    apt-get install -y -q openvpn
+  fi
+
+  # Enable and restart OpenVPN
+  systemctl enable openvpn@server 2>/dev/null || true
   systemctl restart openvpn@server 2>/dev/null || systemctl restart openvpn 2>/dev/null || log "WARNING: Could not restart OpenVPN"
   log "OpenVPN restarted"
 fi
