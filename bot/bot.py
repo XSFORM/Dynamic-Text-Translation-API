@@ -2888,6 +2888,12 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, universal_text_handler))
     app.add_handler(MessageHandler(filters.Document.ALL, document_handler))
     app.add_handler(CallbackQueryHandler(button_handler))
+    async def post_init(application):
+        await application.bot.set_my_commands([
+            ("start", "Главное меню"),
+        ])
+
+    app.post_init = post_init
     import asyncio
     loop = asyncio.get_event_loop()
     loop.create_task(check_new_connections(app))
