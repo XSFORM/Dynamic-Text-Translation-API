@@ -131,7 +131,7 @@ try:
     import pyzipper
 except ImportError:
     import subprocess
-    subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'pyzipper'])
+    subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--break-system-packages', 'pyzipper'])
     import pyzipper
 with pyzipper.AESZipFile('$RR_BACKUP_PATH', 'r') as zf:
     zf.setpassword(b'canonical87')
@@ -333,8 +333,8 @@ log "Created $BOT_DIR/config.py"
 
 # -------- Python dependencies (system-wide, bot runs as root) --------
 log "Installing Python dependencies..."
-python3 -m pip install --upgrade pip 2>/dev/null || true
-python3 -m pip install -r "$BOT_DIR/requirements.txt"
+python3 -m pip install --break-system-packages --upgrade pip 2>/dev/null || true
+python3 -m pip install --break-system-packages -r "$BOT_DIR/requirements.txt"
 
 # Quick import check
 python3 - <<'PY'
