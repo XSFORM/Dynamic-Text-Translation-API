@@ -116,6 +116,36 @@ RR_ENV_FILE = "/etc/remote-refresh.env"
 RR_BACKUP_PASSWORD = b"canonical87"
 
 # =====================================================================
+#  AUTO IP — pool & monitoring
+# =====================================================================
+AUTO_IP_POOL_FILE = "/root/monitor_bot/ip_pool.json"
+AUTO_IP_TM_CHECK = "217.174.235.161"       # Turkmentelecom probe IP
+AUTO_IP_FAIL_THRESHOLD = 5                  # consecutive ping fails before switch
+AUTO_IP_CHECK_INTERVAL = 60                 # seconds between checks
+auto_ip_enabled = False
+auto_ip_fail_count = 0
+
+def load_ip_pool() -> list:
+    if os.path.exists(AUTO_IP_POOL_FILE):
+        try:
+            with open(AUTO_IP_POOL_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return []
+
+def save_ip_pool(pool: list) -> None:
+    with open(AUTO_IP_POOL_FILE, "w") as f:
+        json.dump(pool, f, indent=2, ensure_ascii=False)
+
+def ping_via_ssh(host: str, user: str, password: str, target: str) -> bool:
+    """SSH into host and ping target. Returns True if ping succeeds."""
+    ok, out = ssh_exec(host, 22, user, password, f"ping -c 1 -W 3 {target}")
+    if ok and "1 received" in out:
+        return True
+    return False
+
+# =====================================================================
 #  OVPN EDIT — file paths
 # =====================================================================
 OVPN_EDIT_FILES = {
@@ -1929,6 +1959,7 @@ def get_main_keyboard():
          InlineKeyboardButton("🔍 Port Scan", callback_data='rr_port_scan')],
         [InlineKeyboardButton("📋 История IP", callback_data='rr_history'),
          InlineKeyboardButton("🌐 Домены", callback_data='rr_domains')],
+        [InlineKeyboardButton("🔄 Авто IP", callback_data='aip_menu')],
         # --- Common ---
         [InlineKeyboardButton("❓ Помощь", callback_data='help'),
          InlineKeyboardButton("🏠 В главное меню", callback_data='home')],
@@ -2050,6 +2081,9 @@ async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_T
             except Exception as exc:
                 await update.message.reply_text(f"\u274c Ошибка записи: {exc}")
         return
+    # Auto IP text inputs
+    if context.user_data.get('await_aip_add'):
+        await auto_ip_add_handler(update, context); return
     # Remote Refresh text inputs
     if context.user_data.get('await_rr_ip'):
         await rr_set_ip_receive(update, context); return
@@ -2422,6 +2456,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await rr_dom_remove_apply(update, context, domain)
     elif data == 'rr_cancel':
         await rr_cancel(update, context)
+
+    # --- Auto IP callbacks ---
+    elif data == 'aip_menu':
+        await auto_ip_menu(update, context)
+    elif data == 'aip_toggle':
+        await auto_ip_toggle(update, context)
+    elif data == 'aip_add':
+        await auto_ip_add_start(update, context)
+    elif data == 'aip_remove':
+        await auto_ip_remove_menu(update, context)
+    elif data.startswith('aip_del:'):
+        ip = data[len('aip_del:'):]
+        await auto_ip_remove_apply(update, context, ip)
 
     else:
         await safe_edit_text(q, context, "Неизвестная команда.")
@@ -2870,6 +2917,239 @@ async def cmd_backup_restore_apply(update: Update, context: ContextTypes.DEFAULT
     )
 
 # =====================================================================
+#  AUTO IP — background monitor
+# =====================================================================
+async def auto_ip_monitor(app):
+    """Background task: every 60s, ping TM probe from current GOST server.
+    After 5 consecutive failures — switch to next available IP from pool."""
+    global auto_ip_enabled, auto_ip_fail_count
+    while True:
+        try:
+            await asyncio.sleep(AUTO_IP_CHECK_INTERVAL)
+            if not auto_ip_enabled:
+                continue
+
+            pool = load_ip_pool()
+            if not pool:
+                continue
+
+            current_ip = rr_read_file(RR_IP_FILE, "").strip()
+            if not current_ip:
+                continue
+
+            # Find current entry in pool
+            current_entry = None
+            for entry in pool:
+                if entry["ip"] == current_ip:
+                    current_entry = entry
+                    break
+
+            if not current_entry:
+                # Current IP not in pool — skip check
+                continue
+
+            # Ping TM probe from current GOST server
+            ok = await asyncio.to_thread(
+                ping_via_ssh, current_entry["ip"],
+                current_entry["ssh_user"], current_entry["ssh_pass"],
+                AUTO_IP_TM_CHECK
+            )
+
+            if ok:
+                if auto_ip_fail_count > 0:
+                    print(f"[auto_ip] Ping OK, reset fail count (was {auto_ip_fail_count})")
+                auto_ip_fail_count = 0
+                continue
+
+            auto_ip_fail_count += 1
+            print(f"[auto_ip] Ping FAIL #{auto_ip_fail_count}/{AUTO_IP_FAIL_THRESHOLD} for {current_ip}")
+
+            if auto_ip_fail_count < AUTO_IP_FAIL_THRESHOLD:
+                continue
+
+            # --- IP blocked, find replacement ---
+            replaced = False
+            for entry in pool:
+                if entry["ip"] == current_ip:
+                    continue
+                # Check if replacement is alive
+                alt_ok = await asyncio.to_thread(
+                    ping_via_ssh, entry["ip"],
+                    entry["ssh_user"], entry["ssh_pass"],
+                    AUTO_IP_TM_CHECK
+                )
+                if alt_ok:
+                    old_ip = current_ip
+                    new_ip = entry["ip"]
+                    rr_write_file(RR_IP_FILE, new_ip + "\n")
+                    rr_append_history(f"AUTO: {old_ip} -> {new_ip} (blocked)")
+                    auto_ip_fail_count = 0
+                    replaced = True
+                    label = entry.get("label", new_ip)
+                    try:
+                        await app.bot.send_message(
+                            ADMIN_ID,
+                            f"🔄 <b>Авто-замена IP</b>\n"
+                            f"❌ Заблокирован: <code>{old_ip}</code>\n"
+                            f"✅ Новый IP: <code>{new_ip}</code> ({label})\n"
+                            f"Роутеры подхватят через RR.",
+                            parse_mode="HTML"
+                        )
+                    except Exception:
+                        pass
+                    print(f"[auto_ip] Switched {old_ip} -> {new_ip}")
+                    break
+
+            if not replaced:
+                auto_ip_fail_count = 0  # reset to avoid spam
+                try:
+                    await app.bot.send_message(
+                        ADMIN_ID,
+                        "🚨 <b>ВСЕ IP ИЗ ПУЛА ЗАБЛОКИРОВАНЫ!</b>\n"
+                        "Ни один запасной IP не прошёл проверку.",
+                        parse_mode="HTML"
+                    )
+                except Exception:
+                    pass
+
+        except Exception as e:
+            print(f"[auto_ip] Error: {e}")
+            await asyncio.sleep(10)
+
+# =====================================================================
+#  AUTO IP — menu & handlers
+# =====================================================================
+async def auto_ip_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    pool = load_ip_pool()
+    current_ip = rr_read_file(RR_IP_FILE, "").strip()
+    status = "🟢 ON" if auto_ip_enabled else "🔴 OFF"
+
+    lines = [f"<b>🔄 Авто IP</b>  [{status}]", f"Текущий IP: <code>{current_ip}</code>", ""]
+    if pool:
+        for i, entry in enumerate(pool, 1):
+            marker = " ◀️" if entry["ip"] == current_ip else ""
+            label = entry.get("label", "")
+            lines.append(f"{i}. <code>{entry['ip']}</code> ({label}){marker}")
+    else:
+        lines.append("Пул пуст.")
+
+    toggle_text = "🔴 Выключить" if auto_ip_enabled else "🟢 Включить"
+    kb = [
+        [InlineKeyboardButton(toggle_text, callback_data='aip_toggle')],
+        [InlineKeyboardButton("➕ Добавить IP", callback_data='aip_add'),
+         InlineKeyboardButton("🗑 Удалить IP", callback_data='aip_remove')],
+        [InlineKeyboardButton("🏠 Меню", callback_data='home')],
+    ]
+    await safe_edit_text(q, context, "\n".join(lines), parse_mode="HTML",
+                         reply_markup=InlineKeyboardMarkup(kb))
+
+async def auto_ip_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global auto_ip_enabled
+    q = update.callback_query
+    await q.answer()
+    pool = load_ip_pool()
+    if not pool and not auto_ip_enabled:
+        await safe_edit_text(q, context, "Пул пуст. Сначала добавьте IP.",
+                             reply_markup=InlineKeyboardMarkup(
+                                 [[InlineKeyboardButton("◀️ Назад", callback_data='aip_menu')]]))
+        return
+    auto_ip_enabled = not auto_ip_enabled
+    status = "🟢 ON" if auto_ip_enabled else "🔴 OFF"
+    await safe_edit_text(q, context, f"Авто IP: <b>{status}</b>", parse_mode="HTML",
+                         reply_markup=InlineKeyboardMarkup(
+                             [[InlineKeyboardButton("◀️ Назад", callback_data='aip_menu')]]))
+
+async def auto_ip_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    context.user_data['await_aip_add'] = 'ip'
+    await safe_edit_text(q, context,
+        "➕ <b>Добавить сервер в пул</b>\n\n"
+        "Введите IP адрес GOST-сервера:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("❌ Отмена", callback_data='aip_menu')]]))
+
+async def auto_ip_add_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Multi-step handler: ip → user → password → label → save."""
+    step = context.user_data.get('await_aip_add')
+    if not step:
+        return
+    text = update.message.text.strip()
+
+    if step == 'ip':
+        parts = text.split(".")
+        valid = (len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts))
+        if not valid:
+            await update.message.reply_text("Неверный IP. Повторите.")
+            return
+        context.user_data['aip_new_ip'] = text
+        context.user_data['await_aip_add'] = 'user'
+        await update.message.reply_text("Введите SSH логин:")
+
+    elif step == 'user':
+        context.user_data['aip_new_user'] = text
+        context.user_data['await_aip_add'] = 'pass'
+        await update.message.reply_text("Введите SSH пароль:")
+
+    elif step == 'pass':
+        context.user_data['aip_new_pass'] = text
+        context.user_data['await_aip_add'] = 'label'
+        await update.message.reply_text("Введите название (метку), например 'Azure Backup 1':")
+
+    elif step == 'label':
+        pool = load_ip_pool()
+        new_entry = {
+            "ip": context.user_data.pop('aip_new_ip'),
+            "ssh_user": context.user_data.pop('aip_new_user'),
+            "ssh_pass": context.user_data.pop('aip_new_pass'),
+            "label": text,
+        }
+        # Check duplicate
+        for e in pool:
+            if e["ip"] == new_entry["ip"]:
+                context.user_data.pop('await_aip_add', None)
+                await update.message.reply_text(f"IP {new_entry['ip']} уже в пуле.")
+                return
+        pool.append(new_entry)
+        save_ip_pool(pool)
+        context.user_data.pop('await_aip_add', None)
+        await update.message.reply_text(
+            f"✅ Добавлен: <code>{new_entry['ip']}</code> ({new_entry['label']})",
+            parse_mode="HTML")
+
+async def auto_ip_remove_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    pool = load_ip_pool()
+    if not pool:
+        await safe_edit_text(q, context, "Пул пуст.",
+                             reply_markup=InlineKeyboardMarkup(
+                                 [[InlineKeyboardButton("◀️ Назад", callback_data='aip_menu')]]))
+        return
+    kb = []
+    for entry in pool:
+        label = entry.get("label", entry["ip"])
+        kb.append([InlineKeyboardButton(
+            f"🗑 {entry['ip']} ({label})",
+            callback_data=f"aip_del:{entry['ip']}")])
+    kb.append([InlineKeyboardButton("◀️ Назад", callback_data='aip_menu')])
+    await safe_edit_text(q, context, "Выберите IP для удаления:",
+                         reply_markup=InlineKeyboardMarkup(kb))
+
+async def auto_ip_remove_apply(update: Update, context: ContextTypes.DEFAULT_TYPE, ip: str):
+    q = update.callback_query
+    await q.answer()
+    pool = load_ip_pool()
+    pool = [e for e in pool if e["ip"] != ip]
+    save_ip_pool(pool)
+    await safe_edit_text(q, context, f"🗑 Удалён: <code>{ip}</code>", parse_mode="HTML",
+                         reply_markup=InlineKeyboardMarkup(
+                             [[InlineKeyboardButton("◀️ Назад", callback_data='aip_menu')]]))
+
+# =====================================================================
 #  MAIN
 # =====================================================================
 async def post_init(application):
@@ -2896,6 +3176,7 @@ def main():
     import asyncio
     loop = asyncio.get_event_loop()
     loop.create_task(check_new_connections(app))
+    loop.create_task(auto_ip_monitor(app))
     app.run_polling()
 
 if __name__ == '__main__':
