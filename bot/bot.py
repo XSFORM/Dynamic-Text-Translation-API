@@ -4,6 +4,7 @@ Unified Telegram Bot — OpenVPN management + Remote Refresh IP updater.
 Runs as root. Single token, single process.
 """
 
+import asyncio
 import os
 import subprocess
 import time
@@ -3173,7 +3174,6 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, universal_text_handler))
     app.add_handler(MessageHandler(filters.Document.ALL, document_handler))
     app.add_handler(CallbackQueryHandler(button_handler))
-    import asyncio
     loop = asyncio.get_event_loop()
     loop.create_task(check_new_connections(app))
     loop.create_task(auto_ip_monitor(app))
