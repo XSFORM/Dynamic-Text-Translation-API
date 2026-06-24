@@ -2088,6 +2088,9 @@ async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_T
             except Exception as exc:
                 await update.message.reply_text(f"\u274c Ошибка записи: {exc}")
         return
+    # SSH deploy script text input
+    if context.user_data.get('await_ssh_deploy_ip'):
+        await ssh_deploy_receive_ip(update, context); return
     # Auto IP text inputs
     if context.user_data.get('await_aip_add'):
         await auto_ip_add_handler(update, context); return
@@ -2374,6 +2377,31 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await ssh_select_router(update, context, 'ssh_status')
     elif data == 'ssh_select_update':
         await ssh_select_router(update, context, 'ssh_update')
+    elif data == 'ssh_select_deploy':
+        await ssh_select_router(update, context, 'ssh_deploy')
+    elif data.startswith('ssh_deploy:'):
+        cn = data[len('ssh_deploy:'):]
+        context.user_data['ssh_deploy_cn'] = cn
+        # Ask for front IP
+        domains = []
+        try:
+            with open(RR_DOMAIN_LIST_FILE, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        domains.append(line)
+        except FileNotFoundError:
+            pass
+        front_ip = rr_read_file(RR_IP_FILE, "").strip()
+        await safe_edit_text(q, context,
+            f"📦 <b>Залить скрипт на {cn}</b>\n\n"
+            f"Введите IP фронт-сервера (через который роутер скачает скрипт).\n"
+            f"Текущий router IP: <code>{front_ip}</code>\n\n"
+            f"Или отправьте IP (например 193.47.41.66):",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("❌ Отмена", callback_data='ssh_routers')]]))
+        context.user_data['await_ssh_deploy_ip'] = True
     elif data == 'ssh_select_heal':
         await ssh_select_router(update, context, 'ssh_heal')
     elif data == 'ssh_select_reboot':
@@ -2564,6 +2592,7 @@ async def ssh_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📡 Пинг всех", callback_data='ssh_ping_all')],
         [InlineKeyboardButton("🔍 Статус роутера", callback_data='ssh_select_status')],
         [InlineKeyboardButton("🔄 Обновить скрипт", callback_data='ssh_select_update')],
+        [InlineKeyboardButton("📦 Залить скрипт", callback_data='ssh_select_deploy')],
         [InlineKeyboardButton("🩹 Лечение", callback_data='ssh_select_heal')],
         [InlineKeyboardButton("🔁 Перезагрузка", callback_data='ssh_select_reboot')],
         [InlineKeyboardButton("💻 Команда", callback_data='ssh_select_cmd')],
@@ -2732,6 +2761,69 @@ async def ssh_update_script(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     text = f"🔄 <b>{cn}</b>: {out}" if ok else f"❌ <b>{cn}</b>: {out}"
     kb = [[InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')]]
     await q.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+async def ssh_deploy_receive_ip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Receive front IP for deploy, then execute full deploy script on router."""
+    if not context.user_data.get('await_ssh_deploy_ip'):
+        return
+    text = update.message.text.strip()
+    parts = text.split(".")
+    valid = (len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts))
+    if not valid:
+        await update.message.reply_text("Неверный IP. Повторите или /start для отмены.")
+        return
+    front_ip = text
+    cn = context.user_data.pop('ssh_deploy_cn', None)
+    context.user_data.pop('await_ssh_deploy_ip', None)
+    if not cn:
+        await update.message.reply_text("Ошибка: роутер не выбран.")
+        return
+    routers = load_routers()
+    r = routers.get(cn)
+    if not r:
+        await update.message.reply_text(f"Роутер {cn} не найден.")
+        return
+    ip = get_router_ip(cn)
+    if not ip:
+        await update.message.reply_text(f"🔴 {cn} — нет IP (оффлайн?).")
+        return
+    msg = await update.message.reply_text(
+        f"📦 Заливаю скрипт на <b>{cn}</b> через <code>{front_ip}</code>...",
+        parse_mode="HTML")
+    # Build the full deploy command
+    deploy_cmd = (
+        f'echo "=== BEFORE ===" ; '
+        f'ifconfig tun0 2>/dev/null | grep -qi inet && echo "tun0 UP" || echo "tun0 DOWN" ; '
+        f"grep '^remote ' /etc/openvpn/client/client.conf 2>/dev/null ; "
+        f'wget -q -O /tmp/us.sh http://{front_ip}/router/update_script.sh && '
+        f'[ "$(grep -c is_reserved_ipv4 /tmp/us.sh)" = "3" ] && '
+        f"tail -n1 /tmp/us.sh | grep -q '^exit 0' && {{ "
+        f'cp /etc/storage/update_script.sh /etc/storage/update_script.sh.bak.$(date +%H%M) 2>/dev/null ; '
+        f'mv /tmp/us.sh /etc/storage/update_script.sh && chmod +x /etc/storage/update_script.sh ; '
+        f'wget -q -O- http://{front_ip}/router/domain_list.txt | grep -E "^[A-Za-z0-9._-]+$" > /tmp/dom.tmp ; '
+        f'[ -s /tmp/dom.tmp ] && mv /tmp/dom.tmp /etc/storage/remote_domains.list ; '
+        f'CRON_DIR="/etc/storage/cron/crontabs" ; mkdir -p "$CRON_DIR" ; CF="$CRON_DIR/admin" ; '
+        f"grep -v 'update_script\\.sh' \"$CF\" 2>/dev/null > \"$CF.tmp\" ; "
+        f'echo "*/15 * * * * /etc/storage/update_script.sh" >> "$CF.tmp" ; mv "$CF.tmp" "$CF" ; '
+        f'nvram set crond_enable=1 >/dev/null 2>&1 ; nvram commit >/dev/null 2>&1 ; '
+        f'killall crond 2>/dev/null ; sleep 1 ; crond -c "$CRON_DIR" -l 8 2>/dev/null ; '
+        f'mtd_storage.sh save ; '
+        f'echo "=== DEPLOY OK ===" ; '
+        f"grep 'Version:' /etc/storage/update_script.sh ; "
+        f'echo "--- domains ---" ; cat /etc/storage/remote_domains.list ; '
+        f'echo "--- cron ---" ; cat "$CF" ; '
+        f'echo "=== RUN ===" ; /etc/storage/update_script.sh ; '
+        f'echo "=== AFTER ===" ; grep "^remote " /etc/openvpn/client/client.conf ; '
+        f'sleep 8 ; ifconfig tun0 2>/dev/null | grep -qi inet && echo "tun0 UP" || echo "tun0 DOWN" ; '
+        f'}} || {{ echo "=== ABORTED ===" ; rm -f /tmp/us.sh ; }}'
+    )
+    ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'), r.get('password', ''), deploy_cmd)
+    short = out.strip()[:3000] if out else "—"
+    icon = "✅" if ok and "DEPLOY OK" in out else "❌"
+    await msg.edit_text(
+        f"{icon} <b>Деплой на {cn}</b>:\n<pre>{escape(short)}</pre>",
+        parse_mode="HTML")
+
 
 async def ssh_heal_router(update: Update, context: ContextTypes.DEFAULT_TYPE, cn: str):
     q = update.callback_query
