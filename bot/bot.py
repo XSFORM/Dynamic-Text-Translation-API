@@ -2069,6 +2069,12 @@ async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_T
         path = OVPN_EDIT_FILES.get(file_key)
         if path:
             new_content = update.message.text
+            # Safety: reject if content is too short or looks like a bare IP
+            if len(new_content.strip()) < 50 or re.match(r'^\d{1,3}(\.\d{1,3}){3}$', new_content.strip()):
+                await update.message.reply_text(
+                    "⚠️ Отклонено: содержимое слишком короткое или похоже на IP-адрес.\n"
+                    "Для редактирования конфига отправьте полный текст файла.")
+                return
             try:
                 # Save backup copy
                 if os.path.exists(path):
@@ -2101,6 +2107,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer("Доступ запрещён.", show_alert=True); return
     await q.answer()
     data = q.data
+
+    # Clear stale await flags when user clicks any button (prevents cross-menu writes)
+    if data not in ('ovpn_view_server_conf', 'ovpn_view_client_template', 'ovpn_edit_cancel'):
+        context.user_data.pop('await_ovpn_edit', None)
     print("DEBUG callback_data:", data)
 
     # --- OpenVPN callbacks ---
