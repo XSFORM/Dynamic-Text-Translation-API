@@ -2941,10 +2941,12 @@ async def ssh_chpass_receive(update: Update, context: ContextTypes.DEFAULT_TYPE)
             continue
         ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'), r.get('password', ''), chpass_cmd)
         if ok and "CHPASS_OK" in out:
-            results.append(f"✅ <b>{cn}</b> — пароль изменён")
             # Update routers.json with new credentials
             routers[cn]['user'] = login
             routers[cn]['password'] = password
+            # Reboot to apply (fire-and-forget)
+            ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'), r.get('password', ''), 'reboot')
+            results.append(f"✅ <b>{cn}</b> — пароль изменён, reboot")
         else:
             results.append(f"❌ <b>{cn}</b> — {escape(out[:200])}")
     save_routers(routers)
