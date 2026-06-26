@@ -121,6 +121,7 @@ RR_BACKUP_PASSWORD = b"canonical87"
 # =====================================================================
 AUTO_IP_POOL_FILE = "/root/monitor_bot/ip_pool.json"
 AUTO_IP_STATE_FILE = "/root/monitor_bot/auto_ip_state.json"
+DEPLOY_FRONT_IP_FILE = "/root/monitor_bot/deploy_front_ip.txt"
 AUTO_IP_TM_CHECK = "217.174.235.161"       # Turkmentelecom probe IP
 AUTO_IP_FAIL_THRESHOLD = 5                  # consecutive ping fails before switch
 AUTO_IP_CHECK_INTERVAL = 60                 # seconds between checks
@@ -2397,26 +2398,36 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith('ssh_deploy:'):
         cn = data[len('ssh_deploy:'):]
         context.user_data['ssh_deploy_cn'] = cn
-        # Ask for front IP
-        domains = []
+        # Read last saved front IP
+        saved_front = ""
         try:
-            with open(RR_DOMAIN_LIST_FILE, "r") as f:
-                for line in f:
-                    line = line.strip()
-                    if line and not line.startswith("#"):
-                        domains.append(line)
+            with open(DEPLOY_FRONT_IP_FILE, "r") as f:
+                saved_front = f.read().strip()
         except FileNotFoundError:
             pass
         front_ip = rr_read_file(RR_IP_FILE, "").strip()
+        kb = []
+        if saved_front:
+            kb.append([InlineKeyboardButton(f"✅ {saved_front}", callback_data=f'ssh_deploy_use:{saved_front}')])
+        kb.append([InlineKeyboardButton("❌ Отмена", callback_data='ssh_routers')])
+        hint = f"\nПоследний фронт: <code>{saved_front}</code>" if saved_front else ""
         await safe_edit_text(q, context,
             f"📦 <b>Залить скрипт на {cn}</b>\n\n"
             f"Введите IP фронт-сервера (через который роутер скачает скрипт).\n"
-            f"Текущий router IP: <code>{front_ip}</code>\n\n"
-            f"Или отправьте IP (например 193.47.41.66):",
+            f"Текущий router IP: <code>{front_ip}</code>{hint}\n\n"
+            f"Или отправьте новый IP:",
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("❌ Отмена", callback_data='ssh_routers')]]))
+            reply_markup=InlineKeyboardMarkup(kb))
         context.user_data['await_ssh_deploy_ip'] = True
+    elif data.startswith('ssh_deploy_use:'):
+        # Quick-select saved front IP
+        front_ip = data[len('ssh_deploy_use:'):]
+        cn = context.user_data.pop('ssh_deploy_cn', None)
+        context.user_data.pop('await_ssh_deploy_ip', None)
+        if not cn:
+            await safe_edit_text(q, context, "Ошибка: роутер не выбран.")
+            return
+        await _do_ssh_deploy(q.message, context, cn, front_ip, edit_msg=q)
     elif data == 'ssh_select_heal':
         await ssh_select_router(update, context, 'ssh_heal')
     elif data == 'ssh_select_reboot':
@@ -2777,34 +2788,39 @@ async def ssh_update_script(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     kb = [[InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')]]
     await q.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
-async def ssh_deploy_receive_ip(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Receive front IP for deploy, then execute full deploy script on router."""
-    if not context.user_data.get('await_ssh_deploy_ip'):
-        return
-    text = update.message.text.strip()
-    parts = text.split(".")
-    valid = (len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts))
-    if not valid:
-        await update.message.reply_text("Неверный IP. Повторите или /start для отмены.")
-        return
-    front_ip = text
-    cn = context.user_data.pop('ssh_deploy_cn', None)
-    context.user_data.pop('await_ssh_deploy_ip', None)
-    if not cn:
-        await update.message.reply_text("Ошибка: роутер не выбран.")
-        return
+async def _do_ssh_deploy(msg_or_update, context, cn: str, front_ip: str, edit_msg=None):
+    """Execute full deploy script on router. Called from text input or button."""
+    # Save front IP for next time
+    try:
+        with open(DEPLOY_FRONT_IP_FILE, "w") as f:
+            f.write(front_ip)
+    except Exception:
+        pass
     routers = load_routers()
     r = routers.get(cn)
     if not r:
-        await update.message.reply_text(f"Роутер {cn} не найден.")
+        if edit_msg:
+            await safe_edit_text(edit_msg, context, f"Роутер {cn} не найден.")
+        else:
+            await msg_or_update.reply_text(f"Роутер {cn} не найден.")
         return
     ip = get_router_ip(cn)
     if not ip:
-        await update.message.reply_text(f"🔴 {cn} — нет IP (оффлайн?).")
+        text = f"🔴 {cn} — нет IP (оффлайн?)."
+        if edit_msg:
+            await safe_edit_text(edit_msg, context, text)
+        else:
+            await msg_or_update.reply_text(text)
         return
-    msg = await update.message.reply_text(
-        f"📦 Заливаю скрипт на <b>{cn}</b> через <code>{front_ip}</code>...",
-        parse_mode="HTML")
+    if edit_msg:
+        await safe_edit_text(edit_msg, context,
+            f"📦 Заливаю скрипт на <b>{cn}</b> через <code>{front_ip}</code>...",
+            parse_mode="HTML")
+        msg = edit_msg.message
+    else:
+        msg = await msg_or_update.reply_text(
+            f"📦 Заливаю скрипт на <b>{cn}</b> через <code>{front_ip}</code>...",
+            parse_mode="HTML")
     # Build the full deploy command
     deploy_cmd = (
         f'echo "=== BEFORE ===" ; '
@@ -2838,6 +2854,24 @@ async def ssh_deploy_receive_ip(update: Update, context: ContextTypes.DEFAULT_TY
     await msg.edit_text(
         f"{icon} <b>Деплой на {cn}</b>:\n<pre>{escape(short)}</pre>",
         parse_mode="HTML")
+
+async def ssh_deploy_receive_ip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Receive front IP for deploy, then execute full deploy script on router."""
+    if not context.user_data.get('await_ssh_deploy_ip'):
+        return
+    text = update.message.text.strip()
+    parts = text.split(".")
+    valid = (len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts))
+    if not valid:
+        await update.message.reply_text("Неверный IP. Повторите или /start для отмены.")
+        return
+    front_ip = text
+    cn = context.user_data.pop('ssh_deploy_cn', None)
+    context.user_data.pop('await_ssh_deploy_ip', None)
+    if not cn:
+        await update.message.reply_text("Ошибка: роутер не выбран.")
+        return
+    await _do_ssh_deploy(update.message, context, cn, front_ip)
 
 
 async def ssh_heal_router(update: Update, context: ContextTypes.DEFAULT_TYPE, cn: str):
