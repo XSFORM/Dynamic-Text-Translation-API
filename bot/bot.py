@@ -2509,9 +2509,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['ssh_chpass_targets'] = '__all__'
         await safe_edit_text(q, context,
             "🔑 <b>Сменить пароль на ВСЕХ роутерах</b>\n\n"
-            "Введите логин и пароль через пробел:\n"
-            "<code>admin новый_пароль</code>\n\n"
-            "Или только пароль (логин = admin):",
+            "Введите новый пароль:",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("❌ Отмена", callback_data='ssh_routers')]]))
@@ -2551,9 +2549,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['ssh_chpass_targets'] = [cn]
         await safe_edit_text(q, context,
             f"🔑 <b>Сменить пароль на {cn}</b>\n\n"
-            "Введите логин и пароль через пробел:\n"
-            "<code>admin новый_пароль</code>\n\n"
-            "Или только пароль (логин = admin):",
+            "Введите новый пароль:",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("❌ Отмена", callback_data='ssh_routers')]]))
@@ -2892,17 +2888,9 @@ async def ssh_chpass_receive(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     context.user_data.pop('await_ssh_chpass', None)
     targets = context.user_data.pop('ssh_chpass_targets', None)
-    text = update.message.text.strip()
-    parts = text.split()
-    if len(parts) == 1:
-        login = "admin"
-        password = parts[0]
-    elif len(parts) == 2:
-        login = parts[0]
-        password = parts[1]
-    else:
-        await update.message.reply_text("Формат: <code>логин пароль</code> или просто <code>пароль</code>",
-            parse_mode="HTML")
+    password = update.message.text.strip()
+    if not password or ' ' in password:
+        await update.message.reply_text("Введите пароль одним словом (без пробелов).")
         return
     if not targets:
         await update.message.reply_text("Ошибка: роутеры не выбраны.")
@@ -2922,10 +2910,9 @@ async def ssh_chpass_receive(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("Нет активных роутеров.")
         return
     msg = await update.message.reply_text(
-        f"🔑 Меняю пароль на {label}...\nЛогин: <code>{login}</code>",
+        f"🔑 Меняю пароль на {label}...",
         parse_mode="HTML")
     chpass_cmd = (
-        f'nvram set http_username={login} && '
         f'nvram set http_passwd={password} && '
         f'nvram commit && mtd_storage.sh save && echo CHPASS_OK'
     )
@@ -2941,8 +2928,7 @@ async def ssh_chpass_receive(update: Update, context: ContextTypes.DEFAULT_TYPE)
             continue
         ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'), r.get('password', ''), chpass_cmd)
         if ok and "CHPASS_OK" in out:
-            # Update routers.json with new credentials
-            routers[cn]['user'] = login
+            # Update routers.json with new password
             routers[cn]['password'] = password
             # Reboot to apply (fire-and-forget)
             ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'), r.get('password', ''), 'reboot')
