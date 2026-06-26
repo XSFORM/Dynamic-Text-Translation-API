@@ -2110,6 +2110,9 @@ async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_T
     # SSH deploy script text input
     if context.user_data.get('await_ssh_deploy_ip'):
         await ssh_deploy_receive_ip(update, context); return
+    # SSH change password text input
+    if context.user_data.get('await_ssh_chpass'):
+        await ssh_chpass_receive(update, context); return
     # Auto IP text inputs
     if context.user_data.get('await_aip_add'):
         await auto_ip_add_handler(update, context); return
@@ -2497,6 +2500,65 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await safe_edit_text(q, context, "Роутер не найден.")
 
+    # --- Change password callbacks ---
+    elif data == 'ssh_chpass_menu':
+        await ssh_chpass_mode_menu(update, context)
+    elif data == 'ssh_chpass_one':
+        await ssh_select_router(update, context, 'ssh_chpass')
+    elif data == 'ssh_chpass_all':
+        context.user_data['ssh_chpass_targets'] = '__all__'
+        await safe_edit_text(q, context,
+            "🔑 <b>Сменить пароль на ВСЕХ роутерах</b>\n\n"
+            "Введите логин и пароль через пробел:\n"
+            "<code>admin новый_пароль</code>\n\n"
+            "Или только пароль (логин = admin):",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("❌ Отмена", callback_data='ssh_routers')]]))
+        context.user_data['await_ssh_chpass'] = True
+    elif data == 'ssh_chpass_multi':
+        context.user_data['ssh_chpass_selected'] = []
+        await ssh_chpass_multi_select(update, context)
+    elif data.startswith('ssh_chpass_toggle:'):
+        cn = data[len('ssh_chpass_toggle:'):]
+        sel = context.user_data.get('ssh_chpass_selected', [])
+        if cn in sel:
+            sel.remove(cn)
+        else:
+            sel.append(cn)
+        context.user_data['ssh_chpass_selected'] = sel
+        await ssh_chpass_multi_select(update, context)
+    elif data == 'ssh_chpass_multi_done':
+        sel = context.user_data.get('ssh_chpass_selected', [])
+        if not sel:
+            await safe_edit_text(q, context, "Не выбрано ни одного роутера.",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("◀️ Назад", callback_data='ssh_chpass_menu')]]))
+        else:
+            context.user_data['ssh_chpass_targets'] = sel
+            names = ", ".join(sel)
+            await safe_edit_text(q, context,
+                f"🔑 <b>Сменить пароль на: {names}</b>\n\n"
+                "Введите логин и пароль через пробел:\n"
+                "<code>admin новый_пароль</code>\n\n"
+                "Или только пароль (логин = admin):",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("❌ Отмена", callback_data='ssh_routers')]]))
+            context.user_data['await_ssh_chpass'] = True
+    elif data.startswith('ssh_chpass:'):
+        cn = data[len('ssh_chpass:'):]
+        context.user_data['ssh_chpass_targets'] = [cn]
+        await safe_edit_text(q, context,
+            f"🔑 <b>Сменить пароль на {cn}</b>\n\n"
+            "Введите логин и пароль через пробел:\n"
+            "<code>admin новый_пароль</code>\n\n"
+            "Или только пароль (логин = admin):",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("❌ Отмена", callback_data='ssh_routers')]]))
+        context.user_data['await_ssh_chpass'] = True
+
     # --- Remote Refresh callbacks ---
     elif data == 'rr_current_ip':
         await rr_current_ip(update, context)
@@ -2622,6 +2684,7 @@ async def ssh_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🩹 Лечение", callback_data='ssh_select_heal')],
         [InlineKeyboardButton("🔁 Перезагрузка", callback_data='ssh_select_reboot')],
         [InlineKeyboardButton("💻 Команда", callback_data='ssh_select_cmd')],
+        [InlineKeyboardButton("🔑 Сменить пароль", callback_data='ssh_chpass_menu')],
         [InlineKeyboardButton("🏠 В главное меню", callback_data='home')],
     ]
     await safe_edit_text(q, context,
@@ -2694,6 +2757,7 @@ async def ssh_select_router(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         'ssh_cmd': '💻 Выберите роутер для команды',
         'ssh_edit': '✏️ Выберите роутер для редактирования',
         'ssh_delete': '🗑️ Выберите роутер для удаления',
+        'ssh_chpass': '🔑 Выберите роутер для смены пароля',
     }
     await safe_edit_text(q, context, titles.get(action, "Выберите роутер:"),
         reply_markup=InlineKeyboardMarkup(kb))
@@ -2787,6 +2851,105 @@ async def ssh_update_script(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     text = f"🔄 <b>{cn}</b>: {out}" if ok else f"❌ <b>{cn}</b>: {out}"
     kb = [[InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')]]
     await q.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+async def ssh_chpass_mode_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show change password target selection: one / several / all."""
+    q = update.callback_query
+    routers = load_routers()
+    online = get_online_clients()
+    online_count = sum(1 for cn in routers if cn in online)
+    kb = [
+        [InlineKeyboardButton("🖥 Один роутер", callback_data='ssh_chpass_one')],
+        [InlineKeyboardButton("☑️ Несколько роутеров", callback_data='ssh_chpass_multi')],
+        [InlineKeyboardButton(f"🌐 Все активные ({online_count})", callback_data='ssh_chpass_all')],
+        [InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')],
+    ]
+    await safe_edit_text(q, context,
+        "🔑 <b>Сменить пароль роутера</b>\n\nВыберите режим:",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+async def ssh_chpass_multi_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show router list with toggle checkboxes for multi-select (chpass)."""
+    q = update.callback_query
+    routers = load_routers()
+    online = get_online_clients()
+    sel = context.user_data.get('ssh_chpass_selected', [])
+    kb = []
+    for cn in sorted(routers.keys(), key=_natural_key):
+        if cn not in online:
+            continue
+        mark = "☑️" if cn in sel else "⬜"
+        kb.append([InlineKeyboardButton(f"{mark} {cn}", callback_data=f'ssh_chpass_toggle:{cn}')])
+    count = len(sel)
+    kb.append([InlineKeyboardButton(f"✅ Готово ({count})", callback_data='ssh_chpass_multi_done')])
+    kb.append([InlineKeyboardButton("◀️ Назад", callback_data='ssh_chpass_menu')])
+    await safe_edit_text(q, context, "🔑 Выберите роутеры для смены пароля:",
+        reply_markup=InlineKeyboardMarkup(kb))
+
+async def ssh_chpass_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Receive login/password and execute change on target routers."""
+    if not context.user_data.get('await_ssh_chpass'):
+        return
+    context.user_data.pop('await_ssh_chpass', None)
+    targets = context.user_data.pop('ssh_chpass_targets', None)
+    text = update.message.text.strip()
+    parts = text.split()
+    if len(parts) == 1:
+        login = "admin"
+        password = parts[0]
+    elif len(parts) == 2:
+        login = parts[0]
+        password = parts[1]
+    else:
+        await update.message.reply_text("Формат: <code>логин пароль</code> или просто <code>пароль</code>",
+            parse_mode="HTML")
+        return
+    if not targets:
+        await update.message.reply_text("Ошибка: роутеры не выбраны.")
+        return
+    routers = load_routers()
+    online = get_online_clients()
+    if targets == '__all__':
+        target_list = [cn for cn in sorted(routers.keys(), key=_natural_key) if cn in online]
+        label = f"ВСЕХ активных ({len(target_list)})"
+    elif isinstance(targets, list):
+        target_list = targets
+        label = ", ".join(targets)
+    else:
+        target_list = [targets]
+        label = targets
+    if not target_list:
+        await update.message.reply_text("Нет активных роутеров.")
+        return
+    msg = await update.message.reply_text(
+        f"🔑 Меняю пароль на {label}...\nЛогин: <code>{login}</code>",
+        parse_mode="HTML")
+    chpass_cmd = (
+        f'nvram set http_username={login} && '
+        f'nvram set http_passwd={password} && '
+        f'nvram commit && mtd_storage.sh save && echo CHPASS_OK'
+    )
+    results = []
+    for cn in target_list:
+        r = routers.get(cn)
+        if not r:
+            results.append(f"🔴 <b>{cn}</b> — не найден")
+            continue
+        ip = get_router_ip(cn)
+        if not ip:
+            results.append(f"🔴 <b>{cn}</b> — нет IP")
+            continue
+        ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'), r.get('password', ''), chpass_cmd)
+        if ok and "CHPASS_OK" in out:
+            results.append(f"✅ <b>{cn}</b> — пароль изменён")
+            # Update routers.json with new credentials
+            routers[cn]['user'] = login
+            routers[cn]['password'] = password
+        else:
+            results.append(f"❌ <b>{cn}</b> — {escape(out[:200])}")
+    save_routers(routers)
+    report = "🔑 <b>Смена пароля:</b>\n\n" + "\n".join(results)
+    await msg.edit_text(report, parse_mode="HTML")
 
 async def _do_ssh_deploy(msg_or_update, context, cn: str, front_ip: str, edit_msg=None):
     """Execute full deploy script on router. Called from text input or button."""
@@ -3344,8 +3507,8 @@ async def auto_ip_monitor(app):
                 try:
                     await app.bot.send_message(
                         ADMIN_ID,
-                        "🚨 <b>ВСЕ IP ИЗ ПУЛА ЗАБЛОКИРОВАНЫ!</b>\n"
-                        "Ни один запасной IP не прошёл проверку.",
+                        "ð¨ <b>ÐÐ¡Ð IP ÐÐ ÐÐ£ÐÐ ÐÐÐÐÐÐÐÐ ÐÐÐÐÐ«!</b>\n"
+                        "ÐÐ¸ Ð¾Ð´Ð¸Ð½ Ð·Ð°Ð¿Ð°ÑÐ½Ð¾Ð¹ IP Ð½Ðµ Ð¿ÑÐ¾ÑÑÐ» Ð¿ÑÐ¾Ð²ÐµÑÐºÑ.",
                         parse_mode="HTML"
                     )
                 except Exception:
@@ -3363,9 +3526,9 @@ async def auto_ip_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     pool = load_ip_pool()
     current_ip = rr_read_file(RR_IP_FILE, "").strip()
-    status = "🟢 ON" if auto_ip_enabled else "🔴 OFF"
+    status = "\U0001f7e2 ON" if auto_ip_enabled else "\U0001f534 OFF"
 
-    lines = [f"<b>🔄 Авто IP</b>  [{status}]", f"Текущий IP: <code>{current_ip}</code>", ""]
+    lines = [f"<b>\U0001f504 Авто IP</b>  [{status}]", f"Текущий IP: <code>{current_ip}</code>", ""]
     if pool:
         for i, entry in enumerate(pool, 1):
             marker = " ◀️" if entry["ip"] == current_ip else ""
@@ -3374,12 +3537,12 @@ async def auto_ip_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         lines.append("Пул пуст.")
 
-    toggle_text = "🔴 Выключить" if auto_ip_enabled else "🟢 Включить"
+    toggle_text = "\U0001f534 Выключить" if auto_ip_enabled else "\U0001f7e2 Включить"
     kb = [
         [InlineKeyboardButton(toggle_text, callback_data='aip_toggle')],
         [InlineKeyboardButton("➕ Добавить IP", callback_data='aip_add'),
-         InlineKeyboardButton("🗑 Удалить IP", callback_data='aip_remove')],
-        [InlineKeyboardButton("🏠 Меню", callback_data='home')],
+         InlineKeyboardButton("\U0001f5d1 Удалить IP", callback_data='aip_remove')],
+        [InlineKeyboardButton("\U0001f3e0 Меню", callback_data='home')],
     ]
     await safe_edit_text(q, context, "\n".join(lines), parse_mode="HTML",
                          reply_markup=InlineKeyboardMarkup(kb))
@@ -3396,7 +3559,7 @@ async def auto_ip_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     auto_ip_enabled = not auto_ip_enabled
     _save_auto_ip_state(auto_ip_enabled)
-    status = "🟢 ON" if auto_ip_enabled else "🔴 OFF"
+    status = "\U0001f7e2 ON" if auto_ip_enabled else "\U0001f534 OFF"
     await safe_edit_text(q, context, f"Авто IP: <b>{status}</b>", parse_mode="HTML",
                          reply_markup=InlineKeyboardMarkup(
                              [[InlineKeyboardButton("◀️ Назад", callback_data='aip_menu')]]))
@@ -3413,7 +3576,7 @@ async def auto_ip_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [[InlineKeyboardButton("❌ Отмена", callback_data='aip_menu')]]))
 
 async def auto_ip_add_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Multi-step handler: ip → user → password → label → save."""
+    """Multi-step handler: ip -> user -> password -> label -> save."""
     step = context.user_data.get('await_aip_add')
     if not step:
         return
@@ -3473,7 +3636,7 @@ async def auto_ip_remove_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
     for entry in pool:
         label = entry.get("label", entry["ip"])
         kb.append([InlineKeyboardButton(
-            f"🗑 {entry['ip']} ({label})",
+            f"\U0001f5d1 {entry['ip']} ({label})",
             callback_data=f"aip_del:{entry['ip']}")])
     kb.append([InlineKeyboardButton("◀️ Назад", callback_data='aip_menu')])
     await safe_edit_text(q, context, "Выберите IP для удаления:",
@@ -3485,7 +3648,7 @@ async def auto_ip_remove_apply(update: Update, context: ContextTypes.DEFAULT_TYP
     pool = load_ip_pool()
     pool = [e for e in pool if e["ip"] != ip]
     save_ip_pool(pool)
-    await safe_edit_text(q, context, f"🗑 Удалён: <code>{ip}</code>", parse_mode="HTML",
+    await safe_edit_text(q, context, f"\U0001f5d1 Удалён: <code>{ip}</code>", parse_mode="HTML",
                          reply_markup=InlineKeyboardMarkup(
                              [[InlineKeyboardButton("◀️ Назад", callback_data='aip_menu')]]))
 
