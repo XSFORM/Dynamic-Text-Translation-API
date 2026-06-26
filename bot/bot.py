@@ -120,11 +120,29 @@ RR_BACKUP_PASSWORD = b"canonical87"
 #  AUTO IP — pool & monitoring
 # =====================================================================
 AUTO_IP_POOL_FILE = "/root/monitor_bot/ip_pool.json"
+AUTO_IP_STATE_FILE = "/root/monitor_bot/auto_ip_state.json"
 AUTO_IP_TM_CHECK = "217.174.235.161"       # Turkmentelecom probe IP
 AUTO_IP_FAIL_THRESHOLD = 5                  # consecutive ping fails before switch
 AUTO_IP_CHECK_INTERVAL = 60                 # seconds between checks
-auto_ip_enabled = False
 auto_ip_fail_count = 0
+
+def _load_auto_ip_state() -> bool:
+    if os.path.exists(AUTO_IP_STATE_FILE):
+        try:
+            with open(AUTO_IP_STATE_FILE) as f:
+                return json.load(f).get("enabled", False)
+        except Exception:
+            pass
+    return False
+
+def _save_auto_ip_state(enabled: bool):
+    try:
+        with open(AUTO_IP_STATE_FILE, "w") as f:
+            json.dump({"enabled": enabled}, f)
+    except Exception:
+        pass
+
+auto_ip_enabled = _load_auto_ip_state()
 
 def load_ip_pool() -> list:
     if os.path.exists(AUTO_IP_POOL_FILE):
@@ -3343,6 +3361,7 @@ async def auto_ip_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                  [[InlineKeyboardButton("◀️ Назад", callback_data='aip_menu')]]))
         return
     auto_ip_enabled = not auto_ip_enabled
+    _save_auto_ip_state(auto_ip_enabled)
     status = "🟢 ON" if auto_ip_enabled else "🔴 OFF"
     await safe_edit_text(q, context, f"Авто IP: <b>{status}</b>", parse_mode="HTML",
                          reply_markup=InlineKeyboardMarkup(
