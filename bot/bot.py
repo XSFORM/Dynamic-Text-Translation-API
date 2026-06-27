@@ -2375,7 +2375,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == 'rst_bot':
         await safe_edit_text(q, context, "🔄 Перезагрузка бота через 2 сек...")
-        import asyncio
         await asyncio.sleep(2)
         subprocess.Popen(["systemctl", "restart", "remote-refresh-bot"])
 
