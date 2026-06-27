@@ -52,7 +52,7 @@ logger = logging.getLogger(__name__)
 # =====================================================================
 #  OPENVPN SECTION — Constants / Globals
 # =====================================================================
-BOT_VERSION = "HYBRID OVPN+RR v2"
+BOT_VERSION = "HYBRID OVPN+RR v2.1"
 UPDATE_SOURCE_URL = "https://raw.githubusercontent.com/XSFORM/update_bot/main/openvpn_monitor_bot.py"
 SIMPLE_UPDATE_CMD = (
     "curl -L -o /root/monitor_bot/openvpn_monitor_bot.py "
