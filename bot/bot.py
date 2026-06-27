@@ -2914,8 +2914,10 @@ async def ssh_chpass_receive(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"🔑 Меняю пароль на {label}...",
         parse_mode="HTML")
     chpass_cmd = (
-        f'nvram set http_passwd={password} && '
-        f'nvram commit && mtd_storage.sh save && echo CHPASS_OK'
+        f'nvram set http_passwd={password}\n'
+        f'nvram commit\n'
+        f'mtd_storage.sh save\n'
+        f'echo CHPASS_OK'
     )
     results = []
     for cn in target_list:
