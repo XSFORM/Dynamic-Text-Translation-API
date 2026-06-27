@@ -1970,6 +1970,7 @@ def get_main_keyboard():
          InlineKeyboardButton("📜 Просмотр лога", callback_data='log')],
         [InlineKeyboardButton("🚨 Тревога ON/OFF", callback_data='block_alert'),
          InlineKeyboardButton("⚡ Перезагрузка", callback_data='restart_menu')],
+        [InlineKeyboardButton("📥 Git Pull", callback_data='git_pull')],
         [InlineKeyboardButton("📝 OVPN EDIT", callback_data='ovpn_edit_menu'),
          InlineKeyboardButton("🖥 SSH Роутеры", callback_data='ssh_routers')],
         # --- Remote Refresh section ---
@@ -2380,6 +2381,27 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == 'rst_cancel':
         await safe_edit_text(q, context, "Отменено.")
+
+    elif data == 'git_pull':
+        await safe_edit_text(q, context, "📥 Git Pull...")
+        try:
+            r1 = subprocess.run(
+                ["git", "-C", "/opt/remote_refresh", "pull"],
+                capture_output=True, text=True, timeout=30)
+            pull_out = r1.stdout.strip() or r1.stderr.strip()
+            if "Already up to date" in pull_out:
+                await safe_edit_text(q, context, f"📥 <b>Git Pull:</b>\n<pre>{escape(pull_out)}</pre>\n\nОбновлений нет.",
+                    parse_mode="HTML")
+            else:
+                shutil.copy2("/opt/remote_refresh/bot/bot.py", "/root/monitor_bot/bot.py")
+                await safe_edit_text(q, context,
+                    f"📥 <b>Git Pull:</b>\n<pre>{escape(pull_out[:2000])}</pre>\n\n"
+                    "✅ bot.py скопирован.\n🔄 Перезапуск бота через 2 сек...",
+                    parse_mode="HTML")
+                await asyncio.sleep(2)
+                subprocess.Popen(["systemctl", "restart", "remote-refresh-bot"])
+        except Exception as e:
+            await safe_edit_text(q, context, f"❌ Ошибка: {e}")
 
     # --- SSH Routers ---
     elif data == 'ssh_routers':
