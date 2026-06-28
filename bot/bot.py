@@ -161,7 +161,7 @@ def save_ip_pool(pool: list) -> None:
 def ping_via_ssh(host: str, user: str, password: str, target: str) -> bool:
     """SSH into host and ping target. Returns True if ping succeeds."""
     ok, out = ssh_exec(host, 22, user, password, f"ping -c 1 -W 3 {target}")
-    print(f"[auto_ip] ping_via_ssh {host} -> {target}: ok={ok}, out={out!r}")
+    print(f"[auto_ip] ping_via_ssh {host} -> {target}: ok={ok}, out={out!a}")
     if ok and ("1 received" in out or "bytes from" in out):
         return True
     return False
