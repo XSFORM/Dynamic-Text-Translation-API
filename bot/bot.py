@@ -3450,10 +3450,12 @@ async def auto_ip_monitor(app):
 
             pool = load_ip_pool()
             if not pool:
+                print("[auto_ip] pool empty, skip")
                 continue
 
             current_ip = rr_read_file(RR_IP_FILE, "").strip()
             if not current_ip:
+                print("[auto_ip] current_ip empty, skip")
                 continue
 
             # Find current entry in pool
@@ -3464,8 +3466,10 @@ async def auto_ip_monitor(app):
                     break
 
             if not current_entry:
-                # Current IP not in pool — skip check
+                print(f"[auto_ip] {current_ip} not in pool, skip")
                 continue
+
+            print(f"[auto_ip] checking {current_ip} (fail_count={auto_ip_fail_count})")
 
             # Ping TM probe from current GOST server
             ok = await asyncio.to_thread(
@@ -3524,8 +3528,8 @@ async def auto_ip_monitor(app):
                 try:
                     await app.bot.send_message(
                         ADMIN_ID,
-                        "ð¨ <b>ÐÐ¡Ð IP ÐÐ ÐÐ£ÐÐ ÐÐÐÐÐÐÐÐ ÐÐÐÐÐ«!</b>\n"
-                        "ÐÐ¸ Ð¾Ð´Ð¸Ð½ Ð·Ð°Ð¿Ð°ÑÐ½Ð¾Ð¹ IP Ð½Ðµ Ð¿ÑÐ¾ÑÑÐ» Ð¿ÑÐ¾Ð²ÐµÑÐºÑ.",
+                        "🚨 <b>ВСЕ IP ИЗ ПУЛА ЗАБЛОКИРОВАНЫ!</b>\n"
+                        "Ни один запасной IP не прошёл проверку.",
                         parse_mode="HTML"
                     )
                 except Exception:
