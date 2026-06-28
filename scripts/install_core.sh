@@ -331,13 +331,21 @@ ADMIN_ID = ${ADMIN_ID_INPUT:-0}
 EOF
 log "Created $BOT_DIR/config.py"
 
-# -------- Python dependencies (system-wide, bot runs as root) --------
-log "Installing Python dependencies..."
-python3 -m pip install --break-system-packages --upgrade pip 2>/dev/null || true
-python3 -m pip install --break-system-packages -r "$BOT_DIR/requirements.txt"
+# -------- Python venv + dependencies --------
+VENV_DIR="$BOT_DIR/venv"
+if [ ! -d "$VENV_DIR" ]; then
+  log "Creating Python venv at $VENV_DIR..."
+  python3 -m venv "$VENV_DIR"
+fi
+VENV_PIP="$VENV_DIR/bin/pip"
+VENV_PYTHON="$VENV_DIR/bin/python3"
+
+log "Installing Python dependencies into venv..."
+"$VENV_PIP" install --upgrade pip 2>/dev/null || true
+"$VENV_PIP" install -r "$BOT_DIR/requirements.txt"
 
 # Quick import check
-python3 - <<'PY'
+"$VENV_PYTHON" - <<'PY'
 mods = ["requests","telegram","OpenSSL","pytz","cryptography","pyzipper"]
 import importlib, sys
 missing = []
@@ -352,7 +360,7 @@ if missing:
     print("Missing modules:", ", ".join(missing))
     sys.exit(1)
 PY
-log "Python dependencies ready"
+log "Python dependencies ready (venv)"
 
 # -------- Systemd service --------
 SERVICE_SRC="$REPO_DIR/scripts/${SERVICE_NAME}.service"
@@ -371,10 +379,11 @@ Type=simple
 User=root
 WorkingDirectory=/root/monitor_bot
 EnvironmentFile=/etc/remote-refresh.env
-ExecStart=/usr/bin/python3 /root/monitor_bot/bot.py
+ExecStart=/root/monitor_bot/venv/bin/python3 /root/monitor_bot/bot.py
 Restart=on-failure
 RestartSec=10
 Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONIOENCODING=utf-8
 
 [Install]
 WantedBy=multi-user.target
@@ -384,17 +393,44 @@ systemctl daemon-reload
 systemctl enable "$SERVICE_NAME"
 log "Systemd service $SERVICE_NAME installed and enabled"
 
+# -------- Bot data files (if not exist) --------
+for jfile in routers.json ip_pool.json auto_ip_state.json; do
+  jpath="$BOT_DIR/$jfile"
+  if [ ! -f "$jpath" ]; then
+    if [ "$jfile" = "auto_ip_state.json" ]; then
+      echo '{"enabled": false}' > "$jpath"
+    elif [ "$jfile" = "routers.json" ]; then
+      echo '{}' > "$jpath"
+    else
+      echo '[]' > "$jpath"
+    fi
+    log "Created $jpath"
+  fi
+done
+
+# -------- UFW (open ports if active) --------
+if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "active"; then
+  log "UFW is active, opening required ports..."
+  ufw allow 80/tcp   >/dev/null 2>&1 && log "UFW: allowed 80/tcp (RR/nginx)"
+  ufw allow 443/udp  >/dev/null 2>&1 && log "UFW: allowed 443/udp (OpenVPN)"
+  ufw allow 22/tcp   >/dev/null 2>&1 || true  # ensure SSH stays open
+fi
+
 # -------- nginx --------
 systemctl enable nginx
 systemctl restart nginx
 log "nginx restarted"
 
+# -------- Start the bot --------
+log "Starting $SERVICE_NAME..."
+systemctl start "$SERVICE_NAME"
+sleep 2
+if systemctl is-active --quiet "$SERVICE_NAME"; then
+  log "✅ $SERVICE_NAME is running"
+else
+  log "⚠️  $SERVICE_NAME failed to start, check: journalctl -u $SERVICE_NAME -n 30"
+fi
+
 log ""
 log "=== Installation complete ==="
-if [ "$RESTORE_RR" -eq 1 ] || [ "$RESTORE_OVPN" -eq 1 ]; then
-  log "Restored from backup. Start the service:"
-else
-  log "Config created. Start the service:"
-fi
-log "  systemctl start $SERVICE_NAME"
 log "  systemctl status $SERVICE_NAME"
