@@ -3536,7 +3536,9 @@ async def auto_ip_monitor(app):
                     pass
 
         except Exception as e:
+            import traceback
             print(f"[auto_ip] Error: {e}")
+            traceback.print_exc()
             await asyncio.sleep(10)
 
 # =====================================================================
