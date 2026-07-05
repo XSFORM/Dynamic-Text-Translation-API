@@ -2438,8 +2438,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         hint = f"\nПоследний фронт: <code>{saved_front}</code>" if saved_front else ""
         await safe_edit_text(q, context,
             f"📦 <b>Залить скрипт на {cn}</b>\n\n"
-            f"Введите IP фронт-сервера (через который роутер скачает скрипт).\n"
-            f"Текущий router IP: <code>{front_ip}</code>{hint}\n\n"
+            f"Введите IP фронт-сервера (через который роутер скачает скрипт).{hint}\n\n"
             f"Или отправьте новый IP:",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(kb))
@@ -2743,8 +2742,8 @@ async def ssh_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except FileNotFoundError:
         pass
     if available:
-        avail_str = ", ".join(sorted(available, key=_natural_key))
-        hint = f"\n\nДоступные клиенты:\n<code>{avail_str}</code>"
+        avail_str = "  ".join(f"<code>{c}</code>" for c in sorted(available, key=_natural_key))
+        hint = f"\n\nДоступные клиенты:\n{avail_str}"
     else:
         hint = "\n\nВсе клиенты из ipp.txt уже добавлены."
     await safe_edit_text(q, context,
