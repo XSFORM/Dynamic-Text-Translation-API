@@ -2025,9 +2025,21 @@ async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_T
                 errors.append(f"❌ <code>{escape(line)}</code> — нужно минимум имя и пароль")
                 continue
             cn = parts[0]
-            password = parts[1]
-            port = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 22
-            user = parts[3] if len(parts) > 3 else (parts[2] if len(parts) > 2 and not parts[2].isdigit() else "admin")
+            if len(parts) == 2:
+                # имя пароль
+                user = "admin"
+                password = parts[1]
+                port = 22
+            elif len(parts) == 3:
+                # имя логин пароль
+                user = parts[1]
+                password = parts[2]
+                port = 22
+            else:
+                # имя логин пароль порт
+                user = parts[1]
+                password = parts[2]
+                port = int(parts[3]) if parts[3].isdigit() else 22
             routers[cn] = {"user": user, "password": password, "port": port}
             added.append(cn)
         if added:
@@ -2938,8 +2950,8 @@ async def ssh_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_edit_text(q, context,
         f"➕ <b>Добавить роутер</b>{hint}\n\n"
         "Формат: <code>имя пароль</code>\n"
-        "или: <code>имя пароль логин</code>\n"
-        "или: <code>имя пароль порт логин</code>\n"
+        "или: <code>имя логин пароль</code>\n"
+        "или: <code>имя логин пароль порт</code>\n"
         "Несколько — каждый с новой строки\n"
         "User по умолчанию: admin",
         parse_mode="HTML")
