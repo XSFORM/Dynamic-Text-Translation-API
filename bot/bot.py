@@ -2026,8 +2026,9 @@ async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_T
                 continue
             cn = parts[0]
             password = parts[1]
-            port = int(parts[2]) if len(parts) > 2 else 22
-            routers[cn] = {"user": "admin", "password": password, "port": port}
+            port = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 22
+            user = parts[3] if len(parts) > 3 else (parts[2] if len(parts) > 2 and not parts[2].isdigit() else "admin")
+            routers[cn] = {"user": user, "password": password, "port": port}
             added.append(cn)
         if added:
             save_routers(routers)
@@ -2937,7 +2938,8 @@ async def ssh_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_edit_text(q, context,
         f"➕ <b>Добавить роутер</b>{hint}\n\n"
         "Формат: <code>имя пароль</code>\n"
-        "или: <code>имя пароль порт</code>\n"
+        "или: <code>имя пароль логин</code>\n"
+        "или: <code>имя пароль порт логин</code>\n"
         "Несколько — каждый с новой строки\n"
         "User по умолчанию: admin",
         parse_mode="HTML")
