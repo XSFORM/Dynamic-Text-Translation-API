@@ -8,7 +8,7 @@ import asyncio
 import os
 import subprocess
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple, List, Dict
 from html import escape
 import glob
@@ -306,7 +306,7 @@ def save_client_meta():
 def set_client_expiry_days_from_now(name: str, days: int) -> str:
     if days < 1:
         days = 1
-    dt = datetime.utcnow() + timedelta(days=days)
+    dt = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(days=days)
     iso = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     client_meta.setdefault(name, {})["expire"] = iso
     save_client_meta()
@@ -322,12 +322,12 @@ def get_client_expiry(name: str) -> Tuple[Optional[str], Optional[int]]:
         return None, None
     try:
         dt = datetime.strptime(iso, "%Y-%m-%dT%H:%M:%SZ")
-        return iso, (dt - datetime.utcnow()).days
+        return iso, (dt - datetime.now(timezone.utc).replace(tzinfo=None)).days
     except Exception:
         return iso, None
 
 def enforce_client_expiries():
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     changed = False
     for name, data in list(client_meta.items()):
         iso = data.get("expire")
@@ -347,7 +347,7 @@ def enforce_client_expiries():
 def check_and_notify_expiring(bot):
     if not client_meta:
         return
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     for name, data in client_meta.items():
         iso = data.get("expire")
         if not iso:
@@ -524,7 +524,7 @@ def get_cert_days_left(client_name: str) -> Optional[int]:
         cert = crypto.load_certificate(crypto.FILETYPE_PEM, data)
         not_after = cert.get_notAfter().decode("ascii")
         expiry_dt = datetime.strptime(not_after, "%Y%m%d%H%M%SZ")
-        return (expiry_dt - datetime.utcnow()).days
+        return (expiry_dt - datetime.now(timezone.utc).replace(tzinfo=None)).days
     except Exception:
         return None
 
@@ -1062,7 +1062,7 @@ def update_template_and_ovpn(new_host: str, new_port: str) -> Dict[str, int]:
             with open(tpl, "r") as f: old = f.read()
             new = replace_remote_line_in_text(old, new_host, new_port)
             if new != old:
-                backup = tpl + ".bak_" + datetime.utcnow().strftime("%Y%m%d%H%M%S")
+                backup = tpl + ".bak_" + datetime.now(timezone.utc).replace(tzinfo=None).strftime("%Y%m%d%H%M%S")
                 shutil.copy2(tpl, backup)
                 with open(tpl, "w") as f: f.write(new)
                 stats["template_updated"] = 1
@@ -1076,7 +1076,7 @@ def update_template_and_ovpn(new_host: str, new_port: str) -> Dict[str, int]:
             with open(path, "r") as fr: oldc = fr.read()
             newc = replace_remote_line_in_text(oldc, new_host, new_port)
             if newc != oldc:
-                bak = path + ".bak_" + datetime.utcnow().strftime("%Y%m%d%H%M%S")
+                bak = path + ".bak_" + datetime.now(timezone.utc).replace(tzinfo=None).strftime("%Y%m%d%H%M%S")
                 shutil.copy2(path, bak)
                 with open(path, "w") as fw: fw.write(newc)
                 stats["ovpn_updated"] += 1
@@ -1426,7 +1426,7 @@ def clear_traffic_stats():
     global traffic_usage, _last_session_state
     try:
         if os.path.exists(TRAFFIC_DB_PATH):
-            ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+            ts = datetime.now(timezone.utc).replace(tzinfo=None).strftime("%Y%m%d_%H%M%S")
             subprocess.run(f"cp {TRAFFIC_DB_PATH} {TRAFFIC_DB_PATH}.bak_{ts}", shell=True)
     except: pass
     traffic_usage = {}; _last_session_state = {}
@@ -1724,7 +1724,6 @@ def rr_write_domains(domains: list) -> None:
 #  REMOTE REFRESH — History
 # =====================================================================
 def rr_append_history(entry: str) -> None:
-    from datetime import timezone
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     line = f"[{ts}] {entry}\n"
     os.makedirs(os.path.dirname(RR_HISTORY_FILE) or ".", exist_ok=True)
