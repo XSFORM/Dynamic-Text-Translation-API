@@ -2696,6 +2696,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith('aip_del:'):
         ip = data[len('aip_del:'):]
         await auto_ip_remove_apply(update, context, ip)
+    elif data == 'aip_reorder':
+        await auto_ip_reorder_menu(update, context)
+    elif data.startswith('aip_move:'):
+        # aip_move:INDEX:up or aip_move:INDEX:down
+        parts = data[len('aip_move:'):].split(':')
+        idx = int(parts[0])
+        direction = parts[1]
+        await auto_ip_move(update, context, idx, direction)
 
     else:
         await safe_edit_text(q, context, "Неизвестная команда.")
@@ -3752,6 +3760,7 @@ async def auto_ip_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton(toggle_text, callback_data='aip_toggle')],
         [InlineKeyboardButton("➕ Добавить IP", callback_data='aip_add'),
          InlineKeyboardButton("\U0001f5d1 Удалить IP", callback_data='aip_remove')],
+        [InlineKeyboardButton("↕️ Порядок", callback_data='aip_reorder')],
         [InlineKeyboardButton("\U0001f3e0 Меню", callback_data='home')],
     ]
     await safe_edit_text(q, context, "\n".join(lines), parse_mode="HTML",
@@ -3861,6 +3870,43 @@ async def auto_ip_remove_apply(update: Update, context: ContextTypes.DEFAULT_TYP
     await safe_edit_text(q, context, f"\U0001f5d1 Удалён: <code>{ip}</code>", parse_mode="HTML",
                          reply_markup=InlineKeyboardMarkup(
                              [[InlineKeyboardButton("◀️ Назад", callback_data='aip_menu')]]))
+
+async def auto_ip_reorder_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    pool = load_ip_pool()
+    if len(pool) < 2:
+        await safe_edit_text(q, context, "Нужно минимум 2 IP для перестановки.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='aip_menu')]]))
+        return
+    kb = []
+    for i, entry in enumerate(pool):
+        label = entry.get("label", entry["ip"])
+        row = []
+        if i > 0:
+            row.append(InlineKeyboardButton("⬆️", callback_data=f'aip_move:{i}:up'))
+        else:
+            row.append(InlineKeyboardButton(" ", callback_data='aip_reorder'))
+        row.append(InlineKeyboardButton(f"{i+1}. {label}", callback_data='aip_reorder'))
+        if i < len(pool) - 1:
+            row.append(InlineKeyboardButton("⬇️", callback_data=f'aip_move:{i}:down'))
+        else:
+            row.append(InlineKeyboardButton(" ", callback_data='aip_reorder'))
+        kb.append(row)
+    kb.append([InlineKeyboardButton("◀️ Назад", callback_data='aip_menu')])
+    await safe_edit_text(q, context, "↕️ <b>Порядок IP в пуле</b>\nНажмите ⬆️/⬇️ для перемещения:",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+async def auto_ip_move(update: Update, context: ContextTypes.DEFAULT_TYPE, idx: int, direction: str):
+    q = update.callback_query
+    await q.answer()
+    pool = load_ip_pool()
+    if direction == 'up' and idx > 0:
+        pool[idx], pool[idx-1] = pool[idx-1], pool[idx]
+    elif direction == 'down' and idx < len(pool) - 1:
+        pool[idx], pool[idx+1] = pool[idx+1], pool[idx]
+    save_ip_pool(pool)
+    await auto_ip_reorder_menu(update, context)
 
 # =====================================================================
 #  MAIN
