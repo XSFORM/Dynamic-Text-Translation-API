@@ -2015,17 +2015,28 @@ async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_T
     # SSH Routers text inputs
     if context.user_data.get('await_ssh_add'):
         context.user_data.pop('await_ssh_add')
-        parts = update.message.text.strip().split()
-        if len(parts) < 2:
-            await update.message.reply_text("Формат: имя пароль [порт]")
-            return
-        cn = parts[0]
-        password = parts[1]
-        port = int(parts[2]) if len(parts) > 2 else 22
+        lines = [l.strip() for l in update.message.text.strip().splitlines() if l.strip()]
         routers = load_routers()
-        routers[cn] = {"user": "admin", "password": password, "port": port}
-        save_routers(routers)
-        await update.message.reply_text(f"✅ Роутер <b>{cn}</b> добавлен.", parse_mode="HTML")
+        added = []
+        errors = []
+        for line in lines:
+            parts = line.split()
+            if len(parts) < 2:
+                errors.append(f"❌ <code>{escape(line)}</code> — нужно минимум имя и пароль")
+                continue
+            cn = parts[0]
+            password = parts[1]
+            port = int(parts[2]) if len(parts) > 2 else 22
+            routers[cn] = {"user": "admin", "password": password, "port": port}
+            added.append(cn)
+        if added:
+            save_routers(routers)
+        result = ""
+        if added:
+            result += "✅ Добавлено: " + ", ".join(f"<b>{c}</b>" for c in added)
+        if errors:
+            result += ("\n" if result else "") + "\n".join(errors)
+        await update.message.reply_text(result or "Ничего не добавлено.", parse_mode="HTML")
         return
     if context.user_data.get('await_ssh_edit'):
         cn = context.user_data.pop('await_ssh_edit')
@@ -2419,7 +2430,79 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == 'ssh_select_update':
         await ssh_select_router(update, context, 'ssh_update')
     elif data == 'ssh_select_deploy':
+        await ssh_deploy_mode_menu(update, context)
+    elif data == 'ssh_deploy_one':
         await ssh_select_router(update, context, 'ssh_deploy')
+    elif data == 'ssh_deploy_multi':
+        context.user_data['ssh_deploy_selected'] = []
+        await ssh_deploy_multi_select(update, context)
+    elif data.startswith('ssh_deploy_toggle:'):
+        cn = data[len('ssh_deploy_toggle:'):]
+        sel = context.user_data.get('ssh_deploy_selected', [])
+        if cn in sel:
+            sel.remove(cn)
+        else:
+            sel.append(cn)
+        context.user_data['ssh_deploy_selected'] = sel
+        await ssh_deploy_multi_select(update, context)
+    elif data == 'ssh_deploy_multi_done':
+        sel = context.user_data.get('ssh_deploy_selected', [])
+        if not sel:
+            await safe_edit_text(q, context, "Ни один роутер не выбран.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='ssh_select_deploy')]]))
+        else:
+            context.user_data['ssh_deploy_targets'] = sel
+            saved_front = ""
+            try:
+                with open(DEPLOY_FRONT_IP_FILE, "r") as f:
+                    saved_front = f.read().strip()
+            except FileNotFoundError:
+                pass
+            kb = []
+            if saved_front:
+                kb.append([InlineKeyboardButton(f"✅ {saved_front}", callback_data=f'ssh_deploy_multi_use:{saved_front}')])
+            kb.append([InlineKeyboardButton("❌ Отмена", callback_data='ssh_routers')])
+            names = ", ".join(sel)
+            hint = f"\nПоследний фронт: <code>{saved_front}</code>" if saved_front else ""
+            await safe_edit_text(q, context,
+                f"📦 <b>Залить скрипт на {len(sel)} роутеров</b>\n"
+                f"({names})\n\n"
+                f"Введите IP фронт-сервера.{hint}\n\n"
+                f"Или отправьте новый IP:",
+                parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+            context.user_data['await_ssh_deploy_ip'] = True
+            context.user_data['ssh_deploy_cn'] = '__multi__'
+    elif data.startswith('ssh_deploy_multi_use:'):
+        front_ip = data[len('ssh_deploy_multi_use:'):]
+        targets = context.user_data.pop('ssh_deploy_targets', [])
+        context.user_data.pop('await_ssh_deploy_ip', None)
+        context.user_data.pop('ssh_deploy_cn', None)
+        if targets:
+            await _do_ssh_deploy_multi(q, context, targets, front_ip)
+    elif data == 'ssh_deploy_all':
+        routers = load_routers()
+        if not routers:
+            await safe_edit_text(q, context, "Список роутеров пуст.")
+            return
+        context.user_data['ssh_deploy_targets'] = sorted(routers.keys(), key=_natural_key)
+        saved_front = ""
+        try:
+            with open(DEPLOY_FRONT_IP_FILE, "r") as f:
+                saved_front = f.read().strip()
+        except FileNotFoundError:
+            pass
+        kb = []
+        if saved_front:
+            kb.append([InlineKeyboardButton(f"✅ {saved_front}", callback_data=f'ssh_deploy_multi_use:{saved_front}')])
+        kb.append([InlineKeyboardButton("❌ Отмена", callback_data='ssh_routers')])
+        hint = f"\nПоследний фронт: <code>{saved_front}</code>" if saved_front else ""
+        await safe_edit_text(q, context,
+            f"📦 <b>Залить скрипт на ВСЕ роутеры ({len(routers)})</b>\n\n"
+            f"Введите IP фронт-сервера.{hint}\n\n"
+            f"Или отправьте новый IP:",
+            parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+        context.user_data['await_ssh_deploy_ip'] = True
+        context.user_data['ssh_deploy_cn'] = '__multi__'
     elif data.startswith('ssh_deploy:'):
         cn = data[len('ssh_deploy:'):]
         context.user_data['ssh_deploy_cn'] = cn
@@ -2621,6 +2704,103 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #  SSH ROUTERS — handlers
 # =====================================================================
 
+async def ssh_deploy_mode_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show deploy target selection: one / several / all."""
+    q = update.callback_query
+    routers = load_routers()
+    if not routers:
+        await safe_edit_text(q, context, "Список роутеров пуст.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')]]))
+        return
+    kb = [
+        [InlineKeyboardButton("🖥 Один роутер", callback_data='ssh_deploy_one')],
+        [InlineKeyboardButton("☑️ Несколько роутеров", callback_data='ssh_deploy_multi')],
+        [InlineKeyboardButton("🌐 Все роутеры", callback_data='ssh_deploy_all')],
+        [InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')],
+    ]
+    await safe_edit_text(q, context, "📦 <b>Залить скрипт</b>\nВыберите режим:",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+async def ssh_deploy_multi_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show router list with toggle checkboxes for multi-deploy."""
+    q = update.callback_query
+    routers = load_routers()
+    online = get_online_clients()
+    selected = context.user_data.get('ssh_deploy_selected', [])
+    kb = []
+    for cn in sorted(routers.keys(), key=_natural_key):
+        status = "🟢" if cn in online else "🔴"
+        check = "☑️" if cn in selected else "☐"
+        kb.append([InlineKeyboardButton(f"{check} {status} {cn}", callback_data=f'ssh_deploy_toggle:{cn}')])
+    count = len(selected)
+    kb.append([InlineKeyboardButton(f"✅ Готово ({count})", callback_data='ssh_deploy_multi_done')])
+    kb.append([InlineKeyboardButton("◀️ Назад", callback_data='ssh_select_deploy')])
+    await safe_edit_text(q, context, "📦 Выберите роутеры для деплоя:\n(нажмите чтобы выбрать/убрать)",
+        reply_markup=InlineKeyboardMarkup(kb))
+
+async def _do_ssh_deploy_multi(q_or_msg, context, targets: list, front_ip: str):
+    """Deploy script to multiple routers sequentially."""
+    try:
+        with open(DEPLOY_FRONT_IP_FILE, "w") as f:
+            f.write(front_ip)
+    except Exception:
+        pass
+    routers = load_routers()
+    total = len(targets)
+    if hasattr(q_or_msg, 'message'):
+        msg = q_or_msg.message
+        await safe_edit_text(q_or_msg, context,
+            f"📦 Деплой на {total} роутеров через <code>{front_ip}</code>...\n0/{total}",
+            parse_mode="HTML")
+    else:
+        msg = await q_or_msg.reply_text(
+            f"📦 Деплой на {total} роутеров через <code>{front_ip}</code>...\n0/{total}",
+            parse_mode="HTML")
+    results = []
+    for i, cn in enumerate(targets, 1):
+        r = routers.get(cn)
+        if not r:
+            results.append(f"❌ <b>{cn}</b> — не найден")
+            continue
+        ip = get_router_ip(cn)
+        if not ip:
+            results.append(f"🔴 <b>{cn}</b> — оффлайн")
+            continue
+        try:
+            await msg.edit_text(
+                f"📦 Деплой через <code>{front_ip}</code>...\n{i}/{total}: <b>{cn}</b>",
+                parse_mode="HTML")
+        except Exception:
+            pass
+        deploy_cmd = (
+            f'wget -q -O /tmp/us.sh http://{front_ip}/router/update_script.sh && '
+            f'[ "$(grep -c is_reserved_ipv4 /tmp/us.sh)" = "3" ] && '
+            f"tail -n1 /tmp/us.sh | grep -q '^exit 0' && {{ "
+            f'cp /etc/storage/update_script.sh /etc/storage/update_script.sh.bak.$(date +%H%M) 2>/dev/null ; '
+            f'mv /tmp/us.sh /etc/storage/update_script.sh && chmod +x /etc/storage/update_script.sh ; '
+            f'wget -q -O- http://{front_ip}/router/domain_list.txt | grep -E "^[A-Za-z0-9._-]+$" > /tmp/dom.tmp ; '
+            f'[ -s /tmp/dom.tmp ] && mv /tmp/dom.tmp /etc/storage/remote_domains.list ; '
+            f'CRON_DIR="/etc/storage/cron/crontabs" ; mkdir -p "$CRON_DIR" ; CF="$CRON_DIR/admin" ; '
+            f"grep -v 'update_script\\.sh' \"$CF\" 2>/dev/null > \"$CF.tmp\" ; "
+            f'echo "*/15 * * * * /etc/storage/update_script.sh" >> "$CF.tmp" ; mv "$CF.tmp" "$CF" ; '
+            f'nvram set crond_enable=1 >/dev/null 2>&1 ; nvram commit >/dev/null 2>&1 ; '
+            f'killall crond 2>/dev/null ; sleep 1 ; crond -c "$CRON_DIR" -l 8 2>/dev/null ; '
+            f'mtd_storage.sh save ; '
+            f'echo "DEPLOY OK" ; '
+            f"}} || echo 'ABORTED'"
+        )
+        ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'), r.get('password', ''), deploy_cmd)
+        if ok and "DEPLOY OK" in out:
+            results.append(f"✅ <b>{cn}</b>")
+        else:
+            short = out.strip()[:150] if out else "—"
+            results.append(f"❌ <b>{cn}</b>: {escape(short)}")
+    report = "\n".join(results)
+    ok_count = sum(1 for r in results if r.startswith("✅"))
+    await msg.edit_text(
+        f"📦 <b>Деплой завершён</b>: {ok_count}/{total}\n\n{report}",
+        parse_mode="HTML")
+
 async def ssh_cmd_mode_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show command target selection: one / several / all."""
     q = update.callback_query
@@ -2750,6 +2930,7 @@ async def ssh_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"➕ <b>Добавить роутер</b>{hint}\n\n"
         "Формат: <code>имя пароль</code>\n"
         "или: <code>имя пароль порт</code>\n"
+        "Несколько — каждый с новой строки\n"
         "User по умолчанию: admin",
         parse_mode="HTML")
 
@@ -3042,7 +3223,14 @@ async def ssh_deploy_receive_ip(update: Update, context: ContextTypes.DEFAULT_TY
     if not cn:
         await update.message.reply_text("Ошибка: роутер не выбран.")
         return
-    await _do_ssh_deploy(update.message, context, cn, front_ip)
+    if cn == '__multi__':
+        targets = context.user_data.pop('ssh_deploy_targets', [])
+        if targets:
+            await _do_ssh_deploy_multi(update.message, context, targets, front_ip)
+        else:
+            await update.message.reply_text("Ошибка: роутеры не выбраны.")
+    else:
+        await _do_ssh_deploy(update.message, context, cn, front_ip)
 
 
 async def ssh_heal_router(update: Update, context: ContextTypes.DEFAULT_TYPE, cn: str):
