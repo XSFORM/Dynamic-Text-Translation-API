@@ -2710,6 +2710,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await auto_ip_remove_apply(update, context, ip)
     elif data == 'aip_reorder':
         await auto_ip_reorder_menu(update, context)
+    elif data == 'aip_ping':
+        await auto_ip_ping_all(update, context)
     elif data.startswith('aip_move:'):
         # aip_move:INDEX:up or aip_move:INDEX:down
         parts = data[len('aip_move:'):].split(':')
@@ -3773,10 +3775,37 @@ async def auto_ip_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("➕ Добавить IP", callback_data='aip_add'),
          InlineKeyboardButton("\U0001f5d1 Удалить IP", callback_data='aip_remove')],
         [InlineKeyboardButton("↕️ Порядок", callback_data='aip_reorder')],
+        [InlineKeyboardButton("📡 Пинг", callback_data='aip_ping')],
         [InlineKeyboardButton("\U0001f3e0 Меню", callback_data='home')],
     ]
     await safe_edit_text(q, context, "\n".join(lines), parse_mode="HTML",
                          reply_markup=InlineKeyboardMarkup(kb))
+
+async def auto_ip_ping_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ping all IPs in the pool once and show results."""
+    q = update.callback_query
+    await q.answer()
+    pool = load_ip_pool()
+    if not pool:
+        await safe_edit_text(q, context, "Пул пуст.")
+        return
+    await safe_edit_text(q, context, "📡 Пингую все IP...", parse_mode="HTML")
+    results = []
+    for entry in pool:
+        ip = entry["ip"]
+        label = entry.get("label", "")
+        try:
+            ok = await asyncio.to_thread(
+                ping_via_ssh, ip, entry["ssh_user"], entry["ssh_pass"], AUTO_IP_TM_CHECK
+            )
+            icon = "🟢" if ok else "🔴"
+        except Exception:
+            icon = "🔴"
+        name = f" ({label})" if label else ""
+        results.append(f"{icon} {ip}{name}")
+    text = "📡 <b>Пинг IP пула:</b>\n\n" + "\n".join(results)
+    kb = [[InlineKeyboardButton("◀️ Назад", callback_data='aip_menu')]]
+    await q.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
 async def auto_ip_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global auto_ip_enabled
