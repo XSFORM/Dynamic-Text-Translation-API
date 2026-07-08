@@ -2141,6 +2141,8 @@ async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_T
     # Auto IP text inputs
     if context.user_data.get('await_aip_add'):
         await auto_ip_add_handler(update, context); return
+    if context.user_data.get('await_aip_replace'):
+        await auto_ip_replace_receive(update, context); return
     # Remote Refresh text inputs
     if context.user_data.get('await_rr_ip'):
         await rr_set_ip_receive(update, context); return
@@ -2712,6 +2714,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await auto_ip_reorder_menu(update, context)
     elif data == 'aip_ping':
         await auto_ip_ping_all(update, context)
+    elif data == 'aip_replace':
+        await auto_ip_replace_menu(update, context)
+    elif data.startswith('aip_rep:'):
+        old_ip = data[len('aip_rep:'):]
+        await auto_ip_replace_start(update, context, old_ip)
     elif data.startswith('aip_move:'):
         # aip_move:INDEX:up or aip_move:INDEX:down
         parts = data[len('aip_move:'):].split(':')
@@ -3774,12 +3781,83 @@ async def auto_ip_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton(toggle_text, callback_data='aip_toggle')],
         [InlineKeyboardButton("➕ Добавить IP", callback_data='aip_add'),
          InlineKeyboardButton("\U0001f5d1 Удалить IP", callback_data='aip_remove')],
-        [InlineKeyboardButton("↕️ Порядок", callback_data='aip_reorder')],
+        [InlineKeyboardButton("↕️ Порядок", callback_data='aip_reorder'),
+         InlineKeyboardButton("🔄 Заменить IP", callback_data='aip_replace')],
         [InlineKeyboardButton("📡 Пинг", callback_data='aip_ping')],
         [InlineKeyboardButton("\U0001f3e0 Меню", callback_data='home')],
     ]
     await safe_edit_text(q, context, "\n".join(lines), parse_mode="HTML",
                          reply_markup=InlineKeyboardMarkup(kb))
+
+async def auto_ip_replace_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show list of IPs to choose which one to replace."""
+    q = update.callback_query
+    await q.answer()
+    pool = load_ip_pool()
+    if not pool:
+        await safe_edit_text(q, context, "Пул пуст.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='aip_menu')]]))
+        return
+    kb = []
+    for entry in pool:
+        label = entry.get("label", "")
+        name = f" ({label})" if label else ""
+        kb.append([InlineKeyboardButton(f"{entry['ip']}{name}", callback_data=f"aip_rep:{entry['ip']}")])
+    kb.append([InlineKeyboardButton("◀️ Назад", callback_data='aip_menu')])
+    await safe_edit_text(q, context, "🔄 <b>Заменить IP</b>\nВыберите какой IP заменить:",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+async def auto_ip_replace_start(update: Update, context: ContextTypes.DEFAULT_TYPE, old_ip: str):
+    """Ask for the new IP to replace the old one."""
+    q = update.callback_query
+    await q.answer()
+    pool = load_ip_pool()
+    entry = None
+    for e in pool:
+        if e["ip"] == old_ip:
+            entry = e
+            break
+    if not entry:
+        await safe_edit_text(q, context, "IP не найден в пуле.")
+        return
+    label = entry.get("label", "")
+    name = f" ({label})" if label else ""
+    context.user_data['await_aip_replace'] = old_ip
+    await safe_edit_text(q, context,
+        f"🔄 Замена <code>{old_ip}</code>{name}\n\nВведите новый IP:",
+        parse_mode="HTML")
+
+async def auto_ip_replace_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Receive new IP and replace the old one in the pool."""
+    old_ip = context.user_data.pop('await_aip_replace', None)
+    if not old_ip:
+        return
+    new_ip = update.message.text.strip()
+    parts = new_ip.split(".")
+    if not (len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts)):
+        await update.message.reply_text("Неверный IP. Повторите или /start для отмены.")
+        context.user_data['await_aip_replace'] = old_ip
+        return
+    pool = load_ip_pool()
+    found = False
+    for entry in pool:
+        if entry["ip"] == old_ip:
+            entry["ip"] = new_ip
+            found = True
+            break
+    if not found:
+        await update.message.reply_text(f"IP {old_ip} не найден в пуле.")
+        return
+    save_ip_pool(pool)
+    # Update current IP file if the replaced IP was active
+    current = rr_read_file(RR_IP_FILE, "").strip()
+    if current == old_ip:
+        rr_write_file(RR_IP_FILE, new_ip)
+    label = entry.get("label", "")
+    name = f" ({label})" if label else ""
+    await update.message.reply_text(
+        f"✅ IP заменён:\n<code>{old_ip}</code> → <code>{new_ip}</code>{name}\n\nЛогин/пароль/название сохранены.",
+        parse_mode="HTML")
 
 async def auto_ip_ping_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Ping all IPs in the pool once and show results."""
