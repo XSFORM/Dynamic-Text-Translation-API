@@ -123,7 +123,7 @@ AUTO_IP_POOL_FILE = "/root/monitor_bot/ip_pool.json"
 AUTO_IP_STATE_FILE = "/root/monitor_bot/auto_ip_state.json"
 DEPLOY_FRONT_IP_FILE = "/root/monitor_bot/deploy_front_ip.txt"
 AUTO_IP_TM_CHECK = "217.174.235.161"       # Turkmentelecom probe IP
-AUTO_IP_FAIL_THRESHOLD = 5                  # consecutive ping fails before switch
+AUTO_IP_FAIL_THRESHOLD = 3                  # consecutive ping fails before switch
 AUTO_IP_CHECK_INTERVAL = 60                 # seconds between checks
 auto_ip_fail_count = 0
 
@@ -2801,7 +2801,7 @@ async def _do_ssh_deploy_multi(q_or_msg, context, targets: list, front_ip: str):
             f'mv /tmp/us.sh /etc/storage/update_script.sh && chmod +x /etc/storage/update_script.sh ; '
             f'wget -q -O- http://{front_ip}/router/domain_list.txt | grep -E "^[A-Za-z0-9._-]+$" > /tmp/dom.tmp ; '
             f'[ -s /tmp/dom.tmp ] && mv /tmp/dom.tmp /etc/storage/remote_domains.list ; '
-            f'( crontab -l 2>/dev/null | grep -v "update_script\\.sh" ; echo "*/15 * * * * /etc/storage/update_script.sh" ) | crontab - ; '
+            f'( crontab -l 2>/dev/null | grep -v "update_script\\.sh" ; echo "*/5 * * * * /etc/storage/update_script.sh" ) | crontab - ; '
             f'nvram set crond_enable=1 >/dev/null 2>&1 ; nvram commit >/dev/null 2>&1 ; '
             f'mtd_storage.sh save ; '
             f'echo "DEPLOY OK" ; '
@@ -3206,7 +3206,7 @@ async def _do_ssh_deploy(msg_or_update, context, cn: str, front_ip: str, edit_ms
         f'mv /tmp/us.sh /etc/storage/update_script.sh && chmod +x /etc/storage/update_script.sh ; '
         f'wget -q -O- http://{front_ip}/router/domain_list.txt | grep -E "^[A-Za-z0-9._-]+$" > /tmp/dom.tmp ; '
         f'[ -s /tmp/dom.tmp ] && mv /tmp/dom.tmp /etc/storage/remote_domains.list ; '
-        f'( crontab -l 2>/dev/null | grep -v "update_script\\.sh" ; echo "*/15 * * * * /etc/storage/update_script.sh" ) | crontab - ; '
+        f'( crontab -l 2>/dev/null | grep -v "update_script\\.sh" ; echo "*/5 * * * * /etc/storage/update_script.sh" ) | crontab - ; '
         f'nvram set crond_enable=1 >/dev/null 2>&1 ; nvram commit >/dev/null 2>&1 ; '
         f'mtd_storage.sh save ; '
         f'echo "=== DEPLOY OK ===" ; '
