@@ -2801,11 +2801,8 @@ async def _do_ssh_deploy_multi(q_or_msg, context, targets: list, front_ip: str):
             f'mv /tmp/us.sh /etc/storage/update_script.sh && chmod +x /etc/storage/update_script.sh ; '
             f'wget -q -O- http://{front_ip}/router/domain_list.txt | grep -E "^[A-Za-z0-9._-]+$" > /tmp/dom.tmp ; '
             f'[ -s /tmp/dom.tmp ] && mv /tmp/dom.tmp /etc/storage/remote_domains.list ; '
-            f'CRON_DIR="/etc/storage/cron/crontabs" ; mkdir -p "$CRON_DIR" ; CF="$CRON_DIR/admin" ; '
-            f"grep -v 'update_script\\.sh' \"$CF\" 2>/dev/null > \"$CF.tmp\" ; "
-            f'echo "*/15 * * * * /etc/storage/update_script.sh" >> "$CF.tmp" ; mv "$CF.tmp" "$CF" ; '
+            f'( crontab -l 2>/dev/null | grep -v "update_script\\.sh" ; echo "*/15 * * * * /etc/storage/update_script.sh" ) | crontab - ; '
             f'nvram set crond_enable=1 >/dev/null 2>&1 ; nvram commit >/dev/null 2>&1 ; '
-            f'killall crond 2>/dev/null ; sleep 1 ; crond -c "$CRON_DIR" -l 8 2>/dev/null ; '
             f'mtd_storage.sh save ; '
             f'echo "DEPLOY OK" ; '
             f"}} || echo 'ABORTED'"
@@ -3209,16 +3206,13 @@ async def _do_ssh_deploy(msg_or_update, context, cn: str, front_ip: str, edit_ms
         f'mv /tmp/us.sh /etc/storage/update_script.sh && chmod +x /etc/storage/update_script.sh ; '
         f'wget -q -O- http://{front_ip}/router/domain_list.txt | grep -E "^[A-Za-z0-9._-]+$" > /tmp/dom.tmp ; '
         f'[ -s /tmp/dom.tmp ] && mv /tmp/dom.tmp /etc/storage/remote_domains.list ; '
-        f'CRON_DIR="/etc/storage/cron/crontabs" ; mkdir -p "$CRON_DIR" ; CF="$CRON_DIR/admin" ; '
-        f"grep -v 'update_script\\.sh' \"$CF\" 2>/dev/null > \"$CF.tmp\" ; "
-        f'echo "*/15 * * * * /etc/storage/update_script.sh" >> "$CF.tmp" ; mv "$CF.tmp" "$CF" ; '
+        f'( crontab -l 2>/dev/null | grep -v "update_script\\.sh" ; echo "*/15 * * * * /etc/storage/update_script.sh" ) | crontab - ; '
         f'nvram set crond_enable=1 >/dev/null 2>&1 ; nvram commit >/dev/null 2>&1 ; '
-        f'killall crond 2>/dev/null ; sleep 1 ; crond -c "$CRON_DIR" -l 8 2>/dev/null ; '
         f'mtd_storage.sh save ; '
         f'echo "=== DEPLOY OK ===" ; '
         f"grep 'Version:' /etc/storage/update_script.sh ; "
         f'echo "--- domains ---" ; cat /etc/storage/remote_domains.list ; '
-        f'echo "--- cron ---" ; cat "$CF" ; '
+        f'echo "--- cron ---" ; crontab -l 2>/dev/null ; '
         f'echo "=== RUN ===" ; /etc/storage/update_script.sh ; '
         f'echo "=== AFTER ===" ; grep "^remote " /etc/openvpn/client/client.conf ; '
         f'sleep 8 ; ifconfig tun0 2>/dev/null | grep -qi inet && echo "tun0 UP" || echo "tun0 DOWN" ; '
