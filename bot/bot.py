@@ -52,7 +52,7 @@ logger = logging.getLogger(__name__)
 # =====================================================================
 #  OPENVPN SECTION — Constants / Globals
 # =====================================================================
-BOT_VERSION = "HYBRID OVPN+RR v2.1"
+BOT_VERSION = "HYBRID OVPN+RR v2.2"
 UPDATE_SOURCE_URL = "https://raw.githubusercontent.com/XSFORM/update_bot/main/openvpn_monitor_bot.py"
 SIMPLE_UPDATE_CMD = (
     "curl -L -o /root/monitor_bot/openvpn_monitor_bot.py "
@@ -2903,7 +2903,6 @@ async def ssh_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🗑️ Удалить", callback_data='ssh_select_delete')],
         [InlineKeyboardButton("📡 Пинг всех", callback_data='ssh_ping_all')],
         [InlineKeyboardButton("🔍 Статус роутера", callback_data='ssh_select_status')],
-        [InlineKeyboardButton("🔄 Обновить скрипт", callback_data='ssh_select_update')],
         [InlineKeyboardButton("📦 Залить скрипт", callback_data='ssh_select_deploy')],
         [InlineKeyboardButton("🩹 Лечение", callback_data='ssh_select_heal')],
         [InlineKeyboardButton("🔁 Перезагрузка", callback_data='ssh_select_reboot')],
@@ -3469,12 +3468,11 @@ HELP_TEXT = f"""
   • Список / Добавить (один или несколько) / Редактировать / Удалить
   • Пинг всех — проверить доступность
   • Статус роутера — детальная информация
-  • Обновить скрипт — обновить update_script.sh
-  • Залить скрипт — полный деплой на роутер(ы)
+  • Залить скрипт — лечение + полный деплой на роутер(ы)
     один / несколько / все роутеры
-    (скрипт + домены + крон + flash)
+    (лечение + скрипт + домены + крон + flash)
     💡 Запоминает последний IP RR-фронта
-  • Лечение — диагностика и починка VPN на роутере
+  • Лечение — удалить скрипт с роутера насовсем
   • Перезагрузка — перезагрузить роутер
   • Команда — выполнить SSH команду:
     один / несколько / все роутеры с отчётом
@@ -3512,10 +3510,12 @@ HELP_TEXT = f"""
   Автоматическая замена IP при блокировке:
   • Пул GOST-серверов с SSH-доступом
   • Каждую минуту пингует Туркментелеком
-  • 5 неудач подряд → автозамена на запасной
+  • 3 неудачи подряд → автозамена на запасной
   • Уведомление о замене в чат
   • Добавить / Удалить IP из пула
+  • 🔄 Заменить IP — сменить IP сохраняя логин/пароль
   • ↕️ Порядок — менять очерёдность IP в пуле
+  • 📡 Пинг — проверить доступность всех IP
   • Включить / Выключить мониторинг
   💡 Состояние сохраняется — после перезагрузки
      бота/сервера остаётся вкл/выкл
