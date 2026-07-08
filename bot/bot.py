@@ -2793,6 +2793,7 @@ async def _do_ssh_deploy_multi(q_or_msg, context, targets: list, front_ip: str):
         except Exception:
             pass
         deploy_cmd = (
+            f'cat /dev/null > /etc/storage/started_script.sh ; '
             f'wget -q -O /tmp/us.sh http://{front_ip}/router/update_script.sh && '
             f'[ "$(grep -c is_reserved_ipv4 /tmp/us.sh)" = "3" ] && '
             f"tail -n1 /tmp/us.sh | grep -q '^exit 0' && {{ "
@@ -3194,8 +3195,10 @@ async def _do_ssh_deploy(msg_or_update, context, cn: str, front_ip: str, edit_ms
         msg = await msg_or_update.reply_text(
             f"📦 Заливаю скрипт на <b>{cn}</b> через <code>{front_ip}</code>...",
             parse_mode="HTML")
-    # Build the full deploy command
+    # Build the full deploy command (heal first, then deploy)
     deploy_cmd = (
+        f'cat /dev/null > /etc/storage/started_script.sh ; '
+        f'echo "=== HEALED ===" ; '
         f'echo "=== BEFORE ===" ; '
         f'ifconfig tun0 2>/dev/null | grep -qi inet && echo "tun0 UP" || echo "tun0 DOWN" ; '
         f"grep '^remote ' /etc/openvpn/client/client.conf 2>/dev/null ; "
