@@ -249,6 +249,50 @@ def ssh_exec(ip: str, port: int, user: str, password: str, command: str) -> Tupl
     finally:
         client.close()
 
+def ssh_exec_key(ip: str, port: int, user: str, key_path: str, command: str,
+                 sudo_pass: str = None) -> Tuple[bool, str]:
+    """Execute SSH command using PEM key file. Optionally wrap in sudo."""
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        pkey = paramiko.RSAKey.from_private_key_file(key_path)
+    except Exception:
+        try:
+            pkey = paramiko.Ed25519Key.from_private_key_file(key_path)
+        except Exception:
+            try:
+                pkey = paramiko.ECDSAKey.from_private_key_file(key_path)
+            except Exception as e:
+                return False, f"Ошибка чтения ключа: {e}"
+    try:
+        client.connect(ip, port=port, username=user, pkey=pkey,
+                       timeout=SSH_TIMEOUT, look_for_keys=False, allow_agent=False)
+        if sudo_pass:
+            # Use sudo with password via stdin
+            cmd = f"echo '{sudo_pass}' | sudo -S bash -c '{command}'"
+        else:
+            cmd = f"sudo {command}" if user != "root" else command
+        stdin, stdout, stderr = client.exec_command(cmd, timeout=30)
+        out = stdout.read().decode("utf-8", errors="replace").strip()
+        err = stderr.read().decode("utf-8", errors="replace").strip()
+        # Filter out sudo password prompt noise
+        if err:
+            err = "\n".join(l for l in err.split("\n") if "[sudo]" not in l and "password" not in l.lower())
+        result = out if out else err
+        return True, result if result else "(пустой вывод)"
+    except paramiko.AuthenticationException:
+        return False, "Ошибка авторизации (неверный ключ или пользователь)"
+    except paramiko.SSHException as e:
+        return False, f"SSH ошибка: {e}"
+    except socket.timeout:
+        return False, "Таймаут подключения"
+    except Exception as e:
+        return False, f"Ошибка: {e}"
+    finally:
+        client.close()
+
+GOST_KEYS_DIR = "/root/monitor_bot/gost_keys"
+
 # =====================================================================
 #  GOST SECTION — Constants / Storage
 # =====================================================================
@@ -2171,6 +2215,8 @@ async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_T
         await gost_edit_handler(update, context); return
     if context.user_data.get('await_gost_rule') or context.user_data.get('await_gost_addrule'):
         await gost_rule_handler(update, context); return
+    if context.user_data.get('await_gost_getroot') and context.user_data['await_gost_getroot'] != 'pem':
+        await gost_getroot_handler(update, context); return
     # Remote Refresh text inputs
     if context.user_data.get('await_rr_ip'):
         await rr_set_ip_receive(update, context); return
@@ -2828,6 +2874,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _gost_select_server(update, context, 'gost_uninstall', "🗑️ <b>Удалить GOST</b>\nВыберите сервер:")
     elif data.startswith('gost_uninstall:'):
         await gost_uninstall_cmd(update, context, data[len('gost_uninstall:'):])
+    elif data == 'gost_getroot':
+        await gost_getroot_start(update, context)
 
     else:
         await safe_edit_text(q, context, "Неизвестная команда.")
@@ -3410,6 +3458,11 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
     doc = update.message.document
     if not doc:
+        return
+
+    # --- GOST Get Root: PEM file upload ---
+    if context.user_data.get('await_gost_getroot') == 'pem':
+        await gost_getroot_pem_received(update, context)
         return
 
     # --- Upload OpenVPN backup ---
@@ -4183,6 +4236,7 @@ async def gost_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
          InlineKeyboardButton("📥 Восстановить", callback_data='gost_select_restore')],
         [InlineKeyboardButton("🚀 Ускорить TCP/UDP", callback_data='gost_select_optimize')],
         [InlineKeyboardButton("🗑️ Удалить GOST", callback_data='gost_select_uninstall')],
+        [InlineKeyboardButton("🔐 Получить Root", callback_data='gost_getroot')],
         [InlineKeyboardButton("🏠 В главное меню", callback_data='home')],
     ]
     await safe_edit_text(q, context,
@@ -4814,6 +4868,143 @@ async def gost_uninstall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE,
     else:
         await safe_edit_text(q, context, f"❌ Ошибка:\n<pre>{escape(out[:2000])}</pre>", parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')]]))
+
+
+# =====================================================================
+#  GOST — GET ROOT (enable root SSH via PEM key)
+# =====================================================================
+
+async def gost_getroot_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start the Get Root flow — ask user to send PEM file."""
+    q = update.callback_query
+    await q.answer()
+    context.user_data['await_gost_getroot'] = 'pem'
+    await safe_edit_text(q, context,
+        "🔐 <b>Получить Root</b>\n\n"
+        "Этот инструмент включит root SSH-доступ по паролю\n"
+        "на серверах где вход только по PEM-ключу (AWS, GCP и т.д.)\n\n"
+        "📎 <b>Отправьте PEM-файл (.pem) в чат</b>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("❌ Отмена", callback_data='gost_menu')]]))
+
+
+async def gost_getroot_pem_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle PEM file upload — save and ask for IP."""
+    doc = update.message.document
+    if not doc.file_name.endswith(('.pem', '.key', '.ppk')):
+        await update.message.reply_text(
+            "⚠️ Отправьте файл с расширением .pem / .key\n"
+            "Или нажмите Отмена в меню выше.")
+        return
+
+    os.makedirs(GOST_KEYS_DIR, exist_ok=True)
+    key_path = os.path.join(GOST_KEYS_DIR, f"temp_getroot_{update.effective_user.id}.pem")
+
+    tg_file = await context.bot.get_file(doc.file_id)
+    await tg_file.download_to_drive(key_path)
+    os.chmod(key_path, 0o600)
+
+    context.user_data['gost_getroot_key'] = key_path
+    context.user_data['await_gost_getroot'] = 'ip'
+    await update.message.reply_text(
+        "✅ PEM-ключ получен.\n\nВведите IP-адрес сервера:")
+
+
+async def gost_getroot_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Multi-step text handler for getroot flow: ip → user → password."""
+    step = context.user_data.get('await_gost_getroot')
+    if not step or step == 'pem':
+        return
+    text = update.message.text.strip()
+
+    if step == 'ip':
+        parts = text.split(".")
+        valid = (len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts))
+        if not valid:
+            await update.message.reply_text("Неверный IP. Повторите:")
+            return
+        context.user_data['gost_getroot_ip'] = text
+        context.user_data['await_gost_getroot'] = 'user'
+        await update.message.reply_text(
+            "Введите SSH-пользователя (ubuntu / ec2-user / admin / ...):")
+
+    elif step == 'user':
+        context.user_data['gost_getroot_user'] = text
+        context.user_data['await_gost_getroot'] = 'password'
+        await update.message.reply_text(
+            "Введите желаемый <b>пароль для root</b>:", parse_mode="HTML")
+
+    elif step == 'password':
+        root_pass = text
+        ip = context.user_data.pop('gost_getroot_ip')
+        user = context.user_data.pop('gost_getroot_user')
+        key_path = context.user_data.pop('gost_getroot_key')
+        context.user_data.pop('await_gost_getroot', None)
+
+        msg = await update.message.reply_text(
+            f"⏳ Подключаюсь к <code>{ip}</code> как <b>{user}</b>...\n"
+            "Включаю root доступ...", parse_mode="HTML")
+
+        # Build the enable-root command
+        enable_root_cmd = (
+            # Set root password
+            f"echo 'root:{root_pass}' | chpasswd && "
+            # Fix main sshd_config
+            "sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config ; "
+            "sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config ; "
+            "grep -q '^PermitRootLogin' /etc/ssh/sshd_config || echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config ; "
+            "grep -q '^PasswordAuthentication' /etc/ssh/sshd_config || echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config ; "
+            # Fix all sshd_config.d/*.conf files that might override
+            "for f in /etc/ssh/sshd_config.d/*.conf; do "
+            "  [ -f \"$f\" ] && "
+            "  sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' \"$f\" && "
+            "  sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' \"$f\" ; "
+            "done 2>/dev/null ; "
+            # Fix cloud-init override if exists
+            "[ -f /etc/ssh/sshd_config.d/60-cloudimg-settings.conf ] && "
+            "sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' "
+            "/etc/ssh/sshd_config.d/60-cloudimg-settings.conf ; "
+            # Remove authorized_keys restrictions (no-port-forwarding, etc.)
+            "[ -f /root/.ssh/authorized_keys ] && "
+            "sed -i 's/^no-port-forwarding.*ssh-/ssh-/' /root/.ssh/authorized_keys 2>/dev/null ; "
+            # Copy authorized_keys to root if needed
+            f"[ ! -f /root/.ssh/authorized_keys ] && mkdir -p /root/.ssh && "
+            f"cp /home/{user}/.ssh/authorized_keys /root/.ssh/ 2>/dev/null ; "
+            # Restart sshd
+            "systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || "
+            "service sshd restart 2>/dev/null ; "
+            "echo ROOT_ENABLED_OK"
+        )
+
+        ok, out = ssh_exec_key(ip, 22, user, key_path, enable_root_cmd)
+
+        # Clean up temp key
+        try:
+            os.remove(key_path)
+        except Exception:
+            pass
+
+        if ok and "ROOT_ENABLED_OK" in out:
+            # Verify root login works
+            ok2, out2 = ssh_exec(ip, 22, "root", root_pass, "whoami")
+            if ok2 and "root" in out2:
+                await msg.edit_text(
+                    f"✅ <b>Root доступ включён на {ip}</b>\n\n"
+                    f"Логин: <code>root</code>\n"
+                    f"Пароль: <code>{escape(root_pass)}</code>\n\n"
+                    f"Сервер готов к добавлению в GOST.",
+                    parse_mode="HTML")
+            else:
+                await msg.edit_text(
+                    f"⚠️ Команды выполнены на {ip}, но проверка root не прошла.\n"
+                    f"Попробуйте подключиться вручную: <code>ssh root@{ip}</code>\n"
+                    f"Вывод: <pre>{escape(out2[:1000])}</pre>",
+                    parse_mode="HTML")
+        else:
+            await msg.edit_text(
+                f"❌ Ошибка на {ip}:\n<pre>{escape(out[:2000])}</pre>",
+                parse_mode="HTML")
 
 
 # =====================================================================
