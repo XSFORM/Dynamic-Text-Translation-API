@@ -52,7 +52,7 @@ logger = logging.getLogger(__name__)
 # =====================================================================
 #  OPENVPN SECTION — Constants / Globals
 # =====================================================================
-BOT_VERSION = "HYBRID OVPN+RR v2.2"
+BOT_VERSION = "HYBRID OVPN+RR v2.3"
 UPDATE_SOURCE_URL = "https://raw.githubusercontent.com/XSFORM/update_bot/main/openvpn_monitor_bot.py"
 SIMPLE_UPDATE_CMD = (
     "curl -L -o /root/monitor_bot/openvpn_monitor_bot.py "
@@ -248,6 +248,26 @@ def ssh_exec(ip: str, port: int, user: str, password: str, command: str) -> Tupl
         return False, f"Ошибка: {e}"
     finally:
         client.close()
+
+# =====================================================================
+#  GOST SECTION — Constants / Storage
+# =====================================================================
+GOST_SERVERS_FILE = "/root/monitor_bot/gost_servers.json"
+GOST_BIN = "/usr/local/bin/gost"
+GOST_SERVICE_PATH = "/usr/lib/systemd/system/gost.service"
+GOST_BACKUP_DIR = "/var/backups/gost-xsform"
+GOST_REPO = "ginuerzh/gost"
+
+def load_gost_servers() -> Dict:
+    try:
+        with open(GOST_SERVERS_FILE, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+def save_gost_servers(data: Dict):
+    with open(GOST_SERVERS_FILE, "w") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
 
 # =====================================================================
 #  NATURAL SORT
@@ -1972,6 +1992,7 @@ def get_main_keyboard():
         [InlineKeyboardButton("📥 Git Pull", callback_data='git_pull')],
         [InlineKeyboardButton("📝 OVPN EDIT", callback_data='ovpn_edit_menu'),
          InlineKeyboardButton("🖥 SSH Роутеры", callback_data='ssh_routers')],
+        [InlineKeyboardButton("🌐 GOST Серверы", callback_data='gost_menu')],
         # --- Remote Refresh section ---
         [InlineKeyboardButton("─── Remote Refresh ───", callback_data='noop')],
         [InlineKeyboardButton("📡 IP роутеров", callback_data='rr_current_ip'),
@@ -2143,6 +2164,13 @@ async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_T
         await auto_ip_add_handler(update, context); return
     if context.user_data.get('await_aip_replace'):
         await auto_ip_replace_receive(update, context); return
+    # GOST text inputs
+    if context.user_data.get('await_gost_add'):
+        await gost_add_handler(update, context); return
+    if context.user_data.get('await_gost_edit'):
+        await gost_edit_handler(update, context); return
+    if context.user_data.get('await_gost_rule') or context.user_data.get('await_gost_addrule'):
+        await gost_rule_handler(update, context); return
     # Remote Refresh text inputs
     if context.user_data.get('await_rr_ip'):
         await rr_set_ip_receive(update, context); return
@@ -2725,6 +2753,81 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         idx = int(parts[0])
         direction = parts[1]
         await auto_ip_move(update, context, idx, direction)
+
+    # --- GOST callbacks ---
+    elif data == 'gost_menu':
+        await gost_menu(update, context)
+    elif data == 'gost_list':
+        await gost_list(update, context)
+    elif data == 'gost_add':
+        await gost_add_start(update, context)
+    elif data.startswith('gost_edit:'):
+        await gost_edit_start(update, context, data[len('gost_edit:'):])
+    elif data.startswith('gost_del:'):
+        await gost_delete(update, context, data[len('gost_del:'):])
+    elif data == 'gost_select_install':
+        await _gost_select_server(update, context, 'gost_install', "⚙️ <b>Установить GOST</b>\nВыберите сервер:")
+    elif data.startswith('gost_install:'):
+        await gost_install(update, context, data[len('gost_install:'):])
+    elif data == 'gost_select_rules':
+        await _gost_select_server(update, context, 'gost_rules', "📡 <b>Настроить правила</b>\nВыберите сервер:")
+    elif data.startswith('gost_rules:'):
+        await gost_configure_rules_start(update, context, data[len('gost_rules:'):])
+    elif data == 'gost_select_addrule':
+        await _gost_select_server(update, context, 'gost_addrule', "➕ <b>Добавить правило</b>\nВыберите сервер:")
+    elif data.startswith('gost_addrule:'):
+        await gost_add_rule_start(update, context, data[len('gost_addrule:'):])
+    elif data == 'gost_rule_more':
+        await gost_rule_more(update, context)
+    elif data == 'gost_rule_done':
+        await gost_rule_done(update, context)
+    elif data == 'gost_select_showconf':
+        await _gost_select_server(update, context, 'gost_showconf', "📄 <b>Показать конфиг</b>\nВыберите сервер:")
+    elif data.startswith('gost_showconf:'):
+        await gost_show_config(update, context, data[len('gost_showconf:'):])
+    elif data == 'gost_ping_all':
+        await gost_ping_all(update, context)
+    elif data == 'gost_select_start':
+        await _gost_select_server(update, context, 'gost_start', "▶️ <b>Запустить GOST</b>\nВыберите сервер:")
+    elif data.startswith('gost_start:'):
+        await gost_start_cmd(update, context, data[len('gost_start:'):])
+    elif data == 'gost_select_stop':
+        await _gost_select_server(update, context, 'gost_stop', "⏹ <b>Остановить GOST</b>\nВыберите сервер:")
+    elif data.startswith('gost_stop:'):
+        await gost_stop_cmd(update, context, data[len('gost_stop:'):])
+    elif data == 'gost_select_restart':
+        await _gost_select_server(update, context, 'gost_restart', "🔁 <b>Перезапустить GOST</b>\nВыберите сервер:")
+    elif data.startswith('gost_restart:'):
+        await gost_restart_cmd(update, context, data[len('gost_restart:'):])
+    elif data == 'gost_select_status':
+        await _gost_select_server(update, context, 'gost_status', "📊 <b>Статус GOST</b>\nВыберите сервер:")
+    elif data.startswith('gost_status:'):
+        await gost_status_cmd(update, context, data[len('gost_status:'):])
+    elif data == 'gost_select_log':
+        await _gost_select_server(update, context, 'gost_log', "📜 <b>Лог GOST</b>\nВыберите сервер:")
+    elif data.startswith('gost_log:'):
+        await gost_log_cmd(update, context, data[len('gost_log:'):])
+    elif data == 'gost_select_backup':
+        await _gost_select_server(update, context, 'gost_backup', "💾 <b>Бэкап GOST</b>\nВыберите сервер:")
+    elif data.startswith('gost_backup:'):
+        await gost_backup_cmd(update, context, data[len('gost_backup:'):])
+    elif data == 'gost_select_restore':
+        await _gost_select_server(update, context, 'gost_restore', "📥 <b>Восстановить GOST</b>\nВыберите сервер:")
+    elif data.startswith('gost_restore:'):
+        await gost_restore_cmd(update, context, data[len('gost_restore:'):])
+    elif data.startswith('gost_restore_apply:'):
+        # gost_restore_apply:IP:FILENAME
+        rest = data[len('gost_restore_apply:'):]
+        parts = rest.split(':', 1)
+        await gost_restore_apply(update, context, parts[0], parts[1])
+    elif data == 'gost_select_optimize':
+        await _gost_select_server(update, context, 'gost_optimize', "🚀 <b>Ускорить TCP/UDP</b>\nВыберите сервер:")
+    elif data.startswith('gost_optimize:'):
+        await gost_optimize_cmd(update, context, data[len('gost_optimize:'):])
+    elif data == 'gost_select_uninstall':
+        await _gost_select_server(update, context, 'gost_uninstall', "🗑️ <b>Удалить GOST</b>\nВыберите сервер:")
+    elif data.startswith('gost_uninstall:'):
+        await gost_uninstall_cmd(update, context, data[len('gost_uninstall:'):])
 
     else:
         await safe_edit_text(q, context, "Неизвестная команда.")
@@ -3521,6 +3624,33 @@ HELP_TEXT = f"""
      бота/сервера остаётся вкл/выкл
 
 ═══════════════════════
+   GOST СЕРВЕРЫ
+═══════════════════════
+
+🌐 GOST Серверы
+  Управление GOST-прокси на удалённых серверах
+  через SSH (paramiko). Полностью независимо
+  от основного VPN-сервера.
+
+  • Список серверов — просмотр, редактирование, удаление
+  • ➕ Добавить сервер — IP + SSH логин/пароль + метка
+  • ⚙️ Установить GOST — скачивает последнюю версию
+    с GitHub на удалённый сервер
+  • 📡 Настроить правила — создание systemd сервиса
+    с правилами перенаправления (TCP/UDP/HTTP/SOCKS5)
+  • ➕ Добавить правило — добавить к существующему конфигу
+  • 📄 Показать конфиг — прочитать gost.service
+  • 📡 Пинг серверов — проверка доступности всех серверов
+  • ▶️ Старт / ⏹ Стоп / 🔁 Рестарт — управление сервисом
+  • 📊 Статус — systemctl status gost
+  • 📜 Лог — последние 30 строк journalctl
+  • 💾 Бэкап — бэкап бинарника + конфига
+  • 📥 Восстановить — из ранее созданного бэкапа
+  • 🚀 Ускорить TCP/UDP — sysctl оптимизация
+    (BBR, буферы, conntrack, fastopen)
+  • 🗑️ Удалить GOST — полное удаление с сервера
+
+═══════════════════════
    ОБЩИЕ КОМАНДЫ
 ═══════════════════════
 
@@ -4026,6 +4156,665 @@ async def auto_ip_move(update: Update, context: ContextTypes.DEFAULT_TYPE, idx: 
         pool[idx], pool[idx+1] = pool[idx+1], pool[idx]
     save_ip_pool(pool)
     await auto_ip_reorder_menu(update, context)
+
+# =====================================================================
+#  GOST MANAGEMENT — Functions
+# =====================================================================
+
+async def gost_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    servers = load_gost_servers()
+    count = len(servers)
+    kb = [
+        [InlineKeyboardButton(f"📋 Список серверов ({count})", callback_data='gost_list')],
+        [InlineKeyboardButton("➕ Добавить сервер", callback_data='gost_add')],
+        [InlineKeyboardButton("⚙️ Установить GOST", callback_data='gost_select_install')],
+        [InlineKeyboardButton("📡 Настроить правила", callback_data='gost_select_rules')],
+        [InlineKeyboardButton("➕ Добавить правило", callback_data='gost_select_addrule')],
+        [InlineKeyboardButton("📄 Показать конфиг", callback_data='gost_select_showconf')],
+        [InlineKeyboardButton("📡 Пинг серверов", callback_data='gost_ping_all')],
+        [InlineKeyboardButton("▶️ Старт", callback_data='gost_select_start'),
+         InlineKeyboardButton("⏹ Стоп", callback_data='gost_select_stop'),
+         InlineKeyboardButton("🔁 Рестарт", callback_data='gost_select_restart')],
+        [InlineKeyboardButton("📊 Статус", callback_data='gost_select_status'),
+         InlineKeyboardButton("📜 Лог", callback_data='gost_select_log')],
+        [InlineKeyboardButton("💾 Бэкап", callback_data='gost_select_backup'),
+         InlineKeyboardButton("📥 Восстановить", callback_data='gost_select_restore')],
+        [InlineKeyboardButton("🚀 Ускорить TCP/UDP", callback_data='gost_select_optimize')],
+        [InlineKeyboardButton("🗑️ Удалить GOST", callback_data='gost_select_uninstall')],
+        [InlineKeyboardButton("🏠 В главное меню", callback_data='home')],
+    ]
+    await safe_edit_text(q, context,
+        f"🌐 <b>GOST Серверы</b> — управление\nСерверов: <b>{count}</b>",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def gost_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    servers = load_gost_servers()
+    if not servers:
+        await safe_edit_text(q, context, "Список серверов пуст.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("➕ Добавить", callback_data='gost_add'),
+                  InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')]]))
+        return
+    lines = []
+    for ip, info in servers.items():
+        label = info.get("label", ip)
+        rules_count = len(info.get("rules", []))
+        lines.append(f"• <code>{ip}</code> — {label} ({rules_count} правил)")
+    kb = []
+    for ip, info in servers.items():
+        label = info.get("label", ip)
+        kb.append([InlineKeyboardButton(f"✏️ {ip} ({label})", callback_data=f'gost_edit:{ip}'),
+                   InlineKeyboardButton("🗑️", callback_data=f'gost_del:{ip}')])
+    kb.append([InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')])
+    await safe_edit_text(q, context,
+        "📋 <b>GOST серверы:</b>\n\n" + "\n".join(lines),
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def gost_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    context.user_data['await_gost_add'] = 'ip'
+    await safe_edit_text(q, context,
+        "➕ <b>Добавить GOST-сервер</b>\n\nВведите IP адрес сервера:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("❌ Отмена", callback_data='gost_menu')]]))
+
+
+async def gost_add_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    step = context.user_data.get('await_gost_add')
+    if not step:
+        return
+    text = update.message.text.strip()
+
+    if step == 'ip':
+        parts = text.split(".")
+        valid = (len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts))
+        if not valid:
+            await update.message.reply_text("Неверный IP. Повторите.")
+            return
+        servers = load_gost_servers()
+        if text in servers:
+            context.user_data.pop('await_gost_add', None)
+            await update.message.reply_text(f"Сервер {text} уже добавлен.")
+            return
+        context.user_data['gost_new_ip'] = text
+        context.user_data['await_gost_add'] = 'user'
+        await update.message.reply_text("Введите SSH логин (root):", reply_markup=None)
+
+    elif step == 'user':
+        context.user_data['gost_new_user'] = text
+        context.user_data['await_gost_add'] = 'pass'
+        await update.message.reply_text("Введите SSH пароль:")
+
+    elif step == 'pass':
+        context.user_data['gost_new_pass'] = text
+        context.user_data['await_gost_add'] = 'label'
+        await update.message.reply_text("Введите название (метку), например 'Front OVPN 1':")
+
+    elif step == 'label':
+        ip = context.user_data.pop('gost_new_ip')
+        user = context.user_data.pop('gost_new_user')
+        pwd = context.user_data.pop('gost_new_pass')
+        context.user_data.pop('await_gost_add', None)
+        servers = load_gost_servers()
+        servers[ip] = {"ssh_user": user, "ssh_pass": pwd, "label": text, "rules": []}
+        save_gost_servers(servers)
+        await update.message.reply_text(
+            f"✅ Сервер добавлен: <code>{ip}</code> ({text})", parse_mode="HTML")
+
+
+async def gost_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE, ip: str):
+    q = update.callback_query
+    await q.answer()
+    servers = load_gost_servers()
+    if ip not in servers:
+        await safe_edit_text(q, context, "Сервер не найден.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='gost_list')]]))
+        return
+    context.user_data['await_gost_edit'] = ip
+    info = servers[ip]
+    await safe_edit_text(q, context,
+        f"✏️ <b>Редактирование {ip}</b>\n"
+        f"Логин: <code>{info['ssh_user']}</code>\n"
+        f"Метка: {info.get('label', '-')}\n\n"
+        f"Отправьте новые данные в формате:\n<code>логин:пароль:метка</code>\n"
+        f"(можно частично: <code>пароль</code> или <code>логин:пароль</code>)",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("❌ Отмена", callback_data='gost_list')]]))
+
+
+async def gost_edit_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ip = context.user_data.pop('await_gost_edit', None)
+    if not ip:
+        return
+    text = update.message.text.strip()
+    servers = load_gost_servers()
+    if ip not in servers:
+        await update.message.reply_text("Сервер не найден.")
+        return
+    parts = text.split(":")
+    if len(parts) == 1:
+        servers[ip]["ssh_pass"] = parts[0]
+    elif len(parts) == 2:
+        servers[ip]["ssh_user"] = parts[0]
+        servers[ip]["ssh_pass"] = parts[1]
+    elif len(parts) >= 3:
+        servers[ip]["ssh_user"] = parts[0]
+        servers[ip]["ssh_pass"] = parts[1]
+        servers[ip]["label"] = ":".join(parts[2:])
+    save_gost_servers(servers)
+    await update.message.reply_text(f"✅ Сервер <code>{ip}</code> обновлён.", parse_mode="HTML")
+
+
+async def gost_delete(update: Update, context: ContextTypes.DEFAULT_TYPE, ip: str):
+    q = update.callback_query
+    await q.answer()
+    servers = load_gost_servers()
+    removed = servers.pop(ip, None)
+    if removed:
+        save_gost_servers(servers)
+        await safe_edit_text(q, context, f"🗑️ Удалён: <code>{ip}</code>", parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')]]))
+    else:
+        await safe_edit_text(q, context, "Сервер не найден.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')]]))
+
+
+def _gost_server_selector(servers: Dict, action: str, back: str = 'gost_menu') -> InlineKeyboardMarkup:
+    """Build keyboard to select a GOST server for an action."""
+    kb = []
+    for ip, info in servers.items():
+        label = info.get("label", ip)
+        kb.append([InlineKeyboardButton(f"{ip} ({label})", callback_data=f'{action}:{ip}')])
+    kb.append([InlineKeyboardButton("◀️ Назад", callback_data=back)])
+    return InlineKeyboardMarkup(kb)
+
+
+async def _gost_select_server(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                               action: str, title: str):
+    """Show server selector for a given action."""
+    q = update.callback_query
+    await q.answer()
+    servers = load_gost_servers()
+    if not servers:
+        await safe_edit_text(q, context, "Нет серверов. Сначала добавьте сервер.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("➕ Добавить", callback_data='gost_add'),
+                  InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')]]))
+        return
+    await safe_edit_text(q, context, title, parse_mode="HTML",
+        reply_markup=_gost_server_selector(servers, action))
+
+
+async def gost_install(update: Update, context: ContextTypes.DEFAULT_TYPE, ip: str):
+    """Install GOST on remote server via SSH."""
+    q = update.callback_query
+    await q.answer()
+    servers = load_gost_servers()
+    srv = servers.get(ip)
+    if not srv:
+        await safe_edit_text(q, context, "Сервер не найден.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')]]))
+        return
+    msg = await safe_edit_text(q, context, f"⏳ Устанавливаю GOST на <code>{ip}</code>...", parse_mode="HTML")
+    install_cmd = (
+        "apt-get update -qq && apt-get install -y -qq wget curl jq tar gzip > /dev/null 2>&1 ; "
+        f"VER=$(curl -s 'https://api.github.com/repos/{GOST_REPO}/releases/latest' | jq -r '.tag_name' | sed 's/^v//') ; "
+        "ARCH=$(dpkg --print-architecture 2>/dev/null || echo amd64) ; "
+        "[ \"$ARCH\" = 'arm64' ] && ARCH='armv8' ; "
+        "[ \"$ARCH\" = 'armhf' ] && ARCH='armv7' ; "
+        "cd /tmp && "
+        f"wget -q 'https://github.com/{GOST_REPO}/releases/download/v'$VER'/gost_'$VER'_linux_'$ARCH'.tar.gz' -O gost.tar.gz && "
+        "tar -xzf gost.tar.gz && chmod +x gost && mv gost /usr/local/bin/gost && "
+        "rm -f gost.tar.gz && "
+        "echo \"GOST_OK:$VER\""
+    )
+    ok, out = ssh_exec(ip, 22, srv["ssh_user"], srv["ssh_pass"], install_cmd)
+    if ok and "GOST_OK:" in out:
+        ver = out.split("GOST_OK:")[-1].strip()
+        result = f"✅ GOST v{ver} установлен на <code>{ip}</code>"
+    else:
+        result = f"❌ Ошибка установки на {ip}:\n<pre>{escape(out[:2000])}</pre>"
+    await safe_edit_text(q, context, result, parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')]]))
+
+
+async def gost_configure_rules_start(update: Update, context: ContextTypes.DEFAULT_TYPE, ip: str):
+    """Start interactive rule configuration for a server."""
+    q = update.callback_query
+    await q.answer()
+    servers = load_gost_servers()
+    if ip not in servers:
+        await safe_edit_text(q, context, "Сервер не найден.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')]]))
+        return
+    context.user_data['await_gost_rule'] = {'ip': ip, 'step': 'proto', 'rules': []}
+    await safe_edit_text(q, context,
+        f"⚙️ <b>Настройка правил для {ip}</b>\n\n"
+        "Протоколы: tcp, udp, http, socks5, tls, ws, relay\n\n"
+        "Введите протокол (например <code>tcp</code>):",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("❌ Отмена", callback_data='gost_menu')]]))
+
+
+async def gost_add_rule_start(update: Update, context: ContextTypes.DEFAULT_TYPE, ip: str):
+    """Add single rule to existing config."""
+    q = update.callback_query
+    await q.answer()
+    servers = load_gost_servers()
+    if ip not in servers:
+        await safe_edit_text(q, context, "Сервер не найден.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')]]))
+        return
+    context.user_data['await_gost_addrule'] = {'ip': ip, 'step': 'proto'}
+    await safe_edit_text(q, context,
+        f"➕ <b>Добавить правило к {ip}</b>\n\n"
+        "Введите протокол (tcp/udp/http/socks5/...):",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("❌ Отмена", callback_data='gost_menu')]]))
+
+
+async def gost_rule_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle multi-step rule input (configure rules / add rule)."""
+    # Determine which flow
+    rule_data = context.user_data.get('await_gost_rule')
+    addrule_data = context.user_data.get('await_gost_addrule')
+    data = rule_data or addrule_data
+    if not data:
+        return
+    is_configure = rule_data is not None
+    key = 'await_gost_rule' if is_configure else 'await_gost_addrule'
+
+    text = update.message.text.strip()
+    step = data['step']
+    ip = data['ip']
+
+    if step == 'proto':
+        data['proto'] = text.lower()
+        data['step'] = 'local_port'
+        await update.message.reply_text("Введите локальный порт:")
+    elif step == 'local_port':
+        if not text.isdigit():
+            await update.message.reply_text("Порт должен быть числом. Повторите:")
+            return
+        data['local_port'] = int(text)
+        data['step'] = 'remote_ip'
+        await update.message.reply_text("Введите IP назначения (бэкенд):")
+    elif step == 'remote_ip':
+        parts = text.split(".")
+        valid = (len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts))
+        if not valid:
+            await update.message.reply_text("Неверный IP. Повторите:")
+            return
+        data['remote_ip'] = text
+        data['step'] = 'remote_port'
+        await update.message.reply_text("Введите порт назначения:")
+    elif step == 'remote_port':
+        if not text.isdigit():
+            await update.message.reply_text("Порт должен быть числом. Повторите:")
+            return
+        rule = {
+            "proto": data.pop('proto'),
+            "local_port": data.pop('local_port'),
+            "remote_ip": data.pop('remote_ip'),
+            "remote_port": int(text),
+        }
+        if is_configure:
+            data['rules'].append(rule)
+            data['step'] = 'more'
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Ещё правило", callback_data='gost_rule_more')],
+                [InlineKeyboardButton("✅ Готово — применить", callback_data='gost_rule_done')],
+            ])
+            rules_txt = "\n".join(
+                f"  {r['proto']}://:{r['local_port']} → {r['remote_ip']}:{r['remote_port']}"
+                for r in data['rules'])
+            await update.message.reply_text(
+                f"Правила для {ip}:\n{rules_txt}\n\nДобавить ещё или применить?",
+                reply_markup=kb)
+        else:
+            # Single add rule — apply immediately
+            context.user_data.pop(key, None)
+            servers = load_gost_servers()
+            srv = servers.get(ip)
+            if not srv:
+                await update.message.reply_text("Сервер не найден.")
+                return
+            srv.setdefault("rules", []).append(rule)
+            save_gost_servers(servers)
+            msg = await update.message.reply_text(f"⏳ Добавляю правило на {ip}...")
+            new_l = f" -L={rule['proto']}://:{rule['local_port']}/{rule['remote_ip']}:{rule['remote_port']}"
+            cmd = (
+                f"sed -i '/^ExecStart=/ s|$|{new_l}|' {GOST_SERVICE_PATH} && "
+                "systemctl daemon-reload && systemctl restart gost && echo RULE_ADDED_OK"
+            )
+            ok, out = ssh_exec(ip, 22, srv["ssh_user"], srv["ssh_pass"], cmd)
+            if ok and "RULE_ADDED_OK" in out:
+                await msg.edit_text(
+                    f"✅ Правило добавлено на {ip}:\n"
+                    f"<code>{rule['proto']}://:{rule['local_port']} → {rule['remote_ip']}:{rule['remote_port']}</code>",
+                    parse_mode="HTML")
+            else:
+                await msg.edit_text(f"❌ Ошибка:\n<pre>{escape(out[:2000])}</pre>", parse_mode="HTML")
+
+
+async def gost_rule_more(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User wants to add another rule in configure flow."""
+    q = update.callback_query
+    await q.answer()
+    data = context.user_data.get('await_gost_rule')
+    if not data:
+        return
+    data['step'] = 'proto'
+    await safe_edit_text(q, context, "Введите протокол для нового правила:")
+
+
+async def gost_rule_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Apply all configured rules to server."""
+    q = update.callback_query
+    await q.answer()
+    data = context.user_data.pop('await_gost_rule', None)
+    if not data or not data.get('rules'):
+        await safe_edit_text(q, context, "Нет правил для применения.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')]]))
+        return
+    ip = data['ip']
+    rules = data['rules']
+    servers = load_gost_servers()
+    srv = servers.get(ip)
+    if not srv:
+        await safe_edit_text(q, context, "Сервер не найден.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')]]))
+        return
+    srv["rules"] = rules
+    save_gost_servers(servers)
+    msg = await safe_edit_text(q, context, f"⏳ Применяю {len(rules)} правил на <code>{ip}</code>...", parse_mode="HTML")
+    gost_ls = " ".join(
+        f"-L={r['proto']}://:{r['local_port']}/{r['remote_ip']}:{r['remote_port']}"
+        for r in rules)
+    service_content = (
+        "[Unit]\\n"
+        "Description=GO Simple Tunnel\\n"
+        "After=network.target\\n"
+        "Wants=network.target\\n"
+        "\\n"
+        "[Service]\\n"
+        "Type=simple\\n"
+        f"ExecStart={GOST_BIN} {gost_ls}\\n"
+        "Restart=on-failure\\n"
+        "\\n"
+        "[Install]\\n"
+        "WantedBy=multi-user.target"
+    )
+    cmd = (
+        f"echo -e '{service_content}' > {GOST_SERVICE_PATH} && "
+        "systemctl daemon-reload && systemctl enable gost && systemctl restart gost && echo GOST_CONF_OK"
+    )
+    ok, out = ssh_exec(ip, 22, srv["ssh_user"], srv["ssh_pass"], cmd)
+    if ok and "GOST_CONF_OK" in out:
+        rules_txt = "\n".join(
+            f"  <code>{r['proto']}://:{r['local_port']} → {r['remote_ip']}:{r['remote_port']}</code>"
+            for r in rules)
+        await safe_edit_text(q, context,
+            f"✅ GOST настроен на <code>{ip}</code>:\n{rules_txt}",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')]]))
+    else:
+        await safe_edit_text(q, context, f"❌ Ошибка:\n<pre>{escape(out[:2000])}</pre>", parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')]]))
+
+
+async def gost_show_config(update: Update, context: ContextTypes.DEFAULT_TYPE, ip: str):
+    q = update.callback_query
+    await q.answer()
+    servers = load_gost_servers()
+    srv = servers.get(ip)
+    if not srv:
+        await safe_edit_text(q, context, "Сервер не найден.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')]]))
+        return
+    msg = await safe_edit_text(q, context, f"⏳ Читаю конфиг с <code>{ip}</code>...", parse_mode="HTML")
+    ok, out = ssh_exec(ip, 22, srv["ssh_user"], srv["ssh_pass"], f"cat {GOST_SERVICE_PATH} 2>/dev/null || echo NO_SERVICE")
+    if ok:
+        await safe_edit_text(q, context,
+            f"📄 <b>Конфиг GOST на {ip}:</b>\n<pre>{escape(out[:3500])}</pre>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')]]))
+    else:
+        await safe_edit_text(q, context, f"❌ Ошибка:\n{escape(out[:2000])}",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')]]))
+
+
+async def gost_ping_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    servers = load_gost_servers()
+    if not servers:
+        await safe_edit_text(q, context, "Нет серверов.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')]]))
+        return
+    msg = await safe_edit_text(q, context, "📡 Пингую серверы...")
+    results = []
+    for ip, info in servers.items():
+        label = info.get("label", ip)
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(3)
+            sock.connect((ip, 22))
+            sock.close()
+            results.append(f"🟢 <code>{ip}</code> — {label}")
+        except Exception:
+            results.append(f"🔴 <code>{ip}</code> — {label}")
+    await safe_edit_text(q, context,
+        "📡 <b>Пинг GOST серверов:</b>\n\n" + "\n".join(results),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')]]))
+
+
+async def _gost_simple_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, ip: str,
+                            cmd: str, success_msg: str, title: str):
+    """Execute a simple SSH command on GOST server and show result."""
+    q = update.callback_query
+    await q.answer()
+    servers = load_gost_servers()
+    srv = servers.get(ip)
+    if not srv:
+        await safe_edit_text(q, context, "Сервер не найден.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')]]))
+        return
+    msg = await safe_edit_text(q, context, f"⏳ {title} <code>{ip}</code>...", parse_mode="HTML")
+    ok, out = ssh_exec(ip, 22, srv["ssh_user"], srv["ssh_pass"], cmd)
+    if ok:
+        await safe_edit_text(q, context,
+            f"{success_msg}\n<pre>{escape(out[:3000])}</pre>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')]]))
+    else:
+        await safe_edit_text(q, context, f"❌ Ошибка:\n<pre>{escape(out[:2000])}</pre>", parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')]]))
+
+
+async def gost_start_cmd(update, context, ip):
+    await _gost_simple_cmd(update, context, ip,
+        "systemctl start gost && systemctl is-active gost",
+        f"▶️ GOST запущен на <code>{ip}</code>:", "Запускаю GOST на")
+
+async def gost_stop_cmd(update, context, ip):
+    await _gost_simple_cmd(update, context, ip,
+        "systemctl stop gost && echo STOPPED",
+        f"⏹ GOST остановлен на <code>{ip}</code>:", "Останавливаю GOST на")
+
+async def gost_restart_cmd(update, context, ip):
+    await _gost_simple_cmd(update, context, ip,
+        "systemctl restart gost && systemctl is-active gost",
+        f"🔁 GOST перезапущен на <code>{ip}</code>:", "Перезапускаю GOST на")
+
+async def gost_status_cmd(update, context, ip):
+    await _gost_simple_cmd(update, context, ip,
+        "systemctl status gost --no-pager 2>&1 | head -20",
+        f"📊 Статус GOST на <code>{ip}</code>:", "Проверяю статус на")
+
+async def gost_log_cmd(update, context, ip):
+    await _gost_simple_cmd(update, context, ip,
+        "journalctl -u gost --no-pager -n 30 2>&1",
+        f"📜 Лог GOST на <code>{ip}</code>:", "Читаю лог на")
+
+
+async def gost_backup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, ip: str):
+    q = update.callback_query
+    await q.answer()
+    servers = load_gost_servers()
+    srv = servers.get(ip)
+    if not srv:
+        await safe_edit_text(q, context, "Сервер не найден.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')]]))
+        return
+    msg = await safe_edit_text(q, context, f"⏳ Создаю бэкап на <code>{ip}</code>...", parse_mode="HTML")
+    cmd = (
+        f"mkdir -p {GOST_BACKUP_DIR} && "
+        f"tar -czf {GOST_BACKUP_DIR}/gost-backup-$(date +%Y%m%d-%H%M%S).tar.gz "
+        f"{GOST_BIN} {GOST_SERVICE_PATH} 2>/dev/null && "
+        f"ls -1t {GOST_BACKUP_DIR}/*.tar.gz | head -5 && echo BACKUP_OK"
+    )
+    ok, out = ssh_exec(ip, 22, srv["ssh_user"], srv["ssh_pass"], cmd)
+    if ok and "BACKUP_OK" in out:
+        await safe_edit_text(q, context,
+            f"💾 Бэкап создан на <code>{ip}</code>:\n<pre>{escape(out.replace('BACKUP_OK','').strip()[:2000])}</pre>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')]]))
+    else:
+        await safe_edit_text(q, context, f"❌ Ошибка:\n<pre>{escape(out[:2000])}</pre>", parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')]]))
+
+
+async def gost_restore_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, ip: str):
+    q = update.callback_query
+    await q.answer()
+    servers = load_gost_servers()
+    srv = servers.get(ip)
+    if not srv:
+        await safe_edit_text(q, context, "Сервер не найден.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')]]))
+        return
+    # First list available backups
+    msg = await safe_edit_text(q, context, f"⏳ Ищу бэкапы на <code>{ip}</code>...", parse_mode="HTML")
+    ok, out = ssh_exec(ip, 22, srv["ssh_user"], srv["ssh_pass"],
+        f"ls -1t {GOST_BACKUP_DIR}/*.tar.gz 2>/dev/null")
+    if not ok or not out.strip():
+        await safe_edit_text(q, context, f"Бэкапы не найдены на {ip}.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')]]))
+        return
+    files = [f.strip() for f in out.strip().split("\n") if f.strip()]
+    if not files:
+        await safe_edit_text(q, context, f"Бэкапы не найдены на {ip}.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')]]))
+        return
+    kb = []
+    for f in files[:10]:
+        fname = f.split("/")[-1]
+        kb.append([InlineKeyboardButton(fname, callback_data=f'gost_restore_apply:{ip}:{fname}')])
+    kb.append([InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')])
+    await safe_edit_text(q, context, f"📥 <b>Бэкапы на {ip}:</b>\nВыберите для восстановления:",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def gost_restore_apply(update: Update, context: ContextTypes.DEFAULT_TYPE, ip: str, fname: str):
+    q = update.callback_query
+    await q.answer()
+    servers = load_gost_servers()
+    srv = servers.get(ip)
+    if not srv:
+        await safe_edit_text(q, context, "Сервер не найден.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')]]))
+        return
+    msg = await safe_edit_text(q, context, f"⏳ Восстанавливаю {fname} на <code>{ip}</code>...", parse_mode="HTML")
+    cmd = (
+        f"tar -xzf {GOST_BACKUP_DIR}/{fname} -C / && "
+        "systemctl daemon-reload && systemctl restart gost && echo RESTORE_OK"
+    )
+    ok, out = ssh_exec(ip, 22, srv["ssh_user"], srv["ssh_pass"], cmd)
+    if ok and "RESTORE_OK" in out:
+        await safe_edit_text(q, context,
+            f"✅ Бэкап {fname} восстановлен на <code>{ip}</code>, GOST перезапущен.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')]]))
+    else:
+        await safe_edit_text(q, context, f"❌ Ошибка:\n<pre>{escape(out[:2000])}</pre>", parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')]]))
+
+
+async def gost_optimize_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, ip: str):
+    q = update.callback_query
+    await q.answer()
+    servers = load_gost_servers()
+    srv = servers.get(ip)
+    if not srv:
+        await safe_edit_text(q, context, "Сервер не найден.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')]]))
+        return
+    msg = await safe_edit_text(q, context, f"⏳ Оптимизирую TCP/UDP на <code>{ip}</code>...", parse_mode="HTML")
+    sysctl_content = (
+        "net.ipv4.ip_forward = 1\\n"
+        "net.core.default_qdisc = fq\\n"
+        "net.core.rmem_max = 2500000\\n"
+        "net.core.wmem_max = 2500000\\n"
+        "net.core.optmem_max = 25165824\\n"
+        "net.core.netdev_max_backlog = 5000\\n"
+        "net.netfilter.nf_conntrack_udp_timeout = 60\\n"
+        "net.netfilter.nf_conntrack_udp_timeout_stream = 180\\n"
+        "net.ipv4.tcp_congestion_control = bbr\\n"
+        "net.ipv4.tcp_fastopen = 3\\n"
+        "net.ipv4.tcp_low_latency = 1"
+    )
+    cmd = (
+        f"echo -e '{sysctl_content}' > /etc/sysctl.d/98-vpn-proxy.conf && "
+        "modprobe nf_conntrack 2>/dev/null ; sysctl --system > /dev/null 2>&1 && "
+        "sysctl net.ipv4.ip_forward net.core.default_qdisc net.ipv4.tcp_congestion_control "
+        "net.ipv4.tcp_fastopen 2>/dev/null && echo OPTIMIZE_OK"
+    )
+    ok, out = ssh_exec(ip, 22, srv["ssh_user"], srv["ssh_pass"], cmd)
+    if ok and "OPTIMIZE_OK" in out:
+        await safe_edit_text(q, context,
+            f"🚀 TCP/UDP оптимизация применена на <code>{ip}</code>:\n<pre>{escape(out.replace('OPTIMIZE_OK','').strip()[:2000])}</pre>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')]]))
+    else:
+        await safe_edit_text(q, context, f"❌ Ошибка:\n<pre>{escape(out[:2000])}</pre>", parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')]]))
+
+
+async def gost_uninstall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, ip: str):
+    q = update.callback_query
+    await q.answer()
+    servers = load_gost_servers()
+    srv = servers.get(ip)
+    if not srv:
+        await safe_edit_text(q, context, "Сервер не найден.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')]]))
+        return
+    msg = await safe_edit_text(q, context, f"⏳ Удаляю GOST с <code>{ip}</code>...", parse_mode="HTML")
+    cmd = (
+        "systemctl stop gost 2>/dev/null ; systemctl disable gost 2>/dev/null ; "
+        f"rm -f {GOST_BIN} {GOST_SERVICE_PATH} && systemctl daemon-reload && echo UNINSTALL_OK"
+    )
+    ok, out = ssh_exec(ip, 22, srv["ssh_user"], srv["ssh_pass"], cmd)
+    if ok and "UNINSTALL_OK" in out:
+        await safe_edit_text(q, context, f"✅ GOST удалён с <code>{ip}</code>", parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')]]))
+    else:
+        await safe_edit_text(q, context, f"❌ Ошибка:\n<pre>{escape(out[:2000])}</pre>", parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')]]))
+
 
 # =====================================================================
 #  MAIN
