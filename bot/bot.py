@@ -3702,6 +3702,13 @@ HELP_TEXT = f"""
   • 🚀 Ускорить TCP/UDP — sysctl оптимизация
     (BBR, буферы, conntrack, fastopen)
   • 🗑️ Удалить GOST — полное удаление с сервера
+  • 🔐 Получить Root — включить root SSH на серверах
+    с PEM-ключом (AWS, GCP, Azure и т.д.)
+    Отправляешь .pem файл → IP → юзер → пароль →
+    бот автоматически включает PermitRootLogin,
+    PasswordAuthentication, задаёт пароль root,
+    фиксит sshd_config.d, рестартует sshd.
+    После этого сервер работает по root+пароль.
 
 ═══════════════════════
    ОБЩИЕ КОМАНДЫ
