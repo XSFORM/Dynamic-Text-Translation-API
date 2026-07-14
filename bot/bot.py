@@ -2874,6 +2874,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _gost_select_server(update, context, 'gost_uninstall', "🗑️ <b>Удалить GOST</b>\nВыберите сервер:")
     elif data.startswith('gost_uninstall:'):
         await gost_uninstall_cmd(update, context, data[len('gost_uninstall:'):])
+    elif data == 'gost_help':
+        await gost_help_send(update, context)
     elif data == 'gost_getroot':
         await gost_getroot_start(update, context)
 
@@ -3682,33 +3684,10 @@ HELP_TEXT = f"""
 
 🌐 GOST Серверы
   Управление GOST-прокси на удалённых серверах
-  через SSH (paramiko). Полностью независимо
-  от основного VPN-сервера.
-
-  • Список серверов — просмотр, редактирование, удаление
-  • ➕ Добавить сервер — IP + SSH логин/пароль + метка
-  • ⚙️ Установить GOST — скачивает последнюю версию
-    с GitHub на удалённый сервер
-  • 📡 Настроить правила — создание systemd сервиса
-    с правилами перенаправления (TCP/UDP/HTTP/SOCKS5)
-  • ➕ Добавить правило — добавить к существующему конфигу
-  • 📄 Показать конфиг — прочитать gost.service
-  • 📡 Пинг серверов — проверка доступности всех серверов
-  • ▶️ Старт / ⏹ Стоп / 🔁 Рестарт — управление сервисом
-  • 📊 Статус — systemctl status gost
-  • 📜 Лог — последние 30 строк journalctl
-  • 💾 Бэкап — бэкап бинарника + конфига
-  • 📥 Восстановить — из ранее созданного бэкапа
-  • 🚀 Ускорить TCP/UDP — sysctl оптимизация
-    (BBR, буферы, conntrack, fastopen)
-  • 🗑️ Удалить GOST — полное удаление с сервера
-  • 🔐 Получить Root — включить root SSH на серверах
-    с PEM-ключом (AWS, GCP, Azure и т.д.)
-    Отправляешь .pem файл → IP → юзер → пароль →
-    бот автоматически включает PermitRootLogin,
-    PasswordAuthentication, задаёт пароль root,
-    фиксит sshd_config.d, рестартует sshd.
-    После этого сервер работает по root+пароль.
+  через SSH. Установка, настройка правил,
+  старт/стоп, бэкапы, оптимизация и др.
+  Подробная справка — кнопка «❓ Помощь GOST»
+  внутри раздела GOST.
 
 ═══════════════════════
    ОБЩИЕ КОМАНДЫ
@@ -4244,6 +4223,7 @@ async def gost_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🚀 Ускорить TCP/UDP", callback_data='gost_select_optimize')],
         [InlineKeyboardButton("🗑️ Удалить GOST", callback_data='gost_select_uninstall')],
         [InlineKeyboardButton("🔐 Получить Root", callback_data='gost_getroot')],
+        [InlineKeyboardButton("❓ Помощь GOST", callback_data='gost_help')],
         [InlineKeyboardButton("🏠 В главное меню", callback_data='home')],
     ]
     await safe_edit_text(q, context,
@@ -4875,6 +4855,129 @@ async def gost_uninstall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE,
     else:
         await safe_edit_text(q, context, f"❌ Ошибка:\n<pre>{escape(out[:2000])}</pre>", parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')]]))
+
+
+# =====================================================================
+#  GOST — HELP
+# =====================================================================
+
+GOST_HELP_TEXT = """
+🌐  GOST Серверы — Подробная справка
+════════════════════════════════════
+
+📋 Список серверов
+  Показывает все добавленные GOST-серверы
+  с IP, меткой и количеством правил.
+  Здесь же можно редактировать (✏️) логин/пароль/метку
+  или удалить (🗑️) сервер из списка.
+
+➕ Добавить сервер
+  Добавить новый GOST-сервер в бот.
+  Бот запросит: IP → SSH логин → SSH пароль → метку.
+  Данные сохраняются в gost_servers.json.
+  Все операции выполняются через SSH.
+
+⚙️ Установить GOST
+  Скачивает последнюю версию GOST с GitHub
+  и устанавливает на выбранный сервер.
+  Автоопределение архитектуры (amd64/arm64/armv7).
+  После установки бинарник: /usr/local/bin/gost
+
+📡 Настроить правила
+  Полная (пере)настройка GOST на сервере.
+  Создаёт systemd service с нуля.
+  Бот спрашивает для каждого правила:
+    • Протокол (tcp/udp/http/socks5/tls/ws/relay)
+    • Локальный порт (на фронт-сервере)
+    • IP назначения (бэкенд-сервер)
+    • Порт назначения
+  Можно добавить несколько правил за раз.
+  ⚠️ Перезаписывает текущий конфиг!
+
+  Примеры правил:
+    TCP forward:  tcp :80 → 1.2.3.4:80  (nginx/http)
+    UDP forward:  udp :443 → 1.2.3.4:443 (OpenVPN)
+    HTTP proxy:   http :8080 (прокси без назначения)
+
+➕ Добавить правило
+  Добавляет одно правило к существующему конфигу
+  без перезаписи. Правило дописывается в ExecStart.
+
+📄 Показать конфиг
+  Читает и показывает текущий файл
+  /usr/lib/systemd/system/gost.service
+  с удалённого сервера.
+
+📡 Пинг серверов
+  Проверяет доступность всех GOST-серверов
+  (TCP подключение на порт 22).
+  🟢 доступен / 🔴 недоступен
+
+▶️ Старт / ⏹ Стоп / 🔁 Рестарт
+  Управление systemd-сервисом gost:
+    systemctl start/stop/restart gost
+
+📊 Статус
+  Показывает systemctl status gost
+  (active/inactive, uptime, PID).
+
+📜 Лог
+  Последние 30 строк журнала GOST:
+  journalctl -u gost -n 30
+
+💾 Бэкап
+  Создаёт tar.gz архив с бинарником gost
+  и файлом gost.service на удалённом сервере.
+  Сохраняется в /var/backups/gost-xsform/
+
+📥 Восстановить
+  Показывает список бэкапов на сервере
+  и восстанавливает выбранный.
+  После восстановления — автоперезапуск.
+
+🚀 Ускорить TCP/UDP
+  Применяет sysctl-оптимизации на сервере:
+    • BBR congestion control
+    • TCP Fast Open
+    • Увеличенные буферы (rmem/wmem)
+    • UDP conntrack таймауты
+    • IP forwarding
+    • fq qdisc
+  Конфиг: /etc/sysctl.d/98-vpn-proxy.conf
+
+🗑️ Удалить GOST
+  Полное удаление GOST с сервера:
+  остановка сервиса → disable → удаление
+  бинарника и service-файла.
+
+🔐 Получить Root
+  Для серверов с PEM-ключом (AWS, GCP, Azure):
+    1. Отправляешь .pem файл в чат
+    2. Вводишь IP сервера
+    3. Вводишь SSH-пользователя (ubuntu/ec2-user)
+    4. Вводишь желаемый пароль root
+  Бот автоматически:
+    • Подключается по PEM-ключу
+    • Задаёт пароль root
+    • Включает PermitRootLogin yes
+    • Включает PasswordAuthentication yes
+    • Фиксит все sshd_config.d/*.conf
+    • Рестартует sshd
+    • Проверяет вход root+пароль
+  PEM-файл удаляется сразу после использования.
+  После этого сервер добавляется обычным способом.
+"""
+
+async def gost_help_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send GOST help as a text file."""
+    q = update.callback_query
+    await q.answer()
+    help_bytes = GOST_HELP_TEXT.strip().encode("utf-8")
+    await context.bot.send_document(
+        chat_id=q.message.chat_id,
+        document=help_bytes,
+        filename="gost_help.txt",
+        caption="📖 Справка — GOST Серверы")
 
 
 # =====================================================================
