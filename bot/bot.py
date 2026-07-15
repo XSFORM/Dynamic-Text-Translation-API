@@ -1897,6 +1897,205 @@ async def rr_set_ip_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop('await_rr_ip', None)
     await update.message.reply_text(f"✅ IP обновлён: <code>{text}</code>", parse_mode="HTML")
 
+# =====================================================================
+#  FORCE IP — принудительная смена IP на роутерах через SSH
+# =====================================================================
+
+async def force_ip_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    current = rr_read_file(RR_IP_FILE, "(не задан)")
+    context.user_data['await_force_ip'] = True
+    await safe_edit_text(q, context,
+        f"🔄 <b>Принудительная смена IP</b>\n\n"
+        f"Текущий IP в боте: <code>{current}</code>\n\n"
+        f"Отправьте новый IPv4 адрес.\n"
+        f"<i>(текущий IP показан для справки, можно ввести любой)</i>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Отмена", callback_data="rr_cancel")]]))
+
+async def force_ip_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get('await_force_ip'):
+        return
+    text = update.message.text.strip()
+    parts = text.split(".")
+    valid = (
+        len(parts) == 4
+        and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts)
+        and text not in ("0.0.0.0", "127.0.0.1")
+    )
+    if not valid:
+        await update.message.reply_text("Неверный IP. Повторите или отмена.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("❌ Отмена", callback_data="rr_cancel")]]))
+        return
+    context.user_data.pop('await_force_ip', None)
+    # Save new IP to current_vpn_ip.txt
+    old_ip = rr_read_file(RR_IP_FILE, "")
+    rr_write_file(RR_IP_FILE, text + "\n")
+    rr_append_history(f"FORCE: {old_ip} -> {text}")
+    context.user_data['force_ip_new'] = text
+    context.user_data['force_ip_old'] = old_ip
+    context.user_data['force_ip_selected'] = set()
+    # Show router selection
+    routers = load_routers()
+    if not routers:
+        await update.message.reply_text(
+            f"✅ IP обновлён: <code>{text}</code>\n"
+            f"Список роутеров пуст — добавьте через SSH Роутеры.",
+            parse_mode="HTML")
+        return
+    online = get_online_clients()
+    cnt_online = sum(1 for cn in routers if cn in online)
+    kb = [
+        [InlineKeyboardButton(f"🌐 Все роутеры ({len(routers)})", callback_data='force_ip_all')],
+        [InlineKeyboardButton("🖥 Один роутер", callback_data='force_ip_one')],
+        [InlineKeyboardButton("☑️ Несколько", callback_data='force_ip_multi')],
+        [InlineKeyboardButton("❌ Отмена (IP уже изменён)", callback_data='home')],
+    ]
+    await update.message.reply_text(
+        f"✅ IP обновлён: <code>{old_ip}</code> → <code>{text}</code>\n\n"
+        f"Онлайн роутеров: <b>{cnt_online}/{len(routers)}</b>\n\n"
+        f"Выберите на какие роутеры принудительно применить новый IP:",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+async def force_ip_select_one(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    routers = load_routers()
+    online = get_online_clients()
+    kb = []
+    for cn in sorted(routers.keys(), key=_natural_key):
+        icon = "🟢" if cn in online else "🔴"
+        kb.append([InlineKeyboardButton(f"{icon} {cn}", callback_data=f'force_ip_run:{cn}')])
+    kb.append([InlineKeyboardButton("◀️ Назад", callback_data='home')])
+    await safe_edit_text(q, context, "🖥 Выберите роутер:", reply_markup=InlineKeyboardMarkup(kb))
+
+async def force_ip_select_multi(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    routers = load_routers()
+    online = get_online_clients()
+    selected = context.user_data.get('force_ip_selected', set())
+    kb = []
+    for cn in sorted(routers.keys(), key=_natural_key):
+        icon = "🟢" if cn in online else "🔴"
+        check = "✅" if cn in selected else "⬜"
+        kb.append([InlineKeyboardButton(f"{check} {icon} {cn}", callback_data=f'force_ip_t:{cn}')])
+    kb.append([InlineKeyboardButton("▶️ Применить", callback_data='force_ip_go')])
+    kb.append([InlineKeyboardButton("◀️ Назад", callback_data='home')])
+    await safe_edit_text(q, context,
+        f"☑️ Выберите роутеры (выбрано: {len(selected)}):",
+        reply_markup=InlineKeyboardMarkup(kb))
+
+async def force_ip_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE, cn: str):
+    q = update.callback_query
+    await q.answer()
+    selected = context.user_data.get('force_ip_selected', set())
+    if cn in selected:
+        selected.discard(cn)
+    else:
+        selected.add(cn)
+    context.user_data['force_ip_selected'] = selected
+    await force_ip_select_multi(update, context)
+
+async def _force_ip_execute(msg, targets, new_ip: str):
+    """SSH to routers and run update_script.sh to force IP change. Returns report text."""
+    routers = load_routers()
+    total = len(targets)
+    results = []
+    for i, cn in enumerate(targets):
+        r = routers.get(cn)
+        if not r:
+            results.append((cn, False, "не найден"))
+            continue
+        ip = get_router_ip(cn)
+        if not ip:
+            results.append((cn, False, "оффлайн (нет VPN IP)"))
+            continue
+        try:
+            await msg.edit_text(
+                f"🔄 Применяю IP на роутеры...\n{i+1}/{total} — {cn}",
+                parse_mode="HTML")
+        except Exception:
+            pass
+        cmd = (
+            '/etc/storage/update_script.sh 2>&1 ; '
+            'echo "===FORCE_RESULT===" ; '
+            'grep "^remote " /etc/openvpn/client/client.conf 2>/dev/null || echo "no remote line"'
+        )
+        ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'), r.get('password', ''), cmd)
+        results.append((cn, ok, out))
+    # Build report
+    lines = [f"🔄 <b>Принудительная смена IP — отчёт</b>\nНовый IP: <code>{new_ip}</code>\n"]
+    ok_count = 0
+    for cn, ok, out in results:
+        if ok:
+            remote_line = ""
+            for ln in out.split('\n'):
+                ln_s = ln.strip()
+                if ln_s.startswith('remote '):
+                    remote_line = ln_s
+            applied = new_ip in out
+            if applied:
+                lines.append(f"✅ <b>{cn}</b>: {remote_line}")
+                ok_count += 1
+            else:
+                lines.append(f"⚠️ <b>{cn}</b>: {remote_line or out[-80:]}")
+        else:
+            lines.append(f"❌ <b>{cn}</b>: {escape(out[:80])}")
+    lines.append(f"\nИтого: {ok_count}/{total} применено")
+    return "\n".join(lines)
+
+async def force_ip_exec_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    new_ip = context.user_data.get('force_ip_new', '')
+    if not new_ip:
+        await safe_edit_text(q, context, "Ошибка: IP не задан. Начните заново.")
+        return
+    routers = load_routers()
+    targets = sorted(routers.keys(), key=_natural_key)
+    if not targets:
+        await safe_edit_text(q, context, "Список роутеров пуст.")
+        return
+    await safe_edit_text(q, context, f"🔄 Применяю IP на все роутеры...\n0/{len(targets)}")
+    report = await _force_ip_execute(q.message, targets, new_ip)
+    kb = [[InlineKeyboardButton("🏠 Меню", callback_data='home')]]
+    await q.message.edit_text(report, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+async def force_ip_exec_one(update: Update, context: ContextTypes.DEFAULT_TYPE, cn: str):
+    q = update.callback_query
+    await q.answer()
+    new_ip = context.user_data.get('force_ip_new', '')
+    if not new_ip:
+        await safe_edit_text(q, context, "Ошибка: IP не задан. Начните заново.")
+        return
+    await safe_edit_text(q, context, f"🔄 Применяю IP на <b>{cn}</b>...", parse_mode="HTML")
+    report = await _force_ip_execute(q.message, [cn], new_ip)
+    kb = [[InlineKeyboardButton("🏠 Меню", callback_data='home')]]
+    await q.message.edit_text(report, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+async def force_ip_exec_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    new_ip = context.user_data.get('force_ip_new', '')
+    selected = context.user_data.get('force_ip_selected', set())
+    if not new_ip:
+        await safe_edit_text(q, context, "Ошибка: IP не задан. Начните заново.")
+        return
+    if not selected:
+        await safe_edit_text(q, context, "Ни один роутер не выбран.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀️ Назад", callback_data='force_ip_multi')]]))
+        return
+    targets = sorted(selected, key=_natural_key)
+    await safe_edit_text(q, context, f"🔄 Применяю IP на {len(targets)} роутеров...\n0/{len(targets)}")
+    report = await _force_ip_execute(q.message, targets, new_ip)
+    kb = [[InlineKeyboardButton("🏠 Меню", callback_data='home')]]
+    await q.message.edit_text(report, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
 async def rr_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     hist = rr_read_history()
@@ -2024,7 +2223,7 @@ async def rr_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def rr_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer("Отменено")
-    for k in ['await_rr_ip', 'await_rr_domain_add']:
+    for k in ['await_rr_ip', 'await_rr_domain_add', 'await_force_ip']:
         context.user_data.pop(k, None)
     await safe_edit_text(q, context, "Отменено.")
 
@@ -2101,6 +2300,7 @@ def get_main_keyboard():
         [InlineKeyboardButton("─── Remote Refresh ───", callback_data='noop')],
         [InlineKeyboardButton("📡 IP роутеров", callback_data='rr_current_ip'),
          InlineKeyboardButton("✏️ Сменить IP", callback_data='rr_set_ip')],
+        [InlineKeyboardButton("🔄 Принудительная смена IP", callback_data='force_ip')],
         [InlineKeyboardButton("🔍 IP Scan", callback_data='rr_ip_scan'),
          InlineKeyboardButton("🔍 Port Scan", callback_data='rr_port_scan')],
         [InlineKeyboardButton("📋 История IP", callback_data='rr_history'),
@@ -2290,6 +2490,9 @@ async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_T
         await gost_rule_handler(update, context); return
     if context.user_data.get('await_gost_getroot') and context.user_data['await_gost_getroot'] != 'pem':
         await gost_getroot_handler(update, context); return
+    # Force IP text input
+    if context.user_data.get('await_force_ip'):
+        await force_ip_receive(update, context); return
     # Remote Refresh text inputs
     if context.user_data.get('await_rr_ip'):
         await rr_set_ip_receive(update, context); return
@@ -2876,6 +3079,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await rr_dom_remove_apply(update, context, domain)
     elif data == 'rr_cancel':
         await rr_cancel(update, context)
+
+    # --- Force IP callbacks ---
+    elif data == 'force_ip':
+        await force_ip_start(update, context)
+    elif data == 'force_ip_all':
+        await force_ip_exec_all(update, context)
+    elif data == 'force_ip_one':
+        await force_ip_select_one(update, context)
+    elif data == 'force_ip_multi':
+        await force_ip_select_multi(update, context)
+    elif data.startswith('force_ip_t:'):
+        cn = data[len('force_ip_t:'):]
+        await force_ip_toggle(update, context, cn)
+    elif data == 'force_ip_go':
+        await force_ip_exec_selected(update, context)
+    elif data.startswith('force_ip_run:'):
+        cn = data[len('force_ip_run:'):]
+        await force_ip_exec_one(update, context, cn)
 
     # --- Auto IP callbacks ---
     elif data == 'aip_menu':
@@ -3754,6 +3975,12 @@ HELP_TEXT = f"""
 ✏️ Сменить IP
   Вручную изменить IP для роутеров.
   Роутеры подхватят новый IP через крон.
+
+🔄 Принудительная смена IP
+  Изменить IP + сразу применить на роутерах
+  через SSH (не ждать крон 5 мин).
+  Показывает текущий IP для справки.
+  Можно выбрать: все / один / несколько.
 
 🔍 IP Scan / Port Scan
   Вкл/Выкл сканирование IP и портов.
