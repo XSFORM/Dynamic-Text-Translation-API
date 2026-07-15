@@ -1587,6 +1587,33 @@ async def check_new_connections(app: Application):
             await asyncio.sleep(10)
 
 # =====================================================================
+#  ALERT MENU
+# =====================================================================
+
+async def alert_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    status = "🔔 ON" if alert_enabled else "🔕 OFF"
+    kb = [
+        [InlineKeyboardButton("🔔 Включить", callback_data='alert_on'),
+         InlineKeyboardButton("🔕 Выключить", callback_data='alert_off')],
+        [InlineKeyboardButton("── Порог «мало онлайн» ──", callback_data='noop')],
+        [InlineKeyboardButton("15", callback_data='alert_threshold:15'),
+         InlineKeyboardButton("30", callback_data='alert_threshold:30'),
+         InlineKeyboardButton("45", callback_data='alert_threshold:45'),
+         InlineKeyboardButton("60", callback_data='alert_threshold:60')],
+        [InlineKeyboardButton("✏️ Ввести вручную", callback_data='alert_custom')],
+        [InlineKeyboardButton("🏠 В главное меню", callback_data='home')],
+    ]
+    await safe_edit_text(q, context,
+        f"🚨 <b>Тревога блокировки</b>\n\n"
+        f"Статус: <b>{status}</b>\n"
+        f"Порог: <b>{MIN_ONLINE_ALERT}</b> клиентов\n"
+        f"Интервал: каждые 10 сек\n\n"
+        f"Если онлайн &lt; порога → уведомление.",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+# =====================================================================
 #  OPENVPN — Backup / Restore UI
 # =====================================================================
 def list_backups() -> List[str]:
@@ -2031,7 +2058,7 @@ def get_main_keyboard():
          InlineKeyboardButton("📤 Отправить ключи", callback_data='bulk_send_start')],
         [InlineKeyboardButton("📦 Бэкап", callback_data='backup_hub'),
          InlineKeyboardButton("📜 Просмотр лога", callback_data='log')],
-        [InlineKeyboardButton("🚨 Тревога ON/OFF", callback_data='block_alert'),
+        [InlineKeyboardButton("🚨 Тревога", callback_data='block_alert'),
          InlineKeyboardButton("⚡ Перезагрузка", callback_data='restart_menu')],
         [InlineKeyboardButton("📥 Git Pull", callback_data='git_pull')],
         [InlineKeyboardButton("📝 OVPN EDIT", callback_data='ovpn_edit_menu'),
@@ -2197,6 +2224,19 @@ async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_T
             except Exception as exc:
                 await update.message.reply_text(f"\u274c Ошибка записи: {exc}")
         return
+    # Alert threshold text input
+    if context.user_data.get('await_alert_threshold'):
+        context.user_data.pop('await_alert_threshold', None)
+        txt = update.message.text.strip()
+        if txt.isdigit() and 1 <= int(txt) <= 999:
+            global MIN_ONLINE_ALERT
+            MIN_ONLINE_ALERT = int(txt)
+            await update.message.reply_text(
+                f"✅ Порог установлен: <b>{MIN_ONLINE_ALERT}</b> клиентов",
+                parse_mode="HTML")
+        else:
+            await update.message.reply_text("Введите число от 1 до 999.")
+        return
     # SSH deploy script text input
     if context.user_data.get('await_ssh_deploy_ip'):
         await ssh_deploy_receive_ip(update, context); return
@@ -2351,16 +2391,32 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_edit_text(q, context, "ipp.txt не найден.")
 
     elif data == 'block_alert':
-        global alert_enabled
-        alert_enabled = not alert_enabled
-        if alert_enabled:
-            await safe_edit_text(q, context,
-                f"🔔 Тревога блокировки: <b>ON</b>\n"
-                f"Порог MIN_ONLINE_ALERT = {MIN_ONLINE_ALERT}\n"
-                "Проверка каждые 10с.", parse_mode="HTML")
-        else:
-            await safe_edit_text(q, context,
-                "🔕 Тревога блокировки: <b>OFF</b>", parse_mode="HTML")
+        await alert_menu(update, context)
+    elif data == 'alert_on':
+        global alert_enabled, MIN_ONLINE_ALERT
+        alert_enabled = True
+        await safe_edit_text(q, context,
+            f"🔔 Тревога: <b>ON</b>\nПорог: <b>{MIN_ONLINE_ALERT}</b> клиентов",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='block_alert')]]))
+    elif data == 'alert_off':
+        alert_enabled = False
+        await safe_edit_text(q, context,
+            "🔕 Тревога: <b>OFF</b>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='block_alert')]]))
+    elif data.startswith('alert_threshold:'):
+        val = int(data[len('alert_threshold:'):])
+        MIN_ONLINE_ALERT = val
+        await safe_edit_text(q, context,
+            f"✅ Порог установлен: <b>{val}</b> клиентов",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='block_alert')]]))
+    elif data == 'alert_custom':
+        context.user_data['await_alert_threshold'] = True
+        await safe_edit_text(q, context,
+            "Введите число — минимум онлайн для тревоги:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data='block_alert')]]))
 
     elif data == 'help':
         await send_help_file(update, context)
