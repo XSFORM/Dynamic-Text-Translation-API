@@ -1420,11 +1420,44 @@ def get_status_log_tail(n=40):
 def _html_escape(s: str) -> str:
     return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
+def _count_clients_by_ip() -> str:
+    """Parse status.log routing table and count clients per real IP."""
+    try:
+        with open(STATUS_LOG, "r") as f:
+            lines = f.readlines()
+    except Exception:
+        return ""
+    ip_counts: Dict[str, int] = {}
+    in_routing = False
+    for line in lines:
+        line = line.strip()
+        if line.startswith("ROUTING TABLE"):
+            in_routing = True
+            continue
+        if line.startswith("GLOBAL STATS"):
+            break
+        if in_routing and "," in line and not line.startswith("Virtual"):
+            parts = line.split(",")
+            if len(parts) >= 3:
+                real_addr = parts[2]  # IP:PORT
+                real_ip = real_addr.rsplit(":", 1)[0] if ":" in real_addr else real_addr
+                ip_counts[real_ip] = ip_counts.get(real_ip, 0) + 1
+    if not ip_counts:
+        return ""
+    total = sum(ip_counts.values())
+    sorted_ips = sorted(ip_counts.items(), key=lambda x: -x[1])
+    lines_out = [f"\n📊 Клиентов по IP (всего {total}):"]
+    for ip, cnt in sorted_ips:
+        lines_out.append(f"  {ip} — {cnt}")
+    return "\n".join(lines_out)
+
 async def log_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     log_text = get_status_log_tail()
+    ip_summary = _count_clients_by_ip()
     safe = _html_escape(log_text)
-    msgs = split_message(f"<b>status.log (хвост):</b>\n<pre>{safe}</pre>")
+    safe_summary = _html_escape(ip_summary)
+    msgs = split_message(f"<b>status.log (хвост):</b>\n<pre>{safe}</pre>\n<b>{safe_summary}</b>")
     await safe_edit_text(q, context, msgs[0], parse_mode="HTML")
     for m in msgs[1:]:
         await context.bot.send_message(chat_id=q.message.chat_id, text=m, parse_mode="HTML")
