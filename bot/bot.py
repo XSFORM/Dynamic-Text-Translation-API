@@ -4187,18 +4187,22 @@ async def oec_apply_exec(update: Update, context: ContextTypes.DEFAULT_TYPE, tar
     cn = context.user_data.get('oec_cn', '')
     if target == '__all__':
         routers = load_routers()
-        online = get_online_clients()
-        targets = [c for c in sorted(routers.keys(), key=_natural_key) if c in online]
-        await safe_edit_text(q, context, f"💾 Применяю на {len(targets)} роутеров...")
+        all_targets = sorted(routers.keys(), key=_natural_key)
+        total = len(all_targets)
+        await safe_edit_text(q, context, f"💾 Применяю на {total} роутеров...")
         results = []
-        for c in targets:
+        ok_count = 0
+        for c in all_targets:
             ok, msg = await _oec_apply_config(c, lines)
             results.append(msg)
+            if ok:
+                ok_count += 1
         report = "\n".join(results)
         context.user_data['oec_changes'] = 0
         kb = [[InlineKeyboardButton("◀️ Назад", callback_data='oec_menu')]]
         await q.message.edit_text(
-            f"💾 <b>Применение remote — отчёт</b>\n\n{report}",
+            f"💾 <b>Применение remote — отчёт</b>\n\n{report}\n\n"
+            f"<b>Итого: {ok_count} из {total}</b>",
             parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
     else:
         await safe_edit_text(q, context, f"💾 Применяю на <b>{cn}</b>...", parse_mode="HTML")
@@ -4324,17 +4328,21 @@ async def oec_full_edit_exec(update: Update, context: ContextTypes.DEFAULT_TYPE,
         return
     if target == '__all__':
         routers = load_routers()
-        online = get_online_clients()
-        targets = [cn for cn in sorted(routers.keys(), key=_natural_key) if cn in online]
-        await safe_edit_text(q, context, f"📝 Записываю на {len(targets)} роутеров...")
+        all_targets = sorted(routers.keys(), key=_natural_key)
+        total = len(all_targets)
+        await safe_edit_text(q, context, f"📝 Записываю на {total} роутеров...")
         results = []
-        for cn in targets:
+        ok_count = 0
+        for cn in all_targets:
             ok, msg = await _oec_write_full_config(cn, new_content)
             results.append(msg)
+            if ok:
+                ok_count += 1
         report = "\n".join(results)
         kb = [[InlineKeyboardButton("◀️ Назад", callback_data='oec_menu')]]
         await q.message.edit_text(
-            f"📝 <b>Запись конфига — отчёт</b>\n\n{report}",
+            f"📝 <b>Запись конфига — отчёт</b>\n\n{report}\n\n"
+            f"<b>Итого: {ok_count} из {total}</b>",
             parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
     else:
         cn = context.user_data.get('oec_edit_cn', '')
