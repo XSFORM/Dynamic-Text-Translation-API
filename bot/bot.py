@@ -3084,19 +3084,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cn = data[len('oec_rem:'):]
         await oec_remote_show(update, context, cn)
     elif data.startswith('oec_rdel:'):
-        parts = data[len('oec_rdel:'):].rsplit(':', 1)
-        cn, idx = parts[0], int(parts[1])
-        await oec_remote_del_confirm(update, context, cn, idx)
-    elif data.startswith('oec_rdel_do:'):
-        target = data[len('oec_rdel_do:'):]
-        await oec_remote_del_exec(update, context, target)
-    elif data.startswith('oec_radd:'):
-        cn = data[len('oec_radd:'):]
-        await oec_remote_add_start(update, context, cn)
-    elif data == 'oec_radd_do_one':
-        await oec_remote_add_exec(update, context, 'one')
-    elif data == 'oec_radd_do_all':
-        await oec_remote_add_exec(update, context, '__all__')
+        idx = int(data[len('oec_rdel:'):])
+        await oec_remote_del(update, context, idx)
+    elif data == 'oec_radd':
+        await oec_remote_add_start(update, context)
+    elif data == 'oec_apply':
+        await oec_apply(update, context)
+    elif data == 'oec_apply_one':
+        await oec_apply_exec(update, context, 'one')
+    elif data == 'oec_apply_all':
+        await oec_apply_exec(update, context, '__all__')
+    elif data == 'oec_refresh':
+        await oec_refresh(update, context)
     elif data == 'oec_full':
         await ssh_select_router(update, context, 'oec_full')
     elif data.startswith('oec_full:'):
@@ -3327,7 +3326,7 @@ async def _do_ssh_deploy_multi(q_or_msg, context, targets: list, front_ip: str):
             continue
         ip = get_router_ip(cn)
         if not ip:
-            results.append(f"🔴 <b>{cn}</b> — оффлайн")
+            results.append(f"❌ <b>{cn}</b> — оффлайн")
             continue
         try:
             await msg.edit_text(
@@ -3546,7 +3545,7 @@ async def ssh_ping_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if ok:
             results.append(f"🟢 <b>{cn}</b> ({ip}) — {out[:80]}")
         else:
-            results.append(f"🟠 <b>{cn}</b> ({ip}) — {out[:60]}")
+            results.append(f"❌ <b>{cn}</b> ({ip}) — {out[:60]}")
     text = "📡 <b>Пинг всех роутеров:</b>\n\n" + "\n".join(results)
     kb = [[InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')]]
     await q.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
@@ -3952,7 +3951,44 @@ async def oec_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Путь определяется автоматически.",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
-# --- Remote management ---
+# --- Remote management (batch editing) ---
+
+def _oec_render_view(context):
+    """Render the remote editor view from in-memory state. Returns (text, kb)."""
+    cn = context.user_data.get('oec_cn', '?')
+    path = context.user_data.get('oec_path', '')
+    lines = context.user_data.get('oec_lines', [])
+    changes = context.user_data.get('oec_changes', 0)
+
+    # Extract remote lines from in-memory state
+    remotes = []
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if s.startswith('remote ') and not s.startswith('#'):
+            remotes.append((i, s))
+
+    text = f"🌐 <b>{cn}</b> — Remote адреса\n📁 <code>{path}</code>\n"
+    if changes > 0:
+        text += f"⚠️ <b>Несохранённых изменений: {changes}</b>\n"
+    text += "\n"
+    if not remotes:
+        text += "<i>Нет remote строк</i>\n"
+    else:
+        for j, (i, line) in enumerate(remotes):
+            text += f"{j+1}. <code>{escape(line)}</code>\n"
+
+    kb = []
+    for j, (i, line) in enumerate(remotes):
+        short = line[:40] if len(line) > 40 else line
+        kb.append([InlineKeyboardButton(f"❌ {short}", callback_data=f'oec_rdel:{j}')])
+    kb.append([InlineKeyboardButton("➕ Добавить remote", callback_data='oec_radd')])
+    if changes > 0:
+        kb.append([
+            InlineKeyboardButton(f"💾 Применить ({changes} изм.)", callback_data='oec_apply'),
+            InlineKeyboardButton("↩️ Сбросить", callback_data='oec_refresh'),
+        ])
+    kb.append([InlineKeyboardButton("◀️ Назад", callback_data='oec_menu')])
+    return text, kb
 
 async def oec_remote_show(update: Update, context: ContextTypes.DEFAULT_TYPE, cn: str):
     q = update.callback_query
@@ -3983,231 +4019,196 @@ async def oec_remote_show(update: Update, context: ContextTypes.DEFAULT_TYPE, cn
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='oec_menu')]]))
         return
-    # Parse remote lines
+    # Store in-memory state
     config_lines = content.strip().split('\n') if content.strip() else []
-    remotes = []
-    for i, line in enumerate(config_lines):
-        s = line.strip()
-        if s.startswith('remote ') and not s.startswith('#'):
-            remotes.append((i, s))
-    # Save state
     context.user_data['oec_cn'] = cn
     context.user_data['oec_path'] = path
     context.user_data['oec_content'] = content
-    context.user_data['oec_remotes'] = remotes
+    context.user_data['oec_lines'] = config_lines
+    context.user_data['oec_changes'] = 0
 
-    text = f"🌐 <b>{cn}</b> — Remote адреса\n📁 <code>{path}</code>\n\n"
-    if not remotes:
-        text += "<i>Нет remote строк</i>\n"
-    else:
-        for j, (i, line) in enumerate(remotes):
-            text += f"{j+1}. <code>{escape(line)}</code>\n"
-
-    kb = []
-    for j, (i, line) in enumerate(remotes):
-        short = line[:40] if len(line) > 40 else line
-        kb.append([InlineKeyboardButton(f"❌ {short}", callback_data=f'oec_rdel:{cn}:{j}')])
-    kb.append([InlineKeyboardButton("➕ Добавить remote", callback_data=f'oec_radd:{cn}')])
-    kb.append([InlineKeyboardButton("◀️ Назад", callback_data='oec_menu')])
+    text, kb = _oec_render_view(context)
     await q.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
-async def oec_remote_del_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE, cn: str, idx: int):
+async def oec_remote_del(update: Update, context: ContextTypes.DEFAULT_TYPE, idx: int):
+    """Delete remote line by index (in-memory only)."""
     q = update.callback_query
     await q.answer()
-    remotes = context.user_data.get('oec_remotes', [])
-    if idx >= len(remotes):
+    lines = context.user_data.get('oec_lines', [])
+    # Find idx-th remote line
+    remote_count = 0
+    target_line = -1
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if s.startswith('remote ') and not s.startswith('#'):
+            if remote_count == idx:
+                target_line = i
+                break
+            remote_count += 1
+    if target_line < 0:
         await safe_edit_text(q, context, "Ошибка: remote не найден.")
         return
-    _, remote_text = remotes[idx]
-    context.user_data['oec_del_text'] = remote_text
-    kb = [
-        [InlineKeyboardButton(f"🗑 Только {cn}", callback_data=f'oec_rdel_do:{cn}')],
-        [InlineKeyboardButton("🗑 Со ВСЕХ роутеров", callback_data='oec_rdel_do:__all__')],
-        [InlineKeyboardButton("❌ Отмена", callback_data=f'oec_rem:{cn}')],
-    ]
-    await safe_edit_text(q, context,
-        f"Удалить строку?\n<code>{escape(remote_text)}</code>",
-        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+    removed = lines.pop(target_line)
+    context.user_data['oec_lines'] = lines
+    context.user_data['oec_changes'] = context.user_data.get('oec_changes', 0) + 1
 
-async def _oec_write_config(ip, port, user, password, path, new_content):
-    """Write new config content to router via SSH heredoc."""
-    # Use heredoc with unique delimiter to avoid escaping issues
-    cmd = (
-        f"cat > {path} << 'OVPNCFGEOF'\n"
-        f"{new_content}\n"
-        f"OVPNCFGEOF\n"
-        f"mtd_storage.sh save 2>/dev/null && echo WRITE_OK || echo WRITE_FAIL"
-    )
-    return ssh_exec(ip, port, user, password, cmd)
+    text, kb = _oec_render_view(context)
+    text += f"\n🗑 Удалено: <code>{escape(removed.strip())}</code>"
+    await q.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
-async def _oec_remove_remote_line(cn, remote_text, context):
-    """Remove a remote line from router config. Returns (ok, message)."""
-    routers = load_routers()
-    r = routers.get(cn)
-    if not r:
-        return False, f"{cn}: не найден"
-    ip = get_router_ip(cn)
-    if not ip:
-        return False, f"{cn}: оффлайн"
-    # Read current config
-    ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'),
-                       r.get('password', ''), OVPN_EXT_DETECT_CMD)
-    if not ok:
-        return False, f"{cn}: SSH ошибка"
-    path, content = _parse_ovpn_ext_output(out)
-    if not path:
-        return False, f"{cn}: конфиг не найден"
-    # Remove matching line
-    lines = content.split('\n')
-    new_lines = [l for l in lines if l.strip() != remote_text]
-    if len(new_lines) == len(lines):
-        return False, f"{cn}: строка не найдена"
-    new_content = '\n'.join(new_lines)
-    ok2, out2 = await asyncio.to_thread(
-        lambda: ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'),
-                         r.get('password', ''),
-                         f"cat > {path} << 'OVPNCFGEOF'\n{new_content}\nOVPNCFGEOF\n"
-                         f"mtd_storage.sh save 2>/dev/null && echo WRITE_OK"))
-    if ok2 and 'WRITE_OK' in out2:
-        return True, f"{cn}: ✅ удалено"
-    return False, f"{cn}: ошибка записи"
-
-async def oec_remote_del_exec(update: Update, context: ContextTypes.DEFAULT_TYPE, target: str):
+async def oec_remote_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    remote_text = context.user_data.get('oec_del_text', '')
-    if not remote_text:
-        await safe_edit_text(q, context, "Ошибка: текст remote не найден.")
-        return
-    if target == '__all__':
-        routers = load_routers()
-        online = get_online_clients()
-        targets = [cn for cn in sorted(routers.keys(), key=_natural_key) if cn in online]
-        await safe_edit_text(q, context, f"🗑 Удаляю <code>{escape(remote_text)}</code> с {len(targets)} роутеров...",
-            parse_mode="HTML")
-        results = []
-        for cn in targets:
-            ok, msg = await _oec_remove_remote_line(cn, remote_text, context)
-            results.append(msg)
-        report = "\n".join(results)
-        kb = [[InlineKeyboardButton("◀️ Назад", callback_data='oec_menu')]]
-        await q.message.edit_text(
-            f"🗑 <b>Удаление remote — отчёт</b>\n<code>{escape(remote_text)}</code>\n\n{report}",
-            parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
-    else:
-        cn = target
-        await safe_edit_text(q, context, f"🗑 Удаляю с <b>{cn}</b>...", parse_mode="HTML")
-        ok, msg = await _oec_remove_remote_line(cn, remote_text, context)
-        if ok:
-            # Refresh view
-            await oec_remote_show(update, context, cn)
-        else:
-            kb = [[InlineKeyboardButton("◀️ Назад", callback_data=f'oec_rem:{cn}')]]
-            await q.message.edit_text(f"❌ {msg}", reply_markup=InlineKeyboardMarkup(kb))
-
-async def oec_remote_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE, cn: str):
-    q = update.callback_query
-    await q.answer()
-    context.user_data['oec_add_cn'] = cn
     context.user_data['await_oec_radd'] = True
+    cn = context.user_data.get('oec_cn', '')
     await safe_edit_text(q, context,
-        f"➕ <b>Добавить remote на {cn}</b>\n\n"
+        f"➕ <b>Добавить remote</b>\n\n"
         "Введите адрес и порт:\n"
-        "<code>domain.com 443</code> или <code>1.2.3.4 443</code>",
+        "<code>domain.com 443</code> или <code>1.2.3.4 443</code>\n\n"
+        "Можно несколько строк сразу (каждый с новой строки).",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(
             [[InlineKeyboardButton("❌ Отмена", callback_data=f'oec_rem:{cn}')]]))
 
-async def _oec_add_remote_line(cn, remote_line, context):
-    """Add a remote line to router config at the top. Returns (ok, msg)."""
-    routers = load_routers()
-    r = routers.get(cn)
-    if not r:
-        return False, f"{cn}: не найден"
-    ip = get_router_ip(cn)
-    if not ip:
-        return False, f"{cn}: оффлайн"
-    ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'),
-                       r.get('password', ''), OVPN_EXT_DETECT_CMD)
-    if not ok:
-        return False, f"{cn}: SSH ошибка"
-    path, content = _parse_ovpn_ext_output(out)
-    if not path:
-        return False, f"{cn}: конфиг не найден"
-    # Find position: insert after last existing remote line, or at top
-    lines = content.split('\n')
-    insert_pos = 0
-    for i, l in enumerate(lines):
-        if l.strip().startswith('remote '):
-            insert_pos = i + 1
-    lines.insert(insert_pos, remote_line)
-    new_content = '\n'.join(lines)
-    ok2, out2 = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'),
-                         r.get('password', ''),
-                         f"cat > {path} << 'OVPNCFGEOF'\n{new_content}\nOVPNCFGEOF\n"
-                         f"mtd_storage.sh save 2>/dev/null && echo WRITE_OK")
-    if ok2 and 'WRITE_OK' in out2:
-        return True, f"{cn}: ✅ добавлено"
-    return False, f"{cn}: ошибка записи"
-
 async def oec_remote_add_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Add remote lines in-memory."""
     if not context.user_data.get('await_oec_radd'):
         return
     text = update.message.text.strip()
-    parts = text.split()
-    if len(parts) != 2 or not parts[1].isdigit():
-        await update.message.reply_text(
-            "Неверный формат. Нужно: <code>domain.com 443</code>",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("❌ Отмена", callback_data='oec_menu')]]))
-        return
-    remote_line = f"remote {parts[0]} {parts[1]}"
     context.user_data.pop('await_oec_radd', None)
-    context.user_data['oec_add_line'] = remote_line
-    cn = context.user_data.get('oec_add_cn', '')
-    kb = [
-        [InlineKeyboardButton(f"➕ Только {cn}", callback_data='oec_radd_do_one')],
-        [InlineKeyboardButton("➕ На ВСЕ роутеры", callback_data='oec_radd_do_all')],
-        [InlineKeyboardButton("❌ Отмена", callback_data='oec_menu')],
-    ]
-    await update.message.reply_text(
-        f"Добавить строку:\n<code>{escape(remote_line)}</code>\n\nКуда?",
+    lines = context.user_data.get('oec_lines', [])
+    added = []
+    errors = []
+    for raw in text.split('\n'):
+        raw = raw.strip()
+        if not raw:
+            continue
+        parts = raw.split()
+        if len(parts) == 2 and parts[1].isdigit():
+            remote_line = f"remote {parts[0]} {parts[1]}"
+        elif len(parts) == 3 and parts[0].lower() == 'remote' and parts[2].isdigit():
+            remote_line = f"remote {parts[1]} {parts[2]}"
+        else:
+            errors.append(raw)
+            continue
+        # Insert after last remote line
+        insert_pos = 0
+        for i, l in enumerate(lines):
+            if l.strip().startswith('remote '):
+                insert_pos = i + 1
+        lines.insert(insert_pos, remote_line)
+        added.append(remote_line)
+    context.user_data['oec_lines'] = lines
+    context.user_data['oec_changes'] = context.user_data.get('oec_changes', 0) + len(added)
+
+    view_text, kb = _oec_render_view(context)
+    extra = ""
+    if added:
+        extra += "\n➕ Добавлено: " + ", ".join(f"<code>{escape(a)}</code>" for a in added)
+    if errors:
+        extra += "\n⚠️ Неверный формат: " + ", ".join(f"<code>{escape(e)}</code>" for e in errors)
+    await update.message.reply_text(view_text + extra,
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
-async def oec_remote_add_exec(update: Update, context: ContextTypes.DEFAULT_TYPE, target: str):
+async def oec_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reload config from router, discarding in-memory changes."""
+    cn = context.user_data.get('oec_cn', '')
+    if cn:
+        await oec_remote_show(update, context, cn)
+
+async def _oec_apply_config(cn, lines):
+    """Write in-memory lines to a router. Returns (ok, msg)."""
+    routers = load_routers()
+    r = routers.get(cn)
+    if not r:
+        return False, f"❌ {cn}: не найден"
+    ip = get_router_ip(cn)
+    if not ip:
+        return False, f"❌ {cn}: оффлайн"
+    # Detect path on this router
+    ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'),
+                       r.get('password', ''), OVPN_EXT_DETECT_CMD)
+    if not ok:
+        return False, f"❌ {cn}: SSH ошибка"
+    path, old_content = _parse_ovpn_ext_output(out)
+    if not path:
+        return False, f"❌ {cn}: конфиг не найден"
+    # Build new content: take non-remote lines from existing config,
+    # replace remote block with our in-memory remote lines
+    old_lines = old_content.split('\n') if old_content else []
+    # Collect remote lines from in-memory state
+    new_remotes = [l for l in lines if l.strip().startswith('remote ') and not l.strip().startswith('#')]
+    # Rebuild: keep all non-remote lines, insert new remotes where first remote was
+    result_lines = []
+    remotes_inserted = False
+    for ol in old_lines:
+        if ol.strip().startswith('remote ') and not ol.strip().startswith('#'):
+            if not remotes_inserted:
+                result_lines.extend(new_remotes)
+                remotes_inserted = True
+            # Skip old remote line
+        else:
+            result_lines.append(ol)
+    if not remotes_inserted:
+        # No remote lines existed before, add at top
+        result_lines = new_remotes + result_lines
+    new_content = '\n'.join(result_lines)
+    # Write
+    cmd = (
+        f"cat > {path} << 'OVPNCFGEOF'\n{new_content}\nOVPNCFGEOF\n"
+        f"mtd_storage.sh save 2>/dev/null && echo WRITE_OK || echo WRITE_FAIL"
+    )
+    ok2, out2 = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'),
+                         r.get('password', ''), cmd)
+    if ok2 and 'WRITE_OK' in out2:
+        return True, f"✅ {cn}: записано"
+    return False, f"❌ {cn}: ошибка записи"
+
+async def oec_apply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ask where to apply: this router or all."""
     q = update.callback_query
     await q.answer()
-    remote_line = context.user_data.get('oec_add_line', '')
-    if not remote_line:
-        await safe_edit_text(q, context, "Ошибка: строка не задана.")
-        return
+    cn = context.user_data.get('oec_cn', '')
+    changes = context.user_data.get('oec_changes', 0)
+    kb = [
+        [InlineKeyboardButton(f"💾 Только {cn}", callback_data='oec_apply_one')],
+        [InlineKeyboardButton("💾 На ВСЕ роутеры", callback_data='oec_apply_all')],
+        [InlineKeyboardButton("❌ Отмена", callback_data=f'oec_rem:{cn}')],
+    ]
+    await safe_edit_text(q, context,
+        f"💾 <b>Применить {changes} изменений</b>\n\n"
+        f"Записать remote-строки на роутеры?",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+async def oec_apply_exec(update: Update, context: ContextTypes.DEFAULT_TYPE, target: str):
+    q = update.callback_query
+    await q.answer()
+    lines = context.user_data.get('oec_lines', [])
+    cn = context.user_data.get('oec_cn', '')
     if target == '__all__':
         routers = load_routers()
         online = get_online_clients()
-        targets = [cn for cn in sorted(routers.keys(), key=_natural_key) if cn in online]
-        await safe_edit_text(q, context, f"➕ Добавляю на {len(targets)} роутеров...")
+        targets = [c for c in sorted(routers.keys(), key=_natural_key) if c in online]
+        await safe_edit_text(q, context, f"💾 Применяю на {len(targets)} роутеров...")
         results = []
-        for cn in targets:
-            ok, msg = await _oec_add_remote_line(cn, remote_line, context)
+        for c in targets:
+            ok, msg = await _oec_apply_config(c, lines)
             results.append(msg)
         report = "\n".join(results)
+        context.user_data['oec_changes'] = 0
         kb = [[InlineKeyboardButton("◀️ Назад", callback_data='oec_menu')]]
         await q.message.edit_text(
-            f"➕ <b>Добавление remote — отчёт</b>\n<code>{escape(remote_line)}</code>\n\n{report}",
+            f"💾 <b>Применение remote — отчёт</b>\n\n{report}",
             parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
     else:
-        cn = context.user_data.get('oec_add_cn', '')
-        if not cn:
-            await safe_edit_text(q, context, "Ошибка: роутер не выбран.")
-            return
-        await safe_edit_text(q, context, f"➕ Добавляю на <b>{cn}</b>...", parse_mode="HTML")
-        ok, msg = await _oec_add_remote_line(cn, remote_line, context)
+        await safe_edit_text(q, context, f"💾 Применяю на <b>{cn}</b>...", parse_mode="HTML")
+        ok, msg = await _oec_apply_config(cn, lines)
+        context.user_data['oec_changes'] = 0
         if ok:
             await oec_remote_show(update, context, cn)
         else:
-            kb = [[InlineKeyboardButton("◀️ Назад", callback_data='oec_menu')]]
-            await q.message.edit_text(f"❌ {msg}", reply_markup=InlineKeyboardMarkup(kb))
+            kb = [[InlineKeyboardButton("◀️ Назад", callback_data=f'oec_rem:{cn}')]]
+            await q.message.edit_text(f"{msg}", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
 # --- Full editor ---
 
@@ -4291,18 +4292,18 @@ async def _oec_write_full_config(cn, new_content):
     routers = load_routers()
     r = routers.get(cn)
     if not r:
-        return False, f"{cn}: не найден"
+        return False, f"❌ {cn}: не найден"
     ip = get_router_ip(cn)
     if not ip:
-        return False, f"{cn}: оффлайн"
+        return False, f"❌ {cn}: оффлайн"
     # First detect path
     ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'),
                        r.get('password', ''), OVPN_EXT_DETECT_CMD)
     if not ok:
-        return False, f"{cn}: SSH ошибка"
+        return False, f"❌ {cn}: SSH ошибка"
     path, _ = _parse_ovpn_ext_output(out)
     if not path:
-        return False, f"{cn}: конфиг не найден"
+        return False, f"❌ {cn}: конфиг не найден"
     # Write
     cmd = (
         f"cat > {path} << 'OVPNCFGEOF'\n{new_content}\nOVPNCFGEOF\n"
@@ -4311,8 +4312,8 @@ async def _oec_write_full_config(cn, new_content):
     ok2, out2 = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'),
                          r.get('password', ''), cmd)
     if ok2 and 'WRITE_OK' in out2:
-        return True, f"{cn}: ✅ записано"
-    return False, f"{cn}: ошибка записи"
+        return True, f"✅ {cn}: записано"
+    return False, f"❌ {cn}: ошибка записи"
 
 async def oec_full_edit_exec(update: Update, context: ContextTypes.DEFAULT_TYPE, target: str):
     q = update.callback_query
@@ -4454,8 +4455,10 @@ HELP_TEXT = f"""
     (один / несколько / все активные)
     nvram set → commit → save → reboot
   • 📝 Конфиг OpenVPN — расширенная конфигурация:
-    🌐 Remote адреса — просмотр, добавление,
-      удаление remote строк (один / все)
+    🌐 Remote адреса — пакетное редактирование:
+      удаление/добавление нескольких remote строк,
+      затем применение всех изменений разом
+      (на один роутер или все сразу)
     📝 Полный редактор — просмотр и замена
       всего расширенного конфига (один / все)
     Путь к файлу определяется автоматически.
