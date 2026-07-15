@@ -2321,10 +2321,26 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         files = get_ovpn_files()
         files = sorted(files, key=lambda x: _natural_key(x[:-5]))
         lines = ["<b>Статус всех ключей:</b>"]
+        cnt_online = 0
+        cnt_offline = 0
+        cnt_disabled = 0
         for f in files:
             name = f[:-5]
-            st = "⛔" if is_client_ccd_disabled(name) else ("🟢" if name in online_names else "🔴")
+            if is_client_ccd_disabled(name):
+                st = "⛔"
+                cnt_disabled += 1
+            elif name in online_names:
+                st = "🟢"
+                cnt_online += 1
+            else:
+                st = "🔴"
+                cnt_offline += 1
             lines.append(f"{st} {name}")
+        lines.append("")
+        lines.append(f"🟢 Онлайн: <b>{cnt_online}</b>")
+        lines.append(f"🔴 Оффлайн: <b>{cnt_offline}</b>")
+        lines.append(f"⛔ Отключены: <b>{cnt_disabled}</b>")
+        lines.append(f"📊 Всего: <b>{cnt_online + cnt_offline + cnt_disabled}</b>")
         text = "\n".join(lines)
         msgs = split_message(text)
         await safe_edit_text(q, context, msgs[0], parse_mode="HTML")
