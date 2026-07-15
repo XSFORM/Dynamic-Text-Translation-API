@@ -2001,7 +2001,7 @@ async def force_ip_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE, cn
     await force_ip_select_multi(update, context)
 
 async def _force_ip_execute(msg, targets, new_ip: str):
-    """SSH to routers and run update_script.sh to force IP change. Returns report text."""
+    """SSH to routers, directly sed the remote line in client.conf, restart OpenVPN."""
     routers = load_routers()
     total = len(targets)
     results = []
@@ -2020,10 +2020,20 @@ async def _force_ip_execute(msg, targets, new_ip: str):
                 parse_mode="HTML")
         except Exception:
             pass
+        # sed changes IP in config, killall drops tunnel,
+        # then update_script.sh restarts OpenVPN its own way
         cmd = (
-            '/etc/storage/update_script.sh 2>&1 ; '
-            'echo "===FORCE_RESULT===" ; '
-            'grep "^remote " /etc/openvpn/client/client.conf 2>/dev/null || echo "no remote line"'
+            f'CONF=/etc/openvpn/client/client.conf ; '
+            f'OLD=$(grep "^remote " $CONF) ; '
+            f'PORT=$(echo "$OLD" | awk \'{{print $3}}\') ; '
+            f'[ -z "$PORT" ] && PORT=443 ; '
+            f'sed -i "s|^remote .*|remote {new_ip} $PORT|" $CONF ; '
+            f'mtd_storage.sh save 2>/dev/null ; '
+            f'NEW=$(grep "^remote " $CONF) ; '
+            f'echo "OLD: $OLD" ; echo "NEW: $NEW" ; '
+            f'killall openvpn 2>/dev/null ; sleep 1 ; '
+            f'/etc/storage/update_script.sh 2>/dev/null ; '
+            f'echo "===DONE==="'
         )
         ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'), r.get('password', ''), cmd)
         results.append((cn, ok, out))
@@ -2032,17 +2042,20 @@ async def _force_ip_execute(msg, targets, new_ip: str):
     ok_count = 0
     for cn, ok, out in results:
         if ok:
-            remote_line = ""
+            old_line = ""
+            new_line = ""
             for ln in out.split('\n'):
                 ln_s = ln.strip()
-                if ln_s.startswith('remote '):
-                    remote_line = ln_s
-            applied = new_ip in out
+                if ln_s.startswith('OLD: '):
+                    old_line = ln_s[5:]
+                elif ln_s.startswith('NEW: '):
+                    new_line = ln_s[5:]
+            applied = new_ip in new_line
             if applied:
-                lines.append(f"✅ <b>{cn}</b>: {remote_line}")
+                lines.append(f"✅ <b>{cn}</b>: {new_line}")
                 ok_count += 1
             else:
-                lines.append(f"⚠️ <b>{cn}</b>: {remote_line or out[-80:]}")
+                lines.append(f"⚠️ <b>{cn}</b>: {new_line or out[-80:]}")
         else:
             lines.append(f"❌ <b>{cn}</b>: {escape(out[:80])}")
     lines.append(f"\nИтого: {ok_count}/{total} применено")
