@@ -2020,8 +2020,9 @@ async def _force_ip_execute(msg, targets, new_ip: str):
                 parse_mode="HTML")
         except Exception:
             pass
-        # sed changes IP in config, killall drops tunnel,
-        # then update_script.sh restarts OpenVPN its own way
+        # sed changes IP, save to flash, then background script
+        # kills openvpn + runs update_script.sh AFTER ssh disconnects
+        # (SSH goes through VPN, so killall openvpn kills SSH too)
         cmd = (
             f'CONF=/etc/openvpn/client/client.conf ; '
             f'OLD=$(grep "^remote " $CONF) ; '
@@ -2031,8 +2032,8 @@ async def _force_ip_execute(msg, targets, new_ip: str):
             f'mtd_storage.sh save 2>/dev/null ; '
             f'NEW=$(grep "^remote " $CONF) ; '
             f'echo "OLD: $OLD" ; echo "NEW: $NEW" ; '
-            f'killall openvpn 2>/dev/null ; sleep 1 ; '
-            f'/etc/storage/update_script.sh 2>/dev/null ; '
+            f'( sleep 2 ; killall openvpn 2>/dev/null ; sleep 3 ; '
+            f'/etc/storage/update_script.sh ) > /dev/null 2>&1 & '
             f'echo "===DONE==="'
         )
         ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'), r.get('password', ''), cmd)
