@@ -2353,7 +2353,6 @@ async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_T
         await process_remote_input(update, context); return
     # SSH Routers text inputs
     if context.user_data.get('await_ssh_add'):
-        context.user_data.pop('await_ssh_add')
         lines = [l.strip() for l in update.message.text.strip().splitlines() if l.strip()]
         routers = load_routers()
         added = []
@@ -2388,7 +2387,27 @@ async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_T
             result += "✅ Добавлено: " + ", ".join(f"<b>{c}</b>" for c in added)
         if errors:
             result += ("\n" if result else "") + "\n".join(errors)
-        await update.message.reply_text(result or "Ничего не добавлено.", parse_mode="HTML")
+        # Show updated available list and keep await_ssh_add active
+        available = []
+        try:
+            with open(IPP_FILE, "r") as f:
+                for line in f:
+                    p = line.strip().split(",")
+                    if len(p) >= 2 and p[0] not in routers:
+                        available.append(p[0])
+        except FileNotFoundError:
+            pass
+        if available:
+            avail_str = "  ".join(f"<code>{c}</code>" for c in sorted(available, key=_natural_key))
+            hint = f"\n\nДоступные клиенты:\n{avail_str}"
+        else:
+            hint = ""
+            context.user_data.pop('await_ssh_add', None)
+        kb = [[InlineKeyboardButton("✅ Готово", callback_data='ssh_routers')]]
+        await update.message.reply_text(
+            (result or "Ничего не добавлено.") + hint +
+            ("\n\nОтправьте ещё или нажмите Готово." if available else ""),
+            parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
         return
     if context.user_data.get('await_ssh_edit'):
         cn = context.user_data.pop('await_ssh_edit')
