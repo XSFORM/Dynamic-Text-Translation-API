@@ -3937,6 +3937,37 @@ def _parse_ovpn_ext_output(out: str):
         return path, content
     return None, out
 
+import re as _re
+
+_CERT_TAGS = ['ca', 'cert', 'key', 'tls-crypt', 'tls-auth']
+
+def _extract_cert_blocks(content: str) -> list:
+    """Extract certificate blocks (<ca>...</ca> etc.) from config content.
+    Returns list of (tag, full_block_text) tuples."""
+    blocks = []
+    for tag in _CERT_TAGS:
+        pattern = _re.compile(
+            rf'(^<{_re.escape(tag)}>.*?^</{_re.escape(tag)}>)',
+            _re.MULTILINE | _re.DOTALL)
+        m = pattern.search(content)
+        if m:
+            blocks.append((tag, m.group(1)))
+    return blocks
+
+def _preserve_cert_blocks(old_content: str, new_content: str) -> str:
+    """If old config has cert blocks that new config doesn't, append them."""
+    old_blocks = _extract_cert_blocks(old_content)
+    if not old_blocks:
+        return new_content
+    new_has = {tag for tag, _ in _extract_cert_blocks(new_content)}
+    to_append = []
+    for tag, block in old_blocks:
+        if tag not in new_has:
+            to_append.append(block)
+    if to_append:
+        return new_content.rstrip() + '\n' + '\n'.join(to_append) + '\n'
+    return new_content
+
 async def oec_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -4305,12 +4336,14 @@ async def _oec_write_full_config(cn, new_content):
                        r.get('password', ''), OVPN_EXT_DETECT_CMD)
     if not ok:
         return False, f"❌ {cn}: SSH ошибка"
-    path, _ = _parse_ovpn_ext_output(out)
+    path, old_content = _parse_ovpn_ext_output(out)
     if not path:
         return False, f"❌ {cn}: конфиг не найден"
+    # Preserve certificate blocks from old config
+    final_content = _preserve_cert_blocks(old_content, new_content)
     # Write
     cmd = (
-        f"cat > {path} << 'OVPNCFGEOF'\n{new_content}\nOVPNCFGEOF\n"
+        f"cat > {path} << 'OVPNCFGEOF'\n{final_content}\nOVPNCFGEOF\n"
         f"mtd_storage.sh save 2>/dev/null && echo WRITE_OK || echo WRITE_FAIL"
     )
     ok2, out2 = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'),
