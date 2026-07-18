@@ -2238,7 +2238,7 @@ async def rr_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def rr_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer("Отменено")
     for k in ['await_rr_ip', 'await_rr_domain_add', 'await_force_ip',
-              'await_oec_radd', 'await_oec_fedit']:
+              'await_oec_radd', 'await_oec_fedit', 'await_ssh_add']:
         context.user_data.pop(k, None)
     await safe_edit_text(q, context, "Отменено.")
 
@@ -2352,7 +2352,9 @@ async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_T
     if context.user_data.get('await_remote_input'):
         await process_remote_input(update, context); return
     # SSH Routers text inputs
-    if context.user_data.get('await_ssh_add'):
+    if context.user_data.get('await_ssh_add') and not any(
+            context.user_data.get(k) for k in
+            ['await_ssh_chpass', 'await_ssh_edit', 'await_ssh_cmd']):
         lines = [l.strip() for l in update.message.text.strip().splitlines() if l.strip()]
         routers = load_routers()
         added = []
@@ -3018,10 +3020,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith('ssh_cmd:'):
         cn = data[len('ssh_cmd:'):]
         context.user_data['await_ssh_cmd'] = cn
+        context.user_data.pop('await_ssh_add', None)
         await safe_edit_text(q, context, f"💻 Введите команду для <b>{cn}</b>:", parse_mode="HTML")
     elif data.startswith('ssh_edit:'):
         cn = data[len('ssh_edit:'):]
         context.user_data['await_ssh_edit'] = cn
+        context.user_data.pop('await_ssh_add', None)
         routers = load_routers()
         r = routers.get(cn, {})
         await safe_edit_text(q, context,
@@ -3053,6 +3057,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("❌ Отмена", callback_data='ssh_routers')]]))
         context.user_data['await_ssh_chpass'] = True
+        context.user_data.pop('await_ssh_add', None)
     elif data == 'ssh_chpass_multi':
         context.user_data['ssh_chpass_selected'] = []
         await ssh_chpass_multi_select(update, context)
@@ -3083,6 +3088,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=InlineKeyboardMarkup(
                     [[InlineKeyboardButton("❌ Отмена", callback_data='ssh_routers')]]))
             context.user_data['await_ssh_chpass'] = True
+            context.user_data.pop('await_ssh_add', None)
     elif data.startswith('ssh_chpass:'):
         cn = data[len('ssh_chpass:'):]
         context.user_data['ssh_chpass_targets'] = [cn]
@@ -3093,6 +3099,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("❌ Отмена", callback_data='ssh_routers')]]))
         context.user_data['await_ssh_chpass'] = True
+        context.user_data.pop('await_ssh_add', None)
 
     # --- OpenVPN Ext Config callbacks ---
     elif data == 'oec_menu':
