@@ -2352,12 +2352,9 @@ async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_T
     if context.user_data.get('await_remote_input'):
         await process_remote_input(update, context); return
     # SSH Routers text inputs
-    if context.user_data.get('await_ssh_add') and not any(
-            context.user_data.get(k) for k in
-            ['await_ssh_chpass', 'await_ssh_edit', 'await_ssh_cmd',
-             'await_rr_ip', 'await_rr_domain_add', 'await_force_ip',
-             'await_oec_radd', 'await_oec_fedit', 'await_alert_threshold',
-             'await_gost_add', 'await_gost_rules', 'await_gost_config']):
+    # await_ssh_add stays active for multi-add; skip if ANY other await is active
+    _other_awaits = [k for k in context.user_data if k.startswith('await_') and k != 'await_ssh_add']
+    if context.user_data.get('await_ssh_add') and not _other_awaits:
         lines = [l.strip() for l in update.message.text.strip().splitlines() if l.strip()]
         routers = load_routers()
         added = []
