@@ -2354,7 +2354,10 @@ async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_T
     # SSH Routers text inputs
     if context.user_data.get('await_ssh_add') and not any(
             context.user_data.get(k) for k in
-            ['await_ssh_chpass', 'await_ssh_edit', 'await_ssh_cmd']):
+            ['await_ssh_chpass', 'await_ssh_edit', 'await_ssh_cmd',
+             'await_rr_ip', 'await_rr_domain_add', 'await_force_ip',
+             'await_oec_radd', 'await_oec_fedit', 'await_alert_threshold',
+             'await_gost_add', 'await_gost_rules', 'await_gost_config']):
         lines = [l.strip() for l in update.message.text.strip().splitlines() if l.strip()]
         routers = load_routers()
         added = []
