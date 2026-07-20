@@ -3703,8 +3703,12 @@ async def ssh_chpass_receive(update: Update, context: ContextTypes.DEFAULT_TYPE)
     msg = await update.message.reply_text(
         f"🔑 Меняю пароль на {label}...",
         parse_mode="HTML")
-    chpass_cmd1 = f'nvram set http_passwd={password}'
-    chpass_cmd2 = 'nvram commit\nmtd_storage.sh save\nreboot'
+    chpass_cmd = (
+        f'nvram set http_passwd={password} && '
+        f'nvram commit && mtd_storage.sh save && '
+        f'echo "CHPASS_OK" && '
+        f'( sleep 2 ; reboot ) > /dev/null 2>&1 &'
+    )
     results = []
     for cn in target_list:
         r = routers.get(cn)
@@ -3718,13 +3722,12 @@ async def ssh_chpass_receive(update: Update, context: ContextTypes.DEFAULT_TYPE)
         port = r.get('port', 22)
         user = r.get('user', 'admin')
         pwd = r.get('password', '')
-        ok1, out1 = ssh_exec(ip, port, user, pwd, chpass_cmd1)
-        if not ok1:
-            results.append(f"❌ <b>{cn}</b> — {escape(out1[:200])}")
-            continue
-        ok2, out2 = ssh_exec(ip, port, user, pwd, chpass_cmd2)
-        routers[cn]['password'] = password
-        results.append(f"✅ <b>{cn}</b> — пароль изменён, reboot")
+        ok, out = await asyncio.to_thread(ssh_exec, ip, port, user, pwd, chpass_cmd)
+        if ok and 'CHPASS_OK' in out:
+            routers[cn]['password'] = password
+            results.append(f"✅ <b>{cn}</b> — пароль изменён, reboot")
+        else:
+            results.append(f"❌ <b>{cn}</b> — {escape(out[:200])}")
     save_routers(routers)
     report = "🔑 <b>Смена пароля:</b>\n\n" + "\n".join(results)
     await msg.edit_text(report, parse_mode="HTML")
