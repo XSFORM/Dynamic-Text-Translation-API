@@ -5894,32 +5894,74 @@ async def gost_getroot_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "🔐 <b>Получить Root</b>\n\n"
         "Этот инструмент включит root SSH-доступ по паролю\n"
         "на серверах где вход только по PEM-ключу (AWS, GCP и т.д.)\n\n"
-        "📎 <b>Отправьте PEM-файл (.pem) в чат</b>",
+        "📎 <b>Отправьте файл ключа (.pem / .key / .ppk) в чат</b>",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(
             [[InlineKeyboardButton("❌ Отмена", callback_data='gost_menu')]]))
 
 
+def _convert_ppk_to_pem(ppk_path: str, pem_path: str) -> Tuple[bool, str]:
+    """Convert PuTTY PPK key to OpenSSH PEM format using puttygen."""
+    # Ensure puttygen is available
+    if not shutil.which('puttygen'):
+        try:
+            subprocess.run(['apt-get', 'install', '-y', 'putty-tools'],
+                           capture_output=True, timeout=30)
+        except Exception:
+            pass
+    if not shutil.which('puttygen'):
+        return False, "puttygen не найден. Установите: apt-get install putty-tools"
+    try:
+        r = subprocess.run(
+            ['puttygen', ppk_path, '-O', 'private-openssh', '-o', pem_path],
+            capture_output=True, text=True, timeout=15)
+        if r.returncode == 0 and os.path.exists(pem_path):
+            os.chmod(pem_path, 0o600)
+            return True, "OK"
+        return False, r.stderr.strip() or f"puttygen exit code {r.returncode}"
+    except Exception as e:
+        return False, str(e)
+
+
 async def gost_getroot_pem_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle PEM file upload — save and ask for IP."""
+    """Handle PEM/PPK file upload — save and ask for IP."""
     doc = update.message.document
     if not doc.file_name.endswith(('.pem', '.key', '.ppk')):
         await update.message.reply_text(
-            "⚠️ Отправьте файл с расширением .pem / .key\n"
+            "⚠️ Отправьте файл с расширением .pem / .key / .ppk\n"
             "Или нажмите Отмена в меню выше.")
         return
 
     os.makedirs(GOST_KEYS_DIR, exist_ok=True)
+    is_ppk = doc.file_name.lower().endswith('.ppk')
+    raw_path = os.path.join(GOST_KEYS_DIR, f"temp_getroot_{update.effective_user.id}{'_raw.ppk' if is_ppk else '.pem'}")
     key_path = os.path.join(GOST_KEYS_DIR, f"temp_getroot_{update.effective_user.id}.pem")
 
     tg_file = await context.bot.get_file(doc.file_id)
-    await tg_file.download_to_drive(key_path)
-    os.chmod(key_path, 0o600)
+    await tg_file.download_to_drive(raw_path)
+    os.chmod(raw_path, 0o600)
+
+    if is_ppk:
+        ok, err = await asyncio.to_thread(_convert_ppk_to_pem, raw_path, key_path)
+        try:
+            os.remove(raw_path)
+        except Exception:
+            pass
+        if not ok:
+            await update.message.reply_text(
+                f"❌ Ошибка конвертации PPK → PEM:\n<pre>{escape(err)}</pre>\n\n"
+                "Попробуйте конвертировать вручную в PuTTYgen → Export OpenSSH key",
+                parse_mode="HTML")
+            return
+    else:
+        if raw_path != key_path:
+            os.rename(raw_path, key_path)
 
     context.user_data['gost_getroot_key'] = key_path
     context.user_data['await_gost_getroot'] = 'ip'
+    fmt = "PPK → PEM конвертирован" if is_ppk else "PEM-ключ получен"
     await update.message.reply_text(
-        "✅ PEM-ключ получен.\n\nВведите IP-адрес сервера:")
+        f"✅ {fmt}.\n\nВведите IP-адрес сервера:")
 
 
 async def gost_getroot_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
