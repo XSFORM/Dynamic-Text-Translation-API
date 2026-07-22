@@ -4828,6 +4828,101 @@ async def auto_ip_monitor(app):
             await asyncio.sleep(10)
 
 # =====================================================================
+#  DOMAIN MONITOR — check domain via ISP DNS from router
+# =====================================================================
+DOMAIN_CHECK_HOURS = [9, 12, 15, 18, 21]       # Ashgabat time
+DOMAIN_CHECK_DNS   = AUTO_IP_TM_CHECK           # 217.174.235.161
+domain_monitor_last_status = {}                 # domain -> True/False
+domain_monitor_last_hour = -1                   # last checked hour
+
+async def domain_monitor(app):
+    """Background task: at scheduled hours, SSH to an online router and
+    nslookup the first domain via ISP DNS. Alert if blocked."""
+    global domain_monitor_last_hour, domain_monitor_last_status
+    while True:
+        try:
+            await asyncio.sleep(30)
+            now_tm = datetime.now(TM_TZ)
+            current_hour = now_tm.hour
+            # Only run at scheduled hours, once per hour
+            if current_hour not in DOMAIN_CHECK_HOURS:
+                domain_monitor_last_hour = -1
+                continue
+            if current_hour == domain_monitor_last_hour:
+                continue
+
+            domains = rr_read_domains()
+            if not domains:
+                continue
+
+            # Find an online router to run nslookup from
+            routers = load_routers()
+            online = get_online_clients()
+            test_router = None
+            for cn in online:
+                if cn in routers:
+                    ip = get_router_ip(cn)
+                    if ip:
+                        test_router = (cn, ip, routers[cn])
+                        break
+            if not test_router:
+                print("[domain_mon] no online router for check")
+                continue
+
+            cn, ip, r = test_router
+            domain = domains[0]
+            cmd = f"nslookup {domain} {DOMAIN_CHECK_DNS} 2>&1"
+            ok, out = await asyncio.to_thread(
+                ssh_exec, ip, r.get('port', 22),
+                r.get('user', 'admin'), r.get('password', ''), cmd
+            )
+
+            domain_monitor_last_hour = current_hour
+            time_str = now_tm.strftime("%H:%M")
+
+            # Determine if domain is blocked
+            blocked = False
+            if not ok:
+                blocked = True
+            elif 'timed out' in out.lower() or 'таймаут' in out.lower() or \
+                 'connection timed out' in out.lower() or \
+                 'server can' in out.lower() or 'NXDOMAIN' in out:
+                blocked = True
+            elif 'Address' in out and domain in out:
+                blocked = False
+            else:
+                blocked = True  # unexpected output = suspicious
+
+            prev = domain_monitor_last_status.get(domain)
+            domain_monitor_last_status[domain] = not blocked
+
+            if blocked:
+                msg = (
+                    f"🚨 <b>ДОМЕН ЗАБЛОКИРОВАН!</b>\n\n"
+                    f"Домен: <code>{domain}</code>\n"
+                    f"Проверка через: <b>{cn}</b> ({ip})\n"
+                    f"DNS: <code>{DOMAIN_CHECK_DNS}</code>\n"
+                    f"Время: {time_str}\n\n"
+                    f"<pre>{escape(out[:500])}</pre>\n\n"
+                    f"⚠️ Срочно смените домен!"
+                )
+                await app.bot.send_message(ADMIN_ID, msg, parse_mode="HTML")
+                print(f"[domain_mon] {domain} BLOCKED at {time_str}")
+            else:
+                # Report OK only if it was previously blocked or first check
+                if prev is None or prev is False:
+                    await app.bot.send_message(
+                        ADMIN_ID,
+                        f"✅ Домен <code>{domain}</code> — доступен ({time_str})",
+                        parse_mode="HTML"
+                    )
+                print(f"[domain_mon] {domain} OK at {time_str}")
+
+        except Exception as e:
+            print(f"[domain_mon] Error: {e}")
+            await asyncio.sleep(60)
+
+# =====================================================================
 #  AUTO IP — menu & handlers
 # =====================================================================
 async def auto_ip_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6088,6 +6183,7 @@ def main():
     asyncio.set_event_loop(loop)
     loop.create_task(check_new_connections(app))
     loop.create_task(auto_ip_monitor(app))
+    loop.create_task(domain_monitor(app))
     app.run_polling()
 
 if __name__ == '__main__':
