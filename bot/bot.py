@@ -2193,10 +2193,10 @@ async def rr_dom_remove_apply(update: Update, context: ContextTypes.DEFAULT_TYPE
         await safe_edit_text(q, context, f"{domain} не найден.")
 
 async def rr_push_domains(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Push current domain_list.txt to all online routers via SSH."""
+    """Show current vs new domains and offer router selection."""
     q = update.callback_query; await q.answer()
-    domains = rr_read_domains()
-    if not domains:
+    new_domains = rr_read_domains()
+    if not new_domains:
         await safe_edit_text(q, context, "❌ Список доменов пуст.")
         return
     routers = load_routers()
@@ -2204,15 +2204,101 @@ async def rr_push_domains(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit_text(q, context, "❌ Список роутеров пуст.")
         return
     online = get_online_clients()
+    # Fetch current domains from first online router
+    old_domains_text = "—"
+    for cn in online:
+        if cn in routers:
+            ip = get_router_ip(cn)
+            if ip:
+                r = routers[cn]
+                ok, out = await asyncio.to_thread(
+                    ssh_exec, ip, r.get('port', 22),
+                    r.get('user', 'admin'), r.get('password', ''),
+                    'cat /etc/storage/remote_domains.list 2>/dev/null || echo "(файл не найден)"')
+                if ok and out.strip():
+                    old_lines = [l.strip() for l in out.strip().splitlines() if l.strip()]
+                    old_domains_text = "\n".join(f"  {i+1}. {d}" for i, d in enumerate(old_lines))
+                    context.user_data['push_dom_old'] = old_lines
+                break
+    new_text = "\n".join(f"  {i+1}. {d}" for i, d in enumerate(new_domains))
+    context.user_data['push_dom_new'] = new_domains
+    context.user_data['push_dom_selected'] = set()
+    cnt_online = sum(1 for cn in routers if cn in online)
+    kb = [
+        [InlineKeyboardButton(f"🌐 Все роутеры ({len(routers)})", callback_data='push_dom_all')],
+        [InlineKeyboardButton("🖥 Один роутер", callback_data='push_dom_one')],
+        [InlineKeyboardButton("☑️ Несколько", callback_data='push_dom_multi')],
+        [InlineKeyboardButton("❌ Отмена", callback_data='home')],
+    ]
+    await safe_edit_text(q, context,
+        f"📤 <b>Обновить домены на роутерах</b>\n\n"
+        f"<b>Сейчас на роутерах:</b>\n<pre>{old_domains_text}</pre>\n\n"
+        f"<b>Новый список:</b>\n<pre>{new_text}</pre>\n\n"
+        f"Онлайн: <b>{cnt_online}/{len(routers)}</b>\n\n"
+        f"Выберите роутеры:",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def rr_push_dom_select_one(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    routers = load_routers()
+    online = get_online_clients()
+    kb = []
+    for cn in sorted(routers.keys(), key=_natural_key):
+        icon = "🟢" if cn in online else "🔴"
+        kb.append([InlineKeyboardButton(f"{icon} {cn}", callback_data=f'push_dom_run:{cn}')])
+    kb.append([InlineKeyboardButton("◀️ Назад", callback_data='rr_push_domains')])
+    await safe_edit_text(q, context, "🖥 Выберите роутер:", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def rr_push_dom_select_multi(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    routers = load_routers()
+    online = get_online_clients()
+    selected = context.user_data.get('push_dom_selected', set())
+    kb = []
+    for cn in sorted(routers.keys(), key=_natural_key):
+        icon = "🟢" if cn in online else "🔴"
+        check = "☑️" if cn in selected else "⬜"
+        kb.append([InlineKeyboardButton(f"{check} {icon} {cn}", callback_data=f'push_dom_tog:{cn}')])
+    kb.append([InlineKeyboardButton(f"✅ Применить ({len(selected)})", callback_data='push_dom_go_sel')])
+    kb.append([InlineKeyboardButton("◀️ Назад", callback_data='rr_push_domains')])
+    await safe_edit_text(q, context, "☑️ Выберите роутеры:", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def rr_push_dom_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE, cn: str):
+    q = update.callback_query; await q.answer()
+    selected = context.user_data.get('push_dom_selected', set())
+    if cn in selected:
+        selected.discard(cn)
+    else:
+        selected.add(cn)
+    context.user_data['push_dom_selected'] = selected
+    await rr_push_dom_select_multi(update, context)
+
+
+async def _rr_push_dom_exec(update: Update, context: ContextTypes.DEFAULT_TYPE, targets: list):
+    """Execute domain push to given list of router CNs."""
+    q = update.callback_query
+    domains = context.user_data.get('push_dom_new', rr_read_domains())
+    if not domains:
+        await safe_edit_text(q, context, "❌ Список доменов пуст.")
+        return
+    routers = load_routers()
+    online = get_online_clients()
     dom_text = "\\n".join(domains)
     numbered = "\n".join(f"{i+1}. {d}" for i, d in enumerate(domains))
     msg = await q.message.reply_text(
-        f"📤 Обновляю домены на роутерах...\n<pre>{numbered}</pre>",
+        f"📤 Обновляю домены на {len(targets)} роутерах...",
         parse_mode="HTML")
     cmd = f'printf "{dom_text}\\n" > /etc/storage/remote_domains.list && mtd_storage.sh save && echo DOMUPD_OK'
     results = []
     ok_count = 0
-    for cn, r in routers.items():
+    for cn in targets:
+        r = routers.get(cn)
+        if not r:
+            results.append(f"❌ <b>{cn}</b> — не найден")
+            continue
         if cn not in online:
             results.append(f"❌ <b>{cn}</b> — оффлайн")
             continue
@@ -2229,7 +2315,7 @@ async def rr_push_domains(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             short = out.strip()[:100] if out else "—"
             results.append(f"❌ <b>{cn}</b>: {escape(short)}")
-    total = len(routers)
+    total = len(targets)
     report = "\n".join(results)
     await msg.edit_text(
         f"📤 <b>Домены обновлены</b>\n\n{report}\n\nИтого: {ok_count} из {total}",
@@ -3204,6 +3290,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await rr_dom_remove_apply(update, context, domain)
     elif data == 'rr_push_domains':
         await rr_push_domains(update, context)
+    elif data == 'push_dom_all':
+        routers = load_routers()
+        await _rr_push_dom_exec(update, context, list(routers.keys()))
+    elif data == 'push_dom_one':
+        await rr_push_dom_select_one(update, context)
+    elif data == 'push_dom_multi':
+        await rr_push_dom_select_multi(update, context)
+    elif data.startswith('push_dom_run:'):
+        cn = data[len('push_dom_run:'):]
+        await _rr_push_dom_exec(update, context, [cn])
+    elif data.startswith('push_dom_tog:'):
+        cn = data[len('push_dom_tog:'):]
+        await rr_push_dom_toggle(update, context, cn)
+    elif data == 'push_dom_go_sel':
+        selected = list(context.user_data.get('push_dom_selected', set()))
+        if not selected:
+            await update.callback_query.answer("Ничего не выбрано", show_alert=True)
+        else:
+            await _rr_push_dom_exec(update, context, selected)
     elif data == 'rr_cancel':
         await rr_cancel(update, context)
 
