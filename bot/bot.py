@@ -2322,6 +2322,111 @@ async def _rr_push_dom_exec(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         parse_mode="HTML")
 
 
+# ----- Check domains on routers -----
+async def chk_dom_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    routers = load_routers()
+    if not routers:
+        await safe_edit_text(q, context, "❌ Список роутеров пуст.")
+        return
+    online = get_online_clients()
+    cnt_online = sum(1 for cn in routers if cn in online)
+    context.user_data['chk_dom_selected'] = set()
+    kb = [
+        [InlineKeyboardButton(f"🌐 Все роутеры ({len(routers)})", callback_data='chk_dom_all')],
+        [InlineKeyboardButton("🖥 Один роутер", callback_data='chk_dom_one')],
+        [InlineKeyboardButton("☑️ Несколько", callback_data='chk_dom_multi')],
+        [InlineKeyboardButton("❌ Отмена", callback_data='home')],
+    ]
+    await safe_edit_text(q, context,
+        f"🔎 <b>Проверить домены на роутерах</b>\n\n"
+        f"Онлайн: <b>{cnt_online}/{len(routers)}</b>\n\n"
+        f"Выберите роутеры:",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def chk_dom_select_one(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    routers = load_routers()
+    online = get_online_clients()
+    kb = []
+    for cn in sorted(routers.keys(), key=_natural_key):
+        icon = "🟢" if cn in online else "🔴"
+        kb.append([InlineKeyboardButton(f"{icon} {cn}", callback_data=f'chk_dom_run:{cn}')])
+    kb.append([InlineKeyboardButton("◀️ Назад", callback_data='chk_dom_menu')])
+    await safe_edit_text(q, context, "🖥 Выберите роутер:", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def chk_dom_select_multi(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    routers = load_routers()
+    online = get_online_clients()
+    selected = context.user_data.get('chk_dom_selected', set())
+    kb = []
+    for cn in sorted(routers.keys(), key=_natural_key):
+        icon = "🟢" if cn in online else "🔴"
+        check = "☑️" if cn in selected else "⬜"
+        kb.append([InlineKeyboardButton(f"{check} {icon} {cn}", callback_data=f'chk_dom_tog:{cn}')])
+    kb.append([InlineKeyboardButton(f"✅ Проверить ({len(selected)})", callback_data='chk_dom_go_sel')])
+    kb.append([InlineKeyboardButton("◀️ Назад", callback_data='chk_dom_menu')])
+    await safe_edit_text(q, context, "☑️ Выберите роутеры:", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def chk_dom_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE, cn: str):
+    q = update.callback_query; await q.answer()
+    selected = context.user_data.get('chk_dom_selected', set())
+    if cn in selected:
+        selected.discard(cn)
+    else:
+        selected.add(cn)
+    context.user_data['chk_dom_selected'] = selected
+    await chk_dom_select_multi(update, context)
+
+
+async def _chk_dom_exec(update: Update, context: ContextTypes.DEFAULT_TYPE, targets: list):
+    """Read domains from selected routers and show report."""
+    q = update.callback_query
+    routers = load_routers()
+    online = get_online_clients()
+    server_domains = rr_read_domains()
+    server_set = set(server_domains)
+    msg = await q.message.reply_text(
+        f"🔎 Проверяю домены на {len(targets)} роутерах...")
+    results = []
+    for cn in targets:
+        r = routers.get(cn)
+        if not r:
+            results.append(f"❌ <b>{cn}</b> — не найден"); continue
+        if cn not in online:
+            results.append(f"❌ <b>{cn}</b> — оффлайн"); continue
+        ip = get_router_ip(cn)
+        if not ip:
+            results.append(f"❌ <b>{cn}</b> — нет IP"); continue
+        ok, out = await asyncio.to_thread(
+            ssh_exec, ip, r.get('port', 22),
+            r.get('user', 'admin'), r.get('password', ''),
+            'cat /etc/storage/remote_domains.list 2>/dev/null || echo "(нет файла)"')
+        if ok:
+            router_doms = [l.strip() for l in out.strip().splitlines() if l.strip()]
+            router_set = set(router_doms)
+            if router_set == server_set:
+                status = "✅"
+            else:
+                status = "⚠️"
+            dom_list = ", ".join(router_doms) if router_doms else "(пусто)"
+            results.append(f"{status} <b>{cn}</b>: {dom_list}")
+        else:
+            short = out.strip()[:100] if out else "—"
+            results.append(f"❌ <b>{cn}</b>: {escape(short)}")
+    report = "\n".join(results)
+    server_list = ", ".join(server_domains) if server_domains else "(пусто)"
+    await msg.edit_text(
+        f"🔎 <b>Домены на роутерах</b>\n\n"
+        f"{report}\n\n"
+        f"📋 На сервере: {server_list}",
+        parse_mode="HTML")
+
+
 async def rr_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     await context.bot.send_message(chat_id=q.message.chat_id, text="Создаю бэкап Remote Refresh...")
@@ -2450,7 +2555,8 @@ def get_main_keyboard():
          InlineKeyboardButton("🔍 Port Scan", callback_data='rr_port_scan')],
         [InlineKeyboardButton("📋 История IP", callback_data='rr_history'),
          InlineKeyboardButton("🌐 Домены", callback_data='rr_domains')],
-        [InlineKeyboardButton("📤 Обновить домены на роутерах", callback_data='rr_push_domains')],
+        [InlineKeyboardButton("📤 Обновить домены", callback_data='rr_push_domains'),
+         InlineKeyboardButton("🔎 Проверить домены", callback_data='chk_dom_menu')],
         [InlineKeyboardButton("🔄 Авто IP", callback_data='aip_menu')],
         # --- Common ---
         [InlineKeyboardButton("❓ Помощь", callback_data='help'),
@@ -3309,6 +3415,27 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.callback_query.answer("Ничего не выбрано", show_alert=True)
         else:
             await _rr_push_dom_exec(update, context, selected)
+    elif data == 'chk_dom_menu':
+        await chk_dom_menu(update, context)
+    elif data == 'chk_dom_all':
+        routers = load_routers()
+        await _chk_dom_exec(update, context, list(routers.keys()))
+    elif data == 'chk_dom_one':
+        await chk_dom_select_one(update, context)
+    elif data == 'chk_dom_multi':
+        await chk_dom_select_multi(update, context)
+    elif data.startswith('chk_dom_run:'):
+        cn = data[len('chk_dom_run:'):]
+        await _chk_dom_exec(update, context, [cn])
+    elif data.startswith('chk_dom_tog:'):
+        cn = data[len('chk_dom_tog:'):]
+        await chk_dom_toggle(update, context, cn)
+    elif data == 'chk_dom_go_sel':
+        selected = list(context.user_data.get('chk_dom_selected', set()))
+        if not selected:
+            await update.callback_query.answer("Ничего не выбрано", show_alert=True)
+        else:
+            await _chk_dom_exec(update, context, selected)
     elif data == 'rr_cancel':
         await rr_cancel(update, context)
 
