@@ -2555,8 +2555,7 @@ def get_main_keyboard():
          InlineKeyboardButton("🔍 Port Scan", callback_data='rr_port_scan')],
         [InlineKeyboardButton("📋 История IP", callback_data='rr_history'),
          InlineKeyboardButton("🌐 Домены", callback_data='rr_domains')],
-        [InlineKeyboardButton("📤 Обновить домены", callback_data='rr_push_domains'),
-         InlineKeyboardButton("🔎 Проверить домены", callback_data='chk_dom_menu')],
+        [InlineKeyboardButton("🔎 Проверить домены", callback_data='chk_dom_menu')],
         [InlineKeyboardButton("🔄 Авто IP", callback_data='aip_menu')],
         # --- Common ---
         [InlineKeyboardButton("❓ Помощь", callback_data='help'),
@@ -6263,6 +6262,10 @@ async def gost_getroot_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
     """Start the Get Root flow — ask user to send PEM file."""
     q = update.callback_query
     await q.answer()
+    # Clear any stale GOST/SSH await flags
+    for k in list(context.user_data.keys()):
+        if k.startswith('await_'):
+            context.user_data.pop(k, None)
     context.user_data['await_gost_getroot'] = 'pem'
     await safe_edit_text(q, context,
         "🔐 <b>Получить Root</b>\n\n"
