@@ -2192,6 +2192,50 @@ async def rr_dom_remove_apply(update: Update, context: ContextTypes.DEFAULT_TYPE
     else:
         await safe_edit_text(q, context, f"{domain} не найден.")
 
+async def rr_push_domains(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Push current domain_list.txt to all online routers via SSH."""
+    q = update.callback_query; await q.answer()
+    domains = rr_read_domains()
+    if not domains:
+        await safe_edit_text(q, context, "❌ Список доменов пуст.")
+        return
+    routers = load_routers()
+    if not routers:
+        await safe_edit_text(q, context, "❌ Список роутеров пуст.")
+        return
+    online = get_online_clients()
+    dom_text = "\\n".join(domains)
+    numbered = "\n".join(f"{i+1}. {d}" for i, d in enumerate(domains))
+    msg = await q.message.reply_text(
+        f"📤 Обновляю домены на роутерах...\n<pre>{numbered}</pre>",
+        parse_mode="HTML")
+    cmd = f'printf "{dom_text}\\n" > /etc/storage/remote_domains.list && mtd_storage.sh save && echo DOMUPD_OK'
+    results = []
+    ok_count = 0
+    for cn, r in routers.items():
+        if cn not in online:
+            results.append(f"❌ <b>{cn}</b> — оффлайн")
+            continue
+        ip = get_router_ip(cn)
+        if not ip:
+            results.append(f"❌ <b>{cn}</b> — нет IP")
+            continue
+        ok, out = await asyncio.to_thread(
+            ssh_exec, ip, r.get('port', 22),
+            r.get('user', 'admin'), r.get('password', ''), cmd)
+        if ok and 'DOMUPD_OK' in out:
+            results.append(f"✅ <b>{cn}</b>")
+            ok_count += 1
+        else:
+            short = out.strip()[:100] if out else "—"
+            results.append(f"❌ <b>{cn}</b>: {escape(short)}")
+    total = len(routers)
+    report = "\n".join(results)
+    await msg.edit_text(
+        f"📤 <b>Домены обновлены</b>\n\n{report}\n\nИтого: {ok_count} из {total}",
+        parse_mode="HTML")
+
+
 async def rr_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     await context.bot.send_message(chat_id=q.message.chat_id, text="Создаю бэкап Remote Refresh...")
@@ -2320,6 +2364,7 @@ def get_main_keyboard():
          InlineKeyboardButton("🔍 Port Scan", callback_data='rr_port_scan')],
         [InlineKeyboardButton("📋 История IP", callback_data='rr_history'),
          InlineKeyboardButton("🌐 Домены", callback_data='rr_domains')],
+        [InlineKeyboardButton("📤 Обновить домены на роутерах", callback_data='rr_push_domains')],
         [InlineKeyboardButton("🔄 Авто IP", callback_data='aip_menu')],
         # --- Common ---
         [InlineKeyboardButton("❓ Помощь", callback_data='help'),
@@ -3157,6 +3202,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith('rr_dom_del:'):
         domain = data[len('rr_dom_del:'):]
         await rr_dom_remove_apply(update, context, domain)
+    elif data == 'rr_push_domains':
+        await rr_push_domains(update, context)
     elif data == 'rr_cancel':
         await rr_cancel(update, context)
 
