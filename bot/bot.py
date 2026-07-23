@@ -4809,6 +4809,9 @@ HELP_TEXT = f"""
       (на один роутер или все сразу)
     📝 Полный редактор — просмотр и замена
       всего расширенного конфига (один / все)
+    🔒 Блоки сертификатов (<ca>, <cert>, <key>,
+      <tls-crypt>) сохраняются автоматически
+      при перезаписи конфига.
     Путь к файлу определяется автоматически.
 
 ═══════════════════════
@@ -4842,6 +4845,17 @@ HELP_TEXT = f"""
   • Добавить / Удалить домен
   Домены синхронизируются на роутеры
   автоматически через domain_list.txt.
+
+🔎 Проверить домены
+  SSH на роутеры → показать какие домены стоят
+  на каждом роутере. Один / несколько / все.
+  ✅ = совпадает с сервером, ⚠️ = отличается.
+
+📡 Мониторинг доменов (фоновый)
+  5 раз в день (9, 12, 15, 18, 21)
+  проверяет первый домен через DNS провайдера
+  с 4 разных роутеров. Если ВСЕ показали блок —
+  🚨 уведомление. Если хоть один ОК — норма.
 
 🔄 Авто IP
   Автоматическая замена IP при блокировке:
@@ -5106,23 +5120,37 @@ async def auto_ip_monitor(app):
             await asyncio.sleep(10)
 
 # =====================================================================
-#  DOMAIN MONITOR — check domain via ISP DNS from router
+#  DOMAIN MONITOR — check domain via ISP DNS from multiple routers
 # =====================================================================
 DOMAIN_CHECK_HOURS = [9, 12, 15, 18, 21]       # Ashgabat time
 DOMAIN_CHECK_DNS   = AUTO_IP_TM_CHECK           # 217.174.235.161
+DOMAIN_CHECK_COUNT = 4                          # check from N different routers
 domain_monitor_last_status = {}                 # domain -> True/False
 domain_monitor_last_hour = -1                   # last checked hour
 
+def _domain_check_blocked(out: str, domain: str) -> bool:
+    """Parse nslookup output: return True if domain appears blocked."""
+    if not out:
+        return True
+    low = out.lower()
+    if 'timed out' in low or 'таймаут' in low or \
+       'connection timed out' in low or \
+       'server can' in low or 'NXDOMAIN' in out:
+        return True
+    if 'Address' in out and domain in out:
+        return False
+    return True  # unexpected output = suspicious
+
 async def domain_monitor(app):
-    """Background task: at scheduled hours, SSH to an online router and
-    nslookup the first domain via ISP DNS. Alert if blocked."""
+    """Background task: at scheduled hours, nslookup from up to 4 routers.
+    If ANY router resolves OK → domain is fine.
+    Only if ALL show block → alert."""
     global domain_monitor_last_hour, domain_monitor_last_status
     while True:
         try:
             await asyncio.sleep(30)
             now_tm = datetime.now(TM_TZ)
             current_hour = now_tm.hour
-            # Only run at scheduled hours, once per hour
             if current_hour not in DOMAIN_CHECK_HOURS:
                 domain_monitor_last_hour = -1
                 continue
@@ -5133,68 +5161,68 @@ async def domain_monitor(app):
             if not domains:
                 continue
 
-            # Find an online router to run nslookup from
             routers = load_routers()
             online = get_online_clients()
-            test_router = None
+            # Collect up to DOMAIN_CHECK_COUNT online routers
+            test_routers = []
             for cn in online:
                 if cn in routers:
                     ip = get_router_ip(cn)
                     if ip:
-                        test_router = (cn, ip, routers[cn])
-                        break
-            if not test_router:
-                print("[domain_mon] no online router for check")
+                        test_routers.append((cn, ip, routers[cn]))
+                        if len(test_routers) >= DOMAIN_CHECK_COUNT:
+                            break
+            if not test_routers:
+                print("[domain_mon] no online routers for check")
                 continue
 
-            cn, ip, r = test_router
             domain = domains[0]
             cmd = f"nslookup {domain} {DOMAIN_CHECK_DNS} 2>&1"
-            ok, out = await asyncio.to_thread(
-                ssh_exec, ip, r.get('port', 22),
-                r.get('user', 'admin'), r.get('password', ''), cmd
-            )
-
             domain_monitor_last_hour = current_hour
             time_str = now_tm.strftime("%H:%M")
 
-            # Determine if domain is blocked
-            blocked = False
-            if not ok:
-                blocked = True
-            elif 'timed out' in out.lower() or 'таймаут' in out.lower() or \
-                 'connection timed out' in out.lower() or \
-                 'server can' in out.lower() or 'NXDOMAIN' in out:
-                blocked = True
-            elif 'Address' in out and domain in out:
-                blocked = False
-            else:
-                blocked = True  # unexpected output = suspicious
+            results = []  # (cn, ok_resolve, output)
+            found_ok = False
+            for cn, ip, r in test_routers:
+                ok, out = await asyncio.to_thread(
+                    ssh_exec, ip, r.get('port', 22),
+                    r.get('user', 'admin'), r.get('password', ''), cmd
+                )
+                if ok and not _domain_check_blocked(out, domain):
+                    results.append((cn, True, out))
+                    found_ok = True
+                    break  # one OK is enough
+                else:
+                    results.append((cn, False, out))
 
             prev = domain_monitor_last_status.get(domain)
-            domain_monitor_last_status[domain] = not blocked
+            domain_monitor_last_status[domain] = found_ok
 
-            if blocked:
+            if found_ok:
+                if prev is None or prev is False:
+                    ok_cn = results[-1][0]
+                    await app.bot.send_message(
+                        ADMIN_ID,
+                        f"✅ Домен <code>{domain}</code> — доступен ({time_str})\n"
+                        f"Проверено через: <b>{ok_cn}</b>",
+                        parse_mode="HTML"
+                    )
+                print(f"[domain_mon] {domain} OK at {time_str} (checked {len(results)} routers)")
+            else:
+                # All routers showed block
+                details = "\n".join(
+                    f"  ❌ {cn}: {out.strip()[:80]}" for cn, _, out in results
+                )
                 msg = (
                     f"🚨 <b>ДОМЕН ЗАБЛОКИРОВАН!</b>\n\n"
                     f"Домен: <code>{domain}</code>\n"
-                    f"Проверка через: <b>{cn}</b> ({ip})\n"
-                    f"DNS: <code>{DOMAIN_CHECK_DNS}</code>\n"
-                    f"Время: {time_str}\n\n"
-                    f"<pre>{escape(out[:500])}</pre>\n\n"
+                    f"Время: {time_str}\n"
+                    f"Проверено роутеров: {len(results)}\n\n"
+                    f"<pre>{escape(details)}</pre>\n\n"
                     f"⚠️ Срочно смените домен!"
                 )
                 await app.bot.send_message(ADMIN_ID, msg, parse_mode="HTML")
-                print(f"[domain_mon] {domain} BLOCKED at {time_str}")
-            else:
-                # Report OK only if it was previously blocked or first check
-                if prev is None or prev is False:
-                    await app.bot.send_message(
-                        ADMIN_ID,
-                        f"✅ Домен <code>{domain}</code> — доступен ({time_str})",
-                        parse_mode="HTML"
-                    )
-                print(f"[domain_mon] {domain} OK at {time_str}")
+                print(f"[domain_mon] {domain} BLOCKED at {time_str} ({len(results)} routers checked)")
 
         except Exception as e:
             print(f"[domain_mon] Error: {e}")
@@ -6226,11 +6254,12 @@ GOST_HELP_TEXT = """
 
 🔐 Получить Root
   Для серверов с PEM-ключом (AWS, GCP, Azure):
-    1. Отправляешь .pem файл в чат
+    1. Отправляешь .pem / .key / .ppk файл в чат
     2. Вводишь IP сервера
     3. Вводишь SSH-пользователя (ubuntu/ec2-user)
     4. Вводишь желаемый пароль root
   Бот автоматически:
+    • PPK файлы конвертируются в PEM (puttygen)
     • Подключается по PEM-ключу
     • Задаёт пароль root
     • Включает PermitRootLogin yes
@@ -6238,7 +6267,7 @@ GOST_HELP_TEXT = """
     • Фиксит все sshd_config.d/*.conf
     • Рестартует sshd
     • Проверяет вход root+пароль
-  PEM-файл удаляется сразу после использования.
+  Ключ удаляется сразу после использования.
   После этого сервер добавляется обычным способом.
 """
 
