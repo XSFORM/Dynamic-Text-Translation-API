@@ -2384,24 +2384,27 @@ async def chk_dom_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE, cn:
 
 
 async def _chk_dom_exec(update: Update, context: ContextTypes.DEFAULT_TYPE, targets: list):
-    """Read domains from selected routers and show report."""
+    """Read domains from selected routers and show report with progress."""
     q = update.callback_query
     routers = load_routers()
     online = get_online_clients()
     server_domains = rr_read_domains()
     server_set = set(server_domains)
+    total = len(targets)
     msg = await q.message.reply_text(
-        f"🔎 Проверяю домены на {len(targets)} роутерах...")
+        f"🔎 Проверяю домены... 0/{total}  ░░░░░░░░░░ 0%")
     results = []
+    done = 0
+    last_edit = 0
     for cn in targets:
         r = routers.get(cn)
         if not r:
-            results.append(f"❌ <b>{cn}</b> — не найден"); continue
+            results.append(f"❌ <b>{cn}</b> — не найден"); done += 1; continue
         if cn not in online:
-            results.append(f"❌ <b>{cn}</b> — оффлайн"); continue
+            results.append(f"❌ <b>{cn}</b> — оффлайн"); done += 1; continue
         ip = get_router_ip(cn)
         if not ip:
-            results.append(f"❌ <b>{cn}</b> — нет IP"); continue
+            results.append(f"❌ <b>{cn}</b> — нет IP"); done += 1; continue
         ok, out = await asyncio.to_thread(
             ssh_exec, ip, r.get('port', 22),
             r.get('user', 'admin'), r.get('password', ''),
@@ -2409,15 +2412,25 @@ async def _chk_dom_exec(update: Update, context: ContextTypes.DEFAULT_TYPE, targ
         if ok:
             router_doms = [l.strip() for l in out.strip().splitlines() if l.strip()]
             router_set = set(router_doms)
-            if router_set == server_set:
-                status = "✅"
-            else:
-                status = "⚠️"
+            status = "✅" if router_set == server_set else "⚠️"
             dom_list = ", ".join(router_doms) if router_doms else "(пусто)"
             results.append(f"{status} <b>{cn}</b>: {dom_list}")
         else:
             short = out.strip()[:100] if out else "—"
             results.append(f"❌ <b>{cn}</b>: {escape(short)}")
+        done += 1
+        # Update progress every 5 routers or at the end
+        now_t = time.time()
+        if total > 3 and (done % 5 == 0 or done == total) and now_t - last_edit >= 2:
+            pct = done * 100 // total
+            filled = pct // 10
+            bar = "▓" * filled + "░" * (10 - filled)
+            try:
+                await msg.edit_text(
+                    f"🔎 Проверяю домены... {done}/{total}  {bar} {pct}%")
+                last_edit = now_t
+            except Exception:
+                pass
     report = "\n".join(results)
     server_list = ", ".join(server_domains) if server_domains else "(пусто)"
     await msg.edit_text(
