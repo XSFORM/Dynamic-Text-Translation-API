@@ -5199,14 +5199,13 @@ async def domain_monitor(app):
             domain_monitor_last_status[domain] = found_ok
 
             if found_ok:
-                if prev is None or prev is False:
-                    ok_cn = results[-1][0]
-                    await app.bot.send_message(
-                        ADMIN_ID,
-                        f"✅ Домен <code>{domain}</code> — доступен ({time_str})\n"
-                        f"Проверено через: <b>{ok_cn}</b>",
-                        parse_mode="HTML"
-                    )
+                ok_cn = results[-1][0]
+                await app.bot.send_message(
+                    ADMIN_ID,
+                    f"✅ Домен <code>{domain}</code> — доступен ({time_str})\n"
+                    f"Проверено через: <b>{ok_cn}</b>",
+                    parse_mode="HTML"
+                )
                 print(f"[domain_mon] {domain} OK at {time_str} (checked {len(results)} routers)")
             else:
                 # All routers showed block
