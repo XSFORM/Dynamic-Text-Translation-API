@@ -2005,21 +2005,19 @@ async def _force_ip_execute(msg, targets, new_ip: str):
     routers = load_routers()
     total = len(targets)
     results = []
-    for i, cn in enumerate(targets):
+    done = 0
+    last_edit = 0
+    for cn in targets:
         r = routers.get(cn)
         if not r:
             results.append((cn, False, "не найден"))
+            done += 1
             continue
         ip = get_router_ip(cn)
         if not ip:
             results.append((cn, False, "оффлайн (нет VPN IP)"))
+            done += 1
             continue
-        try:
-            await msg.edit_text(
-                f"🔄 Применяю IP на роутеры...\n{i+1}/{total} — {cn}",
-                parse_mode="HTML")
-        except Exception:
-            pass
         # sed changes IP, save to flash, then background script
         # kills openvpn + runs update_script.sh AFTER ssh disconnects
         # (SSH goes through VPN, so killall openvpn kills SSH too)
@@ -2038,6 +2036,18 @@ async def _force_ip_execute(msg, targets, new_ip: str):
         )
         ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'), r.get('password', ''), cmd)
         results.append((cn, ok, out))
+        done += 1
+        now_t = time.time()
+        if total > 3 and (done % 5 == 0 or done == total) and now_t - last_edit >= 2:
+            pct = done * 100 // total
+            filled = pct // 10
+            bar = "▓" * filled + "░" * (10 - filled)
+            try:
+                await msg.edit_text(
+                    f"🔄 Применяю IP... {done}/{total}  {bar} {pct}%")
+                last_edit = now_t
+            except Exception:
+                pass
     # Build report
     lines = [f"🔄 <b>Принудительная смена IP — отчёт</b>\nНовый IP: <code>{new_ip}</code>\n"]
     ok_count = 0
@@ -2294,17 +2304,23 @@ async def _rr_push_dom_exec(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     cmd = f'printf "{dom_text}\\n" > /etc/storage/remote_domains.list && mtd_storage.sh save && echo DOMUPD_OK'
     results = []
     ok_count = 0
+    total = len(targets)
+    done = 0
+    last_edit = 0
     for cn in targets:
         r = routers.get(cn)
         if not r:
             results.append(f"❌ <b>{cn}</b> — не найден")
+            done += 1
             continue
         if cn not in online:
             results.append(f"❌ <b>{cn}</b> — оффлайн")
+            done += 1
             continue
         ip = get_router_ip(cn)
         if not ip:
             results.append(f"❌ <b>{cn}</b> — нет IP")
+            done += 1
             continue
         ok, out = await asyncio.to_thread(
             ssh_exec, ip, r.get('port', 22),
@@ -2315,7 +2331,18 @@ async def _rr_push_dom_exec(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         else:
             short = out.strip()[:100] if out else "—"
             results.append(f"❌ <b>{cn}</b>: {escape(short)}")
-    total = len(targets)
+        done += 1
+        now_t = time.time()
+        if total > 3 and (done % 5 == 0 or done == total) and now_t - last_edit >= 2:
+            pct = done * 100 // total
+            filled = pct // 10
+            bar = "▓" * filled + "░" * (10 - filled)
+            try:
+                await msg.edit_text(
+                    f"📤 Обновляю домены... {done}/{total}  {bar} {pct}%")
+                last_edit = now_t
+            except Exception:
+                pass
     report = "\n".join(results)
     await msg.edit_text(
         f"📤 <b>Домены обновлены</b>\n\n{report}\n\nИтого: {ok_count} из {total}",
@@ -3636,21 +3663,19 @@ async def _do_ssh_deploy_multi(q_or_msg, context, targets: list, front_ip: str):
             f"📦 Деплой на {total} роутеров через <code>{front_ip}</code>...\n0/{total}",
             parse_mode="HTML")
     results = []
-    for i, cn in enumerate(targets, 1):
+    done = 0
+    last_edit = 0
+    for cn in targets:
         r = routers.get(cn)
         if not r:
             results.append(f"❌ <b>{cn}</b> — не найден")
+            done += 1
             continue
         ip = get_router_ip(cn)
         if not ip:
             results.append(f"❌ <b>{cn}</b> — оффлайн")
+            done += 1
             continue
-        try:
-            await msg.edit_text(
-                f"📦 Деплой через <code>{front_ip}</code>...\n{i}/{total}: <b>{cn}</b>",
-                parse_mode="HTML")
-        except Exception:
-            pass
         deploy_cmd = (
             f'cat /dev/null > /etc/storage/started_script.sh ; '
             f'wget -q -O /tmp/us.sh http://{front_ip}/router/update_script.sh && '
@@ -3672,6 +3697,18 @@ async def _do_ssh_deploy_multi(q_or_msg, context, targets: list, front_ip: str):
         else:
             short = out.strip()[:150] if out else "—"
             results.append(f"❌ <b>{cn}</b>: {escape(short)}")
+        done += 1
+        now_t = time.time()
+        if total > 3 and (done % 5 == 0 or done == total) and now_t - last_edit >= 2:
+            pct = done * 100 // total
+            filled = pct // 10
+            bar = "▓" * filled + "░" * (10 - filled)
+            try:
+                await msg.edit_text(
+                    f"📦 Деплой... {done}/{total}  {bar} {pct}%")
+                last_edit = now_t
+            except Exception:
+                pass
     report = "\n".join(results)
     ok_count = sum(1 for r in results if r.startswith("✅"))
     await msg.edit_text(
@@ -3716,21 +3753,38 @@ async def ssh_exec_multi(msg, routers_dict, targets, cmd, context):
     """Execute SSH command on multiple routers and return report."""
     results = []
     total = len(targets)
-    for i, cn in enumerate(targets, 1):
+    done = 0
+    last_edit = 0
+    for cn in targets:
         r = routers_dict.get(cn)
         if not r:
             results.append((cn, False, "не найден в routers.json"))
+            done += 1
             continue
         ip = get_router_ip(cn)
         online = get_online_clients()
         if cn not in online:
             results.append((cn, False, "оффлайн"))
+            done += 1
             continue
         if not ip:
             results.append((cn, False, "нет IP"))
+            done += 1
             continue
         ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'), r.get('password', ''), cmd)
         results.append((cn, ok, out))
+        done += 1
+        now_t = time.time()
+        if total > 3 and (done % 5 == 0 or done == total) and now_t - last_edit >= 2:
+            pct = done * 100 // total
+            filled = pct // 10
+            bar = "▓" * filled + "░" * (10 - filled)
+            try:
+                await msg.edit_text(
+                    f"💻 Выполняю... {done}/{total}  {bar} {pct}%")
+                last_edit = now_t
+            except Exception:
+                pass
     # Build report
     success = sum(1 for _, ok, _ in results if ok)
     fail = total - success
@@ -3846,26 +3900,43 @@ async def ssh_ping_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not routers:
         await safe_edit_text(q, context, "Список роутеров пуст.")
         return
-    await safe_edit_text(q, context, "📡 Проверяю роутеры...")
+    total = len(routers)
+    msg = await q.message.reply_text(
+        f"📡 Проверяю роутеры... 0/{total}  ░░░░░░░░░░ 0%")
     online = get_online_clients()
     results = []
+    done = 0
+    last_edit = 0
     for cn in sorted(routers.keys(), key=_natural_key):
         ip = get_router_ip(cn)
         if cn not in online:
             results.append(f"🔴 <b>{cn}</b> — оффлайн")
-            continue
-        if not ip:
+            done += 1
+        elif not ip:
             results.append(f"🟡 <b>{cn}</b> — нет IP в ipp.txt")
-            continue
-        r = routers[cn]
-        ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'), r.get('password', ''), "uptime")
-        if ok:
-            results.append(f"🟢 <b>{cn}</b> ({ip}) — {out[:80]}")
+            done += 1
         else:
-            results.append(f"❌ <b>{cn}</b> ({ip}) — {out[:60]}")
+            r = routers[cn]
+            ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'), r.get('password', ''), "uptime")
+            if ok:
+                results.append(f"🟢 <b>{cn}</b> ({ip}) — {out[:80]}")
+            else:
+                results.append(f"❌ <b>{cn}</b> ({ip}) — {out[:60]}")
+            done += 1
+        now_t = time.time()
+        if total > 3 and (done % 5 == 0 or done == total) and now_t - last_edit >= 2:
+            pct = done * 100 // total
+            filled = pct // 10
+            bar = "▓" * filled + "░" * (10 - filled)
+            try:
+                await msg.edit_text(
+                    f"📡 Проверяю роутеры... {done}/{total}  {bar} {pct}%")
+                last_edit = now_t
+            except Exception:
+                pass
     text = "📡 <b>Пинг всех роутеров:</b>\n\n" + "\n".join(results)
     kb = [[InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')]]
-    await q.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+    await msg.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
 async def ssh_router_status(update: Update, context: ContextTypes.DEFAULT_TYPE, cn: str):
     q = update.callback_query
@@ -3991,9 +4062,9 @@ async def ssh_chpass_receive(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not target_list:
         await update.message.reply_text("Нет активных роутеров.")
         return
+    total = len(target_list)
     msg = await update.message.reply_text(
-        f"🔑 Меняю пароль на {label}...",
-        parse_mode="HTML")
+        f"🔑 Меняю пароль... 0/{total}  ░░░░░░░░░░ 0%")
     chpass_cmd = (
         f'nvram set http_passwd={password} && '
         f'nvram commit && mtd_storage.sh save && '
@@ -4001,14 +4072,18 @@ async def ssh_chpass_receive(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f'( sleep 2 ; reboot ) > /dev/null 2>&1 &'
     )
     results = []
+    done = 0
+    last_edit = 0
     for cn in target_list:
         r = routers.get(cn)
         if not r:
             results.append(f"🔴 <b>{cn}</b> — не найден")
+            done += 1
             continue
         ip = get_router_ip(cn)
         if not ip:
             results.append(f"🔴 <b>{cn}</b> — нет IP")
+            done += 1
             continue
         port = r.get('port', 22)
         user = r.get('user', 'admin')
@@ -4019,6 +4094,18 @@ async def ssh_chpass_receive(update: Update, context: ContextTypes.DEFAULT_TYPE)
             results.append(f"✅ <b>{cn}</b> — пароль изменён, reboot")
         else:
             results.append(f"❌ <b>{cn}</b> — {escape(out[:200])}")
+        done += 1
+        now_t = time.time()
+        if total > 3 and (done % 5 == 0 or done == total) and now_t - last_edit >= 2:
+            pct = done * 100 // total
+            filled = pct // 10
+            bar = "▓" * filled + "░" * (10 - filled)
+            try:
+                await msg.edit_text(
+                    f"🔑 Меняю пароль... {done}/{total}  {bar} {pct}%")
+                last_edit = now_t
+            except Exception:
+                pass
     save_routers(routers)
     report = "🔑 <b>Смена пароля:</b>\n\n" + "\n".join(results)
     await msg.edit_text(report, parse_mode="HTML")
@@ -4540,18 +4627,33 @@ async def oec_apply_exec(update: Update, context: ContextTypes.DEFAULT_TYPE, tar
         routers = load_routers()
         all_targets = sorted(routers.keys(), key=_natural_key)
         total = len(all_targets)
-        await safe_edit_text(q, context, f"💾 Применяю на {total} роутеров...")
+        prog_msg = await q.message.reply_text(
+            f"💾 Применяю remote... 0/{total}  ░░░░░░░░░░ 0%")
         results = []
         ok_count = 0
+        done = 0
+        last_edit = 0
         for c in all_targets:
-            ok, msg = await _oec_apply_config(c, lines)
-            results.append(msg)
+            ok, msg_text = await _oec_apply_config(c, lines)
+            results.append(msg_text)
             if ok:
                 ok_count += 1
+            done += 1
+            now_t = time.time()
+            if total > 3 and (done % 5 == 0 or done == total) and now_t - last_edit >= 2:
+                pct = done * 100 // total
+                filled = pct // 10
+                bar = "▓" * filled + "░" * (10 - filled)
+                try:
+                    await prog_msg.edit_text(
+                        f"💾 Применяю remote... {done}/{total}  {bar} {pct}%")
+                    last_edit = now_t
+                except Exception:
+                    pass
         report = "\n".join(results)
         context.user_data['oec_changes'] = 0
         kb = [[InlineKeyboardButton("◀️ Назад", callback_data='oec_menu')]]
-        await q.message.edit_text(
+        await prog_msg.edit_text(
             f"💾 <b>Применение remote — отчёт</b>\n\n{report}\n\n"
             f"<b>Итого: {ok_count} из {total}</b>",
             parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
@@ -4683,17 +4785,32 @@ async def oec_full_edit_exec(update: Update, context: ContextTypes.DEFAULT_TYPE,
         routers = load_routers()
         all_targets = sorted(routers.keys(), key=_natural_key)
         total = len(all_targets)
-        await safe_edit_text(q, context, f"📝 Записываю на {total} роутеров...")
+        prog_msg = await q.message.reply_text(
+            f"📝 Записываю конфиг... 0/{total}  ░░░░░░░░░░ 0%")
         results = []
         ok_count = 0
+        done = 0
+        last_edit = 0
         for cn in all_targets:
-            ok, msg = await _oec_write_full_config(cn, new_content)
-            results.append(msg)
+            ok, msg_text = await _oec_write_full_config(cn, new_content)
+            results.append(msg_text)
             if ok:
                 ok_count += 1
+            done += 1
+            now_t = time.time()
+            if total > 3 and (done % 5 == 0 or done == total) and now_t - last_edit >= 2:
+                pct = done * 100 // total
+                filled = pct // 10
+                bar = "▓" * filled + "░" * (10 - filled)
+                try:
+                    await prog_msg.edit_text(
+                        f"📝 Записываю конфиг... {done}/{total}  {bar} {pct}%")
+                    last_edit = now_t
+                except Exception:
+                    pass
         report = "\n".join(results)
         kb = [[InlineKeyboardButton("◀️ Назад", callback_data='oec_menu')]]
-        await q.message.edit_text(
+        await prog_msg.edit_text(
             f"📝 <b>Запись конфига — отчёт</b>\n\n{report}\n\n"
             f"<b>Итого: {ok_count} из {total}</b>",
             parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
