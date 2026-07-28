@@ -18,6 +18,7 @@ import re
 import hashlib
 import tempfile
 import requests
+import shlex
 import shutil
 import socket
 import logging
@@ -269,9 +270,9 @@ def ssh_exec_key(ip: str, port: int, user: str, key_path: str, command: str,
                        timeout=SSH_TIMEOUT, look_for_keys=False, allow_agent=False)
         if sudo_pass:
             # Use sudo with password via stdin
-            cmd = f"echo '{sudo_pass}' | sudo -S bash -c '{command}'"
+            cmd = f"echo {shlex.quote(sudo_pass)} | sudo -S bash -c {shlex.quote(command)}"
         else:
-            cmd = f"sudo {command}" if user != "root" else command
+            cmd = f"sudo bash -c {shlex.quote(command)}" if user != "root" else command
         stdin, stdout, stderr = client.exec_command(cmd, timeout=30)
         out = stdout.read().decode("utf-8", errors="replace").strip()
         err = stderr.read().decode("utf-8", errors="replace").strip()
@@ -6574,8 +6575,13 @@ async def gost_getroot_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             pass
 
         if ok and "ROOT_ENABLED_OK" in out:
-            # Verify root login works
+            # Wait for sshd to restart, then verify root login
+            await asyncio.sleep(3)
             ok2, out2 = ssh_exec(ip, 22, "root", root_pass, "whoami")
+            if not (ok2 and "root" in out2):
+                # Retry once after extra wait
+                await asyncio.sleep(3)
+                ok2, out2 = ssh_exec(ip, 22, "root", root_pass, "whoami")
             if ok2 and "root" in out2:
                 await msg.edit_text(
                     f"✅ <b>Root доступ включён на {ip}</b>\n\n"
