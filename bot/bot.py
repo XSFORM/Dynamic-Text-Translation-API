@@ -2019,7 +2019,7 @@ async def _force_ip_execute(msg, targets, new_ip: str):
             results.append((cn, False, "оффлайн (нет VPN IP)"))
             done += 1
             continue
-        # sed changes IP, save to flash, then background script
+        # sed changes config file + nvram updates the web UI / boot setting
         # kills openvpn + runs update_script.sh AFTER ssh disconnects
         # (SSH goes through VPN, so killall openvpn kills SSH too)
         cmd = (
@@ -2028,6 +2028,9 @@ async def _force_ip_execute(msg, targets, new_ip: str):
             f'PORT=$(echo "$OLD" | awk \'{{print $3}}\') ; '
             f'[ -z "$PORT" ] && PORT=443 ; '
             f'sed -i "s|^remote .*|remote {new_ip} $PORT|" $CONF ; '
+            # Update NVRAM so web UI and reboot use new IP
+            f'nvram set vpnc_peer={new_ip} ; '
+            f'nvram commit ; '
             f'mtd_storage.sh save 2>/dev/null ; '
             f'NEW=$(grep "^remote " $CONF) ; '
             f'echo "OLD: $OLD" ; echo "NEW: $NEW" ; '
