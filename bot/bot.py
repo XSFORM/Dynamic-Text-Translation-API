@@ -4218,7 +4218,20 @@ async def ssh_heal_router(update: Update, context: ContextTypes.DEFAULT_TYPE, cn
         await safe_edit_text(q, context, f"🔴 {cn} — нет IP.")
         return
     await safe_edit_text(q, context, f"🩹 Лечу <b>{cn}</b>...", parse_mode="HTML")
-    cmd = "cat /dev/null > /etc/storage/started_script.sh && mtd_storage.sh save && echo HEALED_OK"
+    cmd = (
+        # Clear autostart script
+        "cat /dev/null > /etc/storage/started_script.sh ; "
+        # Remove update_script
+        "rm -f /etc/storage/update_script.sh /tmp/update_script.sh ; "
+        # Remove domains list
+        "rm -f /etc/storage/remote_domains.list ; "
+        # Kill running update_script processes
+        "killall update_script.sh 2>/dev/null ; "
+        # Remove cron entry for update_script
+        "crontab -l 2>/dev/null | grep -v 'update_script' | crontab - ; "
+        # Save to flash
+        "mtd_storage.sh save && echo HEALED_OK"
+    )
     ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'), r.get('password', ''), cmd)
     if ok and "HEALED_OK" in out:
         text = f"🩹 <b>{cn}</b>: Вылечен. Перезагрузите роутер для применения."
