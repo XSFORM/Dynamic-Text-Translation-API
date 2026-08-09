@@ -194,14 +194,20 @@ def subnet_get_all_ips(subnet_str: str, skip: list) -> list:
     return [f"{prefix}.{i}" for i in range(256) if i not in skip]
 
 def subnet_next_ip(pool_data: dict) -> Optional[str]:
-    """Return next available IP from subnet. Skips blocked_ips and skip_ips."""
+    """Return next available IP from subnet after current IP.
+    Skips blocked_ips and skip_ips. Wraps around if needed."""
     all_ips = subnet_get_all_ips(
         pool_data.get('subnet', ''),
         pool_data.get('skip_ips', [0, 255]))
     blocked = set(pool_data.get('blocked_ips', []))
     current = pool_data.get('current_ip', '')
-    for ip in all_ips:
-        if ip not in blocked and ip != current:
+    try:
+        idx = all_ips.index(current)
+        ordered = all_ips[idx + 1:] + all_ips[:idx]
+    except ValueError:
+        ordered = all_ips
+    for ip in ordered:
+        if ip not in blocked:
             return ip
     return None
 
