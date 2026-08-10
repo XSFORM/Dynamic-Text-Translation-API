@@ -2145,7 +2145,7 @@ async def _force_ip_execute(msg, targets, new_ip: str):
             f'NEW=$(grep "^remote " $CONF) ; '
             f'echo "OLD: $OLD" ; echo "NEW: $NEW" ; '
             f'nohup sh -c "sleep 2; killall -9 openvpn 2>/dev/null; sleep 3; '
-            f'restart_vpnc" > /dev/null 2>&1 & '
+            f'openvpn --cd /etc/openvpn/client --config client.conf --daemon openvpn-cli" > /dev/null 2>&1 & '
             f'echo "===DONE==="'
         )
         ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'), r.get('password', ''), cmd)
