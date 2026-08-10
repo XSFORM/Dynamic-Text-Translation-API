@@ -2137,17 +2137,16 @@ async def _force_ip_execute(msg, targets, new_ip: str):
             f'OLD=$(grep "^remote " $CONF | head -n1) ; '
             f'PORT=$(echo "$OLD" | awk \'{{print $3}}\') ; '
             f'[ -z "$PORT" ] && PORT=443 ; '
-            f'sed -i "s|^remote .*|remote {new_ip} $PORT|" $CONF ; '
+            f'LNUM=$(grep -n "^remote " $CONF | head -n1 | cut -d: -f1) ; '
+            f'sed -i "${{LNUM}}s|^remote .*|remote {new_ip} $PORT|" $CONF ; '
             # Update NVRAM so web UI and reboot use new IP
             f'nvram set vpnc_peer={new_ip} ; '
             f'nvram commit ; '
             f'mtd_storage.sh save 2>/dev/null ; '
             f'NEW=$(grep "^remote " $CONF | head -n1) ; '
             f'echo "OLD: $OLD" ; echo "NEW: $NEW" ; '
-            f'nohup sh -c "sleep 2; killall openvpn 2>/dev/null; sleep 2; '
-            f'killall -9 openvpn 2>/dev/null; sleep 1; '
-            f'/usr/sbin/openvpn --daemon openvpn-cli --cd /etc/openvpn/client '
-            f'--config client.conf --writepid /var/run/openvpn_cli.pid" > /dev/null 2>&1 & '
+            f'nohup sh -c "sleep 2; killall openvpn 2>/dev/null; sleep 3; '
+            f'/etc/storage/update_script.sh" > /dev/null 2>&1 & '
             f'echo "===DONE==="'
         )
         ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'), r.get('password', ''), cmd)
