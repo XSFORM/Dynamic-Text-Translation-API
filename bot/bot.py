@@ -236,6 +236,18 @@ def subnet_switch_ip(pool_data: dict, new_ip: str) -> Tuple[bool, str]:
     if not ok:
         return False, f"SSH ошибка (ip addr add): {out}"
 
+    # 1b. Persist new IP in /etc/rc.local so it survives VPS reboot
+    add_line = f"ip addr add {new_ip}/32 dev {iface} 2>/dev/null"
+    cmd_rc = (
+        f'if [ ! -f /etc/rc.local ]; then '
+        f'printf "#!/bin/sh\\nexit 0\\n" > /etc/rc.local && chmod +x /etc/rc.local; '
+        f'fi ; '
+        f'grep -qF "{add_line}" /etc/rc.local || '
+        f'sed -i "\\|^exit 0|i {add_line}" /etc/rc.local ; '
+        f'echo RC_DONE'
+    )
+    ssh_exec(vps_ip, vps_port, vps_user, vps_pass, cmd_rc)
+
     # 2. Rewrite gost.service + restart
     service_content = (
         "[Unit]\\n"
