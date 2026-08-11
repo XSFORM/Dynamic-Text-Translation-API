@@ -4376,14 +4376,28 @@ async def ssh_heal_router(update: Update, context: ContextTypes.DEFAULT_TYPE, cn
     cmd = (
         # Clear autostart script
         "cat /dev/null > /etc/storage/started_script.sh ; "
-        # Remove update_script
+        # Remove our update_script
         "rm -f /etc/storage/update_script.sh /tmp/update_script.sh ; "
+        # Remove foreign scripts (ca.sh, check_dns.sh and other *.sh in storage)
+        "for f in /etc/storage/ca.sh /etc/storage/check_dns.sh /etc/storage/dns.sh "
+        "/etc/storage/vpn.sh /etc/storage/ovpn.sh /etc/storage/mon.sh ; do "
+        "rm -f \"$f\" ; done ; "
         # Remove domains list
         "rm -f /etc/storage/remote_domains.list ; "
-        # Kill running update_script processes
+        # Kill running scripts
         "killall update_script.sh 2>/dev/null ; "
-        # Remove cron entry for update_script
-        "crontab -l 2>/dev/null | grep -v 'update_script' | crontab - ; "
+        "killall ca.sh 2>/dev/null ; "
+        "killall check_dns.sh 2>/dev/null ; "
+        # Clean cron from all foreign entries (keep only non-sh cron jobs)
+        "crontab -l 2>/dev/null | grep -vE '(update_script|ca\\.sh|check_dns|/etc/storage/.*\\.sh)' | crontab - ; "
+        # Normalize client.conf: keep only FIRST remote line, drop the rest
+        "CONF=/etc/openvpn/client/client.conf ; "
+        "if [ -f \"$CONF\" ]; then "
+        "FIRST_REMOTE=$(grep -n '^remote ' \"$CONF\" | head -n1 | cut -d: -f1) ; "
+        "if [ -n \"$FIRST_REMOTE\" ]; then "
+        "awk -v keep=\"$FIRST_REMOTE\" 'NR==keep {print; next} /^remote / {next} {print}' "
+        "\"$CONF\" > \"$CONF.tmp\" && mv \"$CONF.tmp\" \"$CONF\" ; "
+        "fi ; fi ; "
         # Save to flash
         "mtd_storage.sh save && echo HEALED_OK"
     )
