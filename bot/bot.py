@@ -2246,6 +2246,212 @@ async def force_ip_exec_selected(update: Update, context: ContextTypes.DEFAULT_T
     kb = [[InlineKeyboardButton("🏠 Меню", callback_data='home')]]
     await q.message.edit_text(report, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
+# =====================================================================
+#  CHANGE PORT — Change OpenVPN port on routers
+# =====================================================================
+async def change_port_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    context.user_data['await_change_port'] = True
+    await safe_edit_text(q, context,
+        f"🔌 <b>Смена порта OpenVPN</b>\n\n"
+        f"Введите новый порт (1-65535).\n"
+        f"<i>Убедитесь что сервер слушает этот порт.</i>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Отмена", callback_data="rr_cancel")]]))
+
+async def change_port_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get('await_change_port'):
+        return
+    text = update.message.text.strip()
+    if not text.isdigit() or not (1 <= int(text) <= 65535):
+        await update.message.reply_text("Неверный порт (1-65535). Повторите или отмена.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("❌ Отмена", callback_data="rr_cancel")]]))
+        return
+    new_port = int(text)
+    context.user_data.pop('await_change_port', None)
+    context.user_data['change_port_new'] = new_port
+    context.user_data['change_port_selected'] = set()
+    routers = load_routers()
+    if not routers:
+        await update.message.reply_text(
+            f"Порт <code>{new_port}</code> — список роутеров пуст.",
+            parse_mode="HTML")
+        return
+    online = get_online_clients()
+    cnt_online = sum(1 for cn in routers if cn in online)
+    kb = [
+        [InlineKeyboardButton(f"🌐 Все роутеры ({len(routers)})", callback_data='chport_all')],
+        [InlineKeyboardButton("🖥 Один роутер", callback_data='chport_one')],
+        [InlineKeyboardButton("☑️ Несколько", callback_data='chport_multi')],
+        [InlineKeyboardButton("❌ Отмена", callback_data='home')],
+    ]
+    await update.message.reply_text(
+        f"🔌 Новый порт: <code>{new_port}</code>\n\n"
+        f"Онлайн роутеров: <b>{cnt_online}/{len(routers)}</b>\n\n"
+        f"Выберите на какие роутеры применить:",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+async def change_port_select_one(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    routers = load_routers()
+    online = get_online_clients()
+    kb = []
+    for cn in sorted(routers.keys(), key=_natural_key):
+        icon = "🟢" if cn in online else "🔴"
+        kb.append([InlineKeyboardButton(f"{icon} {cn}", callback_data=f'chport_run:{cn}')])
+    kb.append([InlineKeyboardButton("◀️ Назад", callback_data='home')])
+    await safe_edit_text(q, context, "🖥 Выберите роутер:", reply_markup=InlineKeyboardMarkup(kb))
+
+async def change_port_select_multi(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    routers = load_routers()
+    online = get_online_clients()
+    selected = context.user_data.get('change_port_selected', set())
+    kb = []
+    for cn in sorted(routers.keys(), key=_natural_key):
+        icon = "🟢" if cn in online else "🔴"
+        check = "✅" if cn in selected else "⬜"
+        kb.append([InlineKeyboardButton(f"{check} {icon} {cn}", callback_data=f'chport_t:{cn}')])
+    kb.append([InlineKeyboardButton("▶️ Применить", callback_data='chport_go')])
+    kb.append([InlineKeyboardButton("◀️ Назад", callback_data='home')])
+    await safe_edit_text(q, context,
+        f"☑️ Выберите роутеры (выбрано: {len(selected)}):",
+        reply_markup=InlineKeyboardMarkup(kb))
+
+async def change_port_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE, cn: str):
+    q = update.callback_query
+    await q.answer()
+    selected = context.user_data.get('change_port_selected', set())
+    if cn in selected:
+        selected.discard(cn)
+    else:
+        selected.add(cn)
+    context.user_data['change_port_selected'] = selected
+    await change_port_select_multi(update, context)
+
+async def _change_port_execute(msg, targets, new_port: int):
+    """SSH to routers, change port in client.conf + NVRAM, restart OpenVPN."""
+    routers = load_routers()
+    total = len(targets)
+    results = []
+    done = 0
+    last_edit = 0
+    for cn in targets:
+        r = routers.get(cn)
+        if not r:
+            results.append((cn, False, "не найден"))
+            done += 1
+            continue
+        ip = get_router_ip(cn)
+        if not ip:
+            results.append((cn, False, "оффлайн (нет VPN IP)"))
+            done += 1
+            continue
+        cmd = (
+            f'CONF=/etc/openvpn/client/client.conf ; '
+            f'OLD=$(grep "^remote " $CONF | head -n1) ; '
+            f'IP=$(echo "$OLD" | awk \'{{print $2}}\') ; '
+            f'LNUM=$(grep -n "^remote " $CONF | head -n1 | cut -d: -f1) ; '
+            f'sed -i "${{LNUM}}s|^remote .*|remote $IP {new_port}|" $CONF ; '
+            f'nvram set vpnc_ov_port={new_port} ; '
+            f'nvram commit ; '
+            f'mtd_storage.sh save 2>/dev/null ; '
+            f'NEW=$(grep "^remote " $CONF | head -n1) ; '
+            f'echo "OLD: $OLD" ; echo "NEW: $NEW" ; '
+            f'/sbin/restart_vpn_client ; '
+            f'echo "===DONE==="'
+        )
+        ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'), r.get('password', ''), cmd)
+        results.append((cn, ok, out))
+        done += 1
+        now_t = time.time()
+        if total > 3 and (done % 5 == 0 or done == total) and now_t - last_edit >= 2:
+            pct = done * 100 // total
+            filled = pct // 10
+            bar = "▓" * filled + "░" * (10 - filled)
+            try:
+                await msg.edit_text(
+                    f"🔌 Меняю порт... {done}/{total}  {bar} {pct}%")
+                last_edit = now_t
+            except Exception:
+                pass
+    # Build report
+    lines = [f"🔌 <b>Смена порта — отчёт</b>\nНовый порт: <code>{new_port}</code>\n"]
+    ok_count = 0
+    for cn, ok, out in results:
+        if ok:
+            old_line = ""
+            new_line = ""
+            for ln in out.split('\n'):
+                ln_s = ln.strip()
+                if ln_s.startswith('OLD: '):
+                    old_line = ln_s[5:]
+                elif ln_s.startswith('NEW: '):
+                    new_line = ln_s[5:]
+            applied = str(new_port) in new_line
+            if applied:
+                lines.append(f"✅ <b>{cn}</b>: {new_line}")
+                ok_count += 1
+            else:
+                lines.append(f"⚠️ <b>{cn}</b>: {new_line or out[-80:]}")
+        else:
+            lines.append(f"❌ <b>{cn}</b>: {escape(out[:80])}")
+    lines.append(f"\nИтого: {ok_count}/{total} применено")
+    return "\n".join(lines)
+
+async def change_port_exec_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    new_port = context.user_data.get('change_port_new', 0)
+    if not new_port:
+        await safe_edit_text(q, context, "Ошибка: порт не задан. Начните заново.")
+        return
+    routers = load_routers()
+    targets = sorted(routers.keys(), key=_natural_key)
+    if not targets:
+        await safe_edit_text(q, context, "Список роутеров пуст.")
+        return
+    await safe_edit_text(q, context, f"🔌 Меняю порт на всех роутерах...\n0/{len(targets)}")
+    report = await _change_port_execute(q.message, targets, new_port)
+    kb = [[InlineKeyboardButton("🏠 Меню", callback_data='home')]]
+    await q.message.edit_text(report, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+async def change_port_exec_one(update: Update, context: ContextTypes.DEFAULT_TYPE, cn: str):
+    q = update.callback_query
+    await q.answer()
+    new_port = context.user_data.get('change_port_new', 0)
+    if not new_port:
+        await safe_edit_text(q, context, "Ошибка: порт не задан. Начните заново.")
+        return
+    await safe_edit_text(q, context, f"🔌 Меняю порт на <b>{cn}</b>...", parse_mode="HTML")
+    report = await _change_port_execute(q.message, [cn], new_port)
+    kb = [[InlineKeyboardButton("🏠 Меню", callback_data='home')]]
+    await q.message.edit_text(report, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+async def change_port_exec_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    new_port = context.user_data.get('change_port_new', 0)
+    selected = context.user_data.get('change_port_selected', set())
+    if not new_port:
+        await safe_edit_text(q, context, "Ошибка: порт не задан. Начните заново.")
+        return
+    if not selected:
+        await safe_edit_text(q, context, "Ни один роутер не выбран.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀️ Назад", callback_data='chport_multi')]]))
+        return
+    targets = sorted(selected, key=_natural_key)
+    await safe_edit_text(q, context, f"🔌 Меняю порт на {len(targets)} роутерах...\n0/{len(targets)}")
+    report = await _change_port_execute(q.message, targets, new_port)
+    kb = [[InlineKeyboardButton("🏠 Меню", callback_data='home')]]
+    await q.message.edit_text(report, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
 async def rr_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     hist = rr_read_history()
@@ -2639,7 +2845,7 @@ async def rr_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def rr_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer("Отменено")
     for k in ['await_rr_ip', 'await_rr_domain_add', 'await_force_ip',
-              'await_oec_radd', 'await_oec_fedit', 'await_ssh_add']:
+              'await_change_port', 'await_oec_radd', 'await_oec_fedit', 'await_ssh_add']:
         context.user_data.pop(k, None)
     await safe_edit_text(q, context, "Отменено.")
 
@@ -2716,7 +2922,8 @@ def get_main_keyboard():
         [InlineKeyboardButton("─── Remote Refresh ───", callback_data='noop')],
         [InlineKeyboardButton("📡 IP роутеров", callback_data='rr_current_ip'),
          InlineKeyboardButton("✏️ Сменить IP", callback_data='rr_set_ip')],
-        [InlineKeyboardButton("🔄 Принудительная смена IP", callback_data='force_ip')],
+        [InlineKeyboardButton("🔄 Смена IP", callback_data='force_ip'),
+         InlineKeyboardButton("🔌 Смена порта", callback_data='change_port')],
         [InlineKeyboardButton("🔍 IP Scan", callback_data='rr_ip_scan'),
          InlineKeyboardButton("🔍 Port Scan", callback_data='rr_port_scan')],
         [InlineKeyboardButton("📋 История IP", callback_data='rr_history'),
@@ -2942,6 +3149,9 @@ async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_T
     # Force IP text input
     if context.user_data.get('await_force_ip'):
         await force_ip_receive(update, context); return
+    # Change Port text input
+    if context.user_data.get('await_change_port'):
+        await change_port_receive(update, context); return
     # Remote Refresh text inputs
     if context.user_data.get('await_rr_ip'):
         await rr_set_ip_receive(update, context); return
@@ -3654,6 +3864,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith('force_ip_run:'):
         cn = data[len('force_ip_run:'):]
         await force_ip_exec_one(update, context, cn)
+
+    # --- Change Port callbacks ---
+    elif data == 'change_port':
+        await change_port_start(update, context)
+    elif data == 'chport_all':
+        await change_port_exec_all(update, context)
+    elif data == 'chport_one':
+        await change_port_select_one(update, context)
+    elif data == 'chport_multi':
+        await change_port_select_multi(update, context)
+    elif data.startswith('chport_t:'):
+        cn = data[len('chport_t:'):]
+        await change_port_toggle(update, context, cn)
+    elif data == 'chport_go':
+        await change_port_exec_selected(update, context)
+    elif data.startswith('chport_run:'):
+        cn = data[len('chport_run:'):]
+        await change_port_exec_one(update, context, cn)
 
     # --- Auto IP callbacks ---
     elif data == 'aip_menu':
