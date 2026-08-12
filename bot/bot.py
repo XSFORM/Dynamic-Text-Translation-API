@@ -2470,6 +2470,72 @@ async def change_port_exec_selected(update: Update, context: ContextTypes.DEFAUL
     kb = [[InlineKeyboardButton("🏠 Меню", callback_data='home')]]
     await q.message.edit_text(report, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
+async def check_router_ports(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """SSH into all routers and show current port from NVRAM."""
+    q = update.callback_query
+    await q.answer()
+    routers = load_routers()
+    if not routers:
+        await safe_edit_text(q, context, "Список роутеров пуст.")
+        return
+    online = get_online_clients()
+    await safe_edit_text(q, context, f"🔌 Читаю порты... 0/{len(routers)}")
+    results = []
+    done = 0
+    last_edit = 0
+    total = len(routers)
+    for cn in sorted(routers.keys(), key=_natural_key):
+        r = routers[cn]
+        ip = get_router_ip(cn)
+        if not ip:
+            results.append((cn, False, None, cn not in online))
+            done += 1
+            continue
+        ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'),
+                           r.get('password', ''), 'nvram get vpnc_ov_port')
+        port_val = out.strip() if ok else None
+        results.append((cn, ok, port_val, cn not in online))
+        done += 1
+        now_t = time.time()
+        if total > 5 and (done % 5 == 0 or done == total) and now_t - last_edit >= 2:
+            pct = done * 100 // total
+            filled = pct // 10
+            bar = "▓" * filled + "░" * (10 - filled)
+            try:
+                await q.message.edit_text(
+                    f"🔌 Читаю порты... {done}/{total}  {bar} {pct}%")
+                last_edit = now_t
+            except Exception:
+                pass
+    # Group by port
+    port_groups = {}
+    offline_list = []
+    err_list = []
+    for cn, ok, port_val, is_offline in results:
+        if is_offline and not ok:
+            offline_list.append(cn)
+        elif not ok:
+            err_list.append(cn)
+        else:
+            port_groups.setdefault(port_val, []).append(cn)
+    lines = ["🔌 <b>Порты роутеров</b>\n"]
+    for port_val in sorted(port_groups.keys(), key=lambda x: int(x) if x and x.isdigit() else 0):
+        cns = port_groups[port_val]
+        lines.append(f"<b>Порт {port_val}:</b> ({len(cns)})")
+        for cn in cns:
+            icon = "🟢" if cn in online else "🔴"
+            lines.append(f"  {icon} {cn}")
+        lines.append("")
+    if offline_list:
+        lines.append(f"⚫ <b>Оффлайн:</b> ({len(offline_list)})")
+        for cn in offline_list:
+            lines.append(f"  🔴 {cn}")
+    if err_list:
+        lines.append(f"❌ <b>Ошибка:</b> {', '.join(err_list)}")
+    kb = [[InlineKeyboardButton("🏠 Меню", callback_data='home')]]
+    await q.message.edit_text("\n".join(lines), parse_mode="HTML",
+                              reply_markup=InlineKeyboardMarkup(kb))
+
 async def rr_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     hist = rr_read_history()
@@ -2942,6 +3008,7 @@ def get_main_keyboard():
          InlineKeyboardButton("✏️ Сменить IP", callback_data='rr_set_ip')],
         [InlineKeyboardButton("🔄 Смена IP", callback_data='force_ip'),
          InlineKeyboardButton("🔌 Смена порта", callback_data='change_port')],
+        [InlineKeyboardButton("🔌 Порты роутеров", callback_data='check_ports')],
         [InlineKeyboardButton("🔍 IP Scan", callback_data='rr_ip_scan'),
          InlineKeyboardButton("🔍 Port Scan", callback_data='rr_port_scan')],
         [InlineKeyboardButton("📋 История IP", callback_data='rr_history'),
@@ -3884,6 +3951,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await force_ip_exec_one(update, context, cn)
 
     # --- Change Port callbacks ---
+    elif data == 'check_ports':
+        await check_router_ports(update, context)
     elif data == 'change_port':
         await change_port_start(update, context)
     elif data == 'chport_all':
