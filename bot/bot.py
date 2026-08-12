@@ -225,7 +225,16 @@ def subnet_switch_ip(pool_data: dict, new_ip: str) -> Tuple[bool, str]:
     iface = pool_data.get('interface', 'eth0')
     backend = pool_data.get('gost_backend', '')
     proto = pool_data.get('gost_protocol', 'udp')
-    gost_port = pool_data.get('gost_port', 443)
+    # Support multiple ports (gost_ports="443,995") with fallback to old gost_port
+    ports_raw = pool_data.get('gost_ports', pool_data.get('gost_port', '443'))
+    if isinstance(ports_raw, int):
+        gost_ports = [ports_raw]
+    elif isinstance(ports_raw, str):
+        gost_ports = [int(p.strip()) for p in ports_raw.split(',') if p.strip().isdigit()]
+    else:
+        gost_ports = [443]
+    if not gost_ports:
+        gost_ports = [443]
 
     if not all([vps_ip, vps_pass, backend]):
         return False, "Subnet Pool не настроен (нет VPS или backend)"
@@ -249,6 +258,7 @@ def subnet_switch_ip(pool_data: dict, new_ip: str) -> Tuple[bool, str]:
     ssh_exec(vps_ip, vps_port, vps_user, vps_pass, cmd_rc)
 
     # 2. Rewrite gost.service + restart
+    l_flags = " ".join(f"-L={proto}://{new_ip}:{p}/{backend}" for p in gost_ports)
     service_content = (
         "[Unit]\\n"
         "Description=GO Simple Tunnel\\n"
@@ -256,7 +266,7 @@ def subnet_switch_ip(pool_data: dict, new_ip: str) -> Tuple[bool, str]:
         "Wants=network.target\\n\\n"
         "[Service]\\n"
         "Type=simple\\n"
-        f"ExecStart=/usr/local/bin/gost -L={proto}://{new_ip}:{gost_port}/{backend}\\n"
+        f"ExecStart=/usr/local/bin/gost {l_flags}\\n"
         "Restart=on-failure\\n\\n"
         "[Install]\\n"
         "WantedBy=multi-user.target"
@@ -357,8 +367,16 @@ def ssh_exec(ip: str, port: int, user: str, password: str, command: str) -> Tupl
         client.connect(ip, port=port, username=user, password=password,
                        timeout=SSH_TIMEOUT, look_for_keys=False, allow_agent=False)
         stdin, stdout, stderr = client.exec_command(command, timeout=SSH_CMD_TIMEOUT)
-        out = stdout.read().decode("utf-8", errors="replace").strip()
-        err = stderr.read().decode("utf-8", errors="replace").strip()
+        # Set channel read timeout so read() doesn't hang when VPN drops
+        stdout.channel.settimeout(SSH_CMD_TIMEOUT)
+        try:
+            out = stdout.read().decode("utf-8", errors="replace").strip()
+        except socket.timeout:
+            out = "(таймаут чтения — VPN рестарт)"
+        try:
+            err = stderr.read().decode("utf-8", errors="replace").strip()
+        except socket.timeout:
+            err = ""
         result = out if out else err
         return True, result if result else "(пустой вывод)"
     except paramiko.AuthenticationException:
@@ -5473,7 +5491,7 @@ SUBNET_SETUP_FIELDS = [
     ('interface', 'Сетевой интерфейс на VPS', 'eth0'),
     ('gost_backend', 'GOST backend IP:port', None),
     ('gost_protocol', 'GOST протокол (udp/tcp)', 'udp'),
-    ('gost_port', 'GOST порт', '443'),
+    ('gost_ports', 'GOST порты (через запятую, напр. 443,995)', '443'),
 ]
 
 async def subnet_setup_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5512,7 +5530,6 @@ async def _subnet_setup_ask(q, context):
         context.user_data.pop('subnet_setup_step', None)
         # Convert numeric fields
         data['vps_port'] = int(data.get('vps_port', 22))
-        data['gost_port'] = int(data.get('gost_port', 443))
         data.setdefault('current_ip', '')
         data.setdefault('used_ips', [])
         data.setdefault('blocked_ips', [])
@@ -5579,7 +5596,14 @@ async def subnet_setup_receive(update: Update, context: ContextTypes.DEFAULT_TYP
         # Single field edit mode
         context.user_data.pop('subnet_setup_single', None)
         pool = load_subnet_pool()
-        if key in ('vps_port', 'gost_port'):
+        if key == 'gost_ports':
+            # Validate comma-separated ports
+            parts = [p.strip() for p in text.split(',')]
+            if not all(p.isdigit() and 1 <= int(p) <= 65535 for p in parts if p):
+                await update.message.reply_text("Введите порты через запятую (напр. 443,995).")
+                return True
+            text = ','.join(parts)
+        elif key == 'vps_port':
             try:
                 text = int(text)
             except ValueError:
