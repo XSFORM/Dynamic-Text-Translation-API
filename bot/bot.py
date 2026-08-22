@@ -3571,6 +3571,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="HTML")
             else:
                 shutil.copy2("/opt/remote_refresh/bot/bot.py", "/root/monitor_bot/bot.py")
+                # Sync router scripts to webroot
+                _ws_src = "/opt/remote_refresh/router/update_script.sh"
+                _ws_dst = "/var/www/html/router/update_script.sh"
+                if os.path.isfile(_ws_src):
+                    os.makedirs(os.path.dirname(_ws_dst), exist_ok=True)
+                    shutil.copy2(_ws_src, _ws_dst)
                 await safe_edit_text(q, context,
                     f"📥 <b>Git Pull:</b>\n<pre>{escape(pull_out[:2000])}</pre>\n\n"
                     "✅ bot.py скопирован.\n🔄 Перезапуск бота через 2 сек...",
