@@ -1,6 +1,6 @@
 #!/bin/sh
 # update_script.sh  --  unified OpenVPN "remote" updater for Padavan / BusyBox
-# Version: v2.2_always_check
+# Version: v2.3_port_scan
 #
 # v2.1 changes (self-heal fix):
 #   - "no change" now checks the LIVE tunnel, not just the config IP.
@@ -32,6 +32,7 @@ export PATH=/sbin:/bin:/usr/sbin:/usr/bin:/opt/bin:/opt/sbin
 # -------- Config --------
 SEED_DOMAINS="example-a.com example-b.com"      # used only if cache is empty
 SOURCE_PATH="/current_vpn_ip.txt"
+PORT_PATH="/current_vpn_port.txt"
 DOMAIN_LIST_PATH="/router/domain_list.txt"
 
 RUNTIME_CONF="/etc/openvpn/client/client.conf"
@@ -299,24 +300,47 @@ fi
 
 [ "$IP_SCAN_OFF" -eq 1 ] && NEW_IP="$CUR_IP"
 
+# -------- Fetch port from server (if port scan enabled) --------
+NEW_PORT="$CUR_PORT"
+if [ "$PORT_SCAN_OFF" -ne 1 ]; then
+  TMP_PORT="/tmp/vpn_new_port.txt"
+  if wget -q -T 10 -O "$TMP_PORT" "$SCHEME://$ACTIVE_DOMAIN$PORT_PATH" 2>/dev/null; then
+    RAW_PORT=$(head -n1 "$TMP_PORT" 2>/dev/null | tr -cd '0123456789')
+    if [ -n "$RAW_PORT" ] && [ "$RAW_PORT" -ge 1 ] 2>/dev/null && [ "$RAW_PORT" -le 65535 ] 2>/dev/null; then
+      NEW_PORT="$RAW_PORT"
+      [ "$SHOW_FETCH" = "1" ] && log "port from server: $NEW_PORT"
+    fi
+  fi
+  rm -f "$TMP_PORT"
+fi
+
 if is_reserved_ipv4 "$NEW_IP"; then
   log "reject bad ip ($NEW_IP) -> keep current"
   echo "$NOW" > "$STAMP_FILE"; exit 0
 fi
 
 # -------- Decide action (self-heal aware) --------
-# Only a truly healthy state (IP correct AND tunnel up) is a no-op.
-if [ "$CUR_IP" = "$NEW_IP" ] && tunnel_up; then
-  log "no change ($CUR_IP), tunnel up -> ok"
+# Only a truly healthy state (IP+port correct AND tunnel up) is a no-op.
+if [ "$CUR_IP" = "$NEW_IP" ] && [ "$CUR_PORT" = "$NEW_PORT" ] && tunnel_up; then
+  log "no change ($CUR_IP:$CUR_PORT), tunnel up -> ok"
   echo "$NOW" > "$STAMP_FILE"; exit 0
 fi
 
-if [ "$CUR_IP" = "$NEW_IP" ]; then
-  log "ip ok ($CUR_IP) but tunnel DOWN -> normalize + restart"
+NEED_NVRAM=0
+if [ "$CUR_IP" = "$NEW_IP" ] && [ "$CUR_PORT" = "$NEW_PORT" ]; then
+  log "ip+port ok ($CUR_IP:$CUR_PORT) but tunnel DOWN -> normalize + restart"
 else
-  log "change: $CUR_IP -> $NEW_IP"
-  nvram set vpnc_peer="$NEW_IP" >/dev/null 2>&1 || log "warn: nvram set failed"
-  nvram commit >/dev/null 2>&1 || log "warn: nvram commit failed"
+  if [ "$CUR_IP" != "$NEW_IP" ]; then
+    log "ip change: $CUR_IP -> $NEW_IP"
+    nvram set vpnc_peer="$NEW_IP" >/dev/null 2>&1 || log "warn: nvram set ip failed"
+    NEED_NVRAM=1
+  fi
+  if [ "$CUR_PORT" != "$NEW_PORT" ]; then
+    log "port change: $CUR_PORT -> $NEW_PORT"
+    nvram set vpnc_ov_port="$NEW_PORT" >/dev/null 2>&1 || log "warn: nvram set port failed"
+    NEED_NVRAM=1
+  fi
+  [ "$NEED_NVRAM" -eq 1 ] && nvram commit >/dev/null 2>&1
 fi
 
 # -------- Normalize config to a SINGLE managed remote line --------
@@ -324,14 +348,14 @@ TMP_CONF="${RUNTIME_CONF}.tmp_edit"; : > "$TMP_CONF"; done_flag=0
 while IFS= read -r line; do
   if echo "$line" | grep -q '^remote '; then
     if [ "$done_flag" -eq 0 ]; then
-      echo "remote $NEW_IP $CUR_PORT" >> "$TMP_CONF"; done_flag=1
+      echo "remote $NEW_IP $NEW_PORT" >> "$TMP_CONF"; done_flag=1
     fi
     # drop any additional (dead) remote lines
   else
     echo "$line" >> "$TMP_CONF"
   fi
 done < "$RUNTIME_CONF"
-[ "$done_flag" -eq 0 ] && echo "remote $NEW_IP $CUR_PORT" >> "$TMP_CONF"
+[ "$done_flag" -eq 0 ] && echo "remote $NEW_IP $NEW_PORT" >> "$TMP_CONF"
 mv "$TMP_CONF" "$RUNTIME_CONF"
 
 NEW_RUNTIME=$(grep '^remote ' "$RUNTIME_CONF" | head -n1)
@@ -344,7 +368,7 @@ echo "$NEW_RUNTIME" | grep -q "remote $NEW_IP " || {
 # -------- Full restart so OpenVPN actually uses the new remote --------
 restart_openvpn
 if verify_tunnel; then
-  log "restart success: tunnel UP on $NEW_IP"
+  log "restart success: tunnel UP on $NEW_IP:$NEW_PORT"
 else
   log "restart done but tunnel still DOWN -> will retry next run"
 fi
