@@ -1,6 +1,6 @@
 #!/bin/sh
 # update_script.sh  --  unified OpenVPN "remote" updater for Padavan / BusyBox
-# Version: v2.1_selfheal
+# Version: v2.2_always_check
 #
 # v2.1 changes (self-heal fix):
 #   - "no change" now checks the LIVE tunnel, not just the config IP.
@@ -13,14 +13,14 @@
 #     domain remotes are stripped (no more "Cannot resolve" cycling).
 #
 # What it does:
-#   - If the OpenVPN tunnel is already UP -> exit immediately (no network poll).
-#     This removes the every-15-min cleartext fingerprint that gets domains blocked.
-#   - Only when the tunnel is DOWN: fetch a fresh IP, trying several domains in turn
-#     (multi-domain failover), refresh the local domain list (sha256-verified),
-#     rewrite "remote <IP> <PORT>" in client.conf and fully restart OpenVPN.
+#   - Always fetches the current IP from the server via domain.
+#     When VPN is UP, traffic goes through tunnel (ISP can't see domain).
+#   - If IP matches and tunnel is UP -> no action.
+#   - If IP changed -> rewrite config + restart OpenVPN.
+#   - If IP matches but tunnel is DOWN -> restart OpenVPN (self-heal).
 #
 # Config switches (below):
-#   CONNECTED_CHECK=1   1 = skip poll while tunnel is up (recommended). 0 = always poll.
+#   CONNECTED_CHECK=0   1 = skip poll while tunnel is up. 0 = always poll (safe: VPN traffic is encrypted).
 #   USE_HTTPS=0         0 = http (BusyBox wget often lacks TLS). 1 = https.
 #   USE_INTERVAL=0      1 = enforce MIN_INTERVAL between real runs. 0 = off.
 #   SHOW_FETCH=0        1 = verbose fetch logging (debug).
@@ -47,7 +47,7 @@ HUP_WAIT=8
 FALLBACK_ENABLE=1
 LOG_TAG="vpn-update"
 
-CONNECTED_CHECK=1
+CONNECTED_CHECK=0
 USE_HTTPS=0
 USE_INTERVAL=0
 SHOW_FETCH=0
