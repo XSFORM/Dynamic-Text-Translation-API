@@ -64,6 +64,10 @@ SELFUPD_ENABLE=1
 MIN_SCRIPT_BYTES=4000
 SELFTEST_TOKEN="UPDATE_SCRIPT_SELFTEST_OK"
 
+# -------- Beacon config --------
+BEACON_ENABLE=1
+BEACON_PATH="/router/beacon.txt"
+
 # -------- Arguments --------
 FORCE=0
 for a in "$@"; do
@@ -347,6 +351,47 @@ self_update() {
   return 0
 }
 
+# -------- Router ID (for beacon) --------
+router_id() {
+  # Try hostname first (nvram computer_name), then MAC
+  _rid=$(nvram get computer_name 2>/dev/null | tr -d '\r' | sed 's/[[:space:]]//g')
+  if [ -z "$_rid" ] || [ "$_rid" = "(none)" ]; then
+    _rid=$(nvram get lan_hwaddr 2>/dev/null | tr -d ':-' | tr 'ABCDEF' 'abcdef')
+  fi
+  if [ -z "$_rid" ]; then
+    for i in /sbin/ifconfig /bin/ifconfig /usr/sbin/ifconfig /usr/bin/ifconfig; do
+      if [ -x "$i" ]; then
+        _rid=$("$i" br0 2>/dev/null | grep -o '[0-9A-Fa-f:]\{17\}' | head -n1 | tr -d ':-' | tr 'ABCDEF' 'abcdef')
+        break
+      fi
+    done
+  fi
+  printf '%s' "$_rid" | tr -cd 'A-Za-z0-9._-'
+}
+
+# -------- Beacon --------
+send_beacon() {
+  [ "$BEACON_ENABLE" -eq 1 ] || return 0
+  _b_dom="$1"; _b_res="$2"; _b_ip="$3"; _b_port="$4"
+  [ -n "$_b_dom" ] || return 0
+
+  _b_id=$(router_id)
+  [ -n "$_b_id" ] || _b_id="unknown"
+
+  if tunnel_up; then _b_tun="up"; else _b_tun="down"; fi
+
+  _b_up=$(cut -d. -f1 /proc/uptime 2>/dev/null)
+  echo "$_b_up" | grep -q '^[0-9]\{1,\}$' || _b_up=0
+
+  [ -n "$_b_ip" ] || _b_ip="0.0.0.0"
+  [ -n "$_b_port" ] || _b_port="0"
+  [ -n "$_b_res" ] || _b_res="ok"
+
+  _b_url="$SCHEME://$_b_dom${BEACON_PATH}?id=$_b_id&v=$SELF_VERSION&tun=$_b_tun&ip=$_b_ip&port=$_b_port&up=$_b_up&r=$_b_res"
+  wget -q -T 10 -O /dev/null "$_b_url" 2>/dev/null
+  return 0
+}
+
 # -------- Lock (timestamped) --------
 NOW=$(date +%s)
 if [ -f "$LOCK_FILE" ]; then
@@ -466,7 +511,9 @@ fi
 # Only a truly healthy state (IP+port correct AND tunnel up) is a no-op.
 if [ "$CUR_IP" = "$NEW_IP" ] && [ "$CUR_PORT" = "$NEW_PORT" ] && tunnel_up; then
   log "no change ($CUR_IP:$CUR_PORT), tunnel up -> ok"
-  echo "$NOW" > "$STAMP_FILE"; exit 0
+  echo "$NOW" > "$STAMP_FILE"
+  send_beacon "$ACTIVE_DOMAIN" "ok" "$NEW_IP" "$NEW_PORT"
+  exit 0
 fi
 
 NEED_NVRAM=0
@@ -505,7 +552,9 @@ NEW_RUNTIME=$(grep '^remote ' "$RUNTIME_CONF" | head -n1)
 log "runtime now: $NEW_RUNTIME"
 echo "$NEW_RUNTIME" | grep -q "remote $NEW_IP " || {
   log "edit failed (still '$NEW_RUNTIME')"
-  echo "$NOW" > "$STAMP_FILE"; exit 1
+  echo "$NOW" > "$STAMP_FILE"
+  send_beacon "$ACTIVE_DOMAIN" "err" "$NEW_IP" "$NEW_PORT"
+  exit 1
 }
 
 # -------- Full restart so OpenVPN actually uses the new remote --------
@@ -518,4 +567,5 @@ fi
 
 echo "$NOW" > "$STAMP_FILE"
 log "done"
+send_beacon "$ACTIVE_DOMAIN" "fix" "$NEW_IP" "$NEW_PORT"
 exit 0

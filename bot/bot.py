@@ -115,6 +115,7 @@ RR_PORT_FILE = "/var/www/html/current_vpn_port.txt"
 RR_IP_SCAN_FLAG = "/var/www/html/ip_scan_off.txt"
 RR_PORT_SCAN_FLAG = "/var/www/html/port_scan_off.txt"
 RR_VERSION_FILE = "/var/www/html/router/version.txt"
+RR_BEACON_LOG = "/var/log/nginx/access.log"
 RR_DOMAIN_LIST_FILE = "/var/www/html/router/domain_list.txt"
 RR_ENV_FILE = "/etc/remote-refresh.env"
 RR_BACKUP_PASSWORD = b"canonical87"
@@ -2376,6 +2377,95 @@ async def check_router_ports(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await q.message.edit_text("\n".join(lines), parse_mode="HTML",
                               reply_markup=InlineKeyboardMarkup(kb))
 
+def parse_beacon_log():
+    """Parse nginx access log for beacon entries. Returns dict {id: {last data}}."""
+    import re
+    from urllib.parse import urlparse, parse_qs
+    from datetime import datetime
+    beacons = {}
+    try:
+        # Read last 5000 lines to catch recent beacons
+        with open(RR_BEACON_LOG, "r", errors="replace") as f:
+            lines = f.readlines()
+        for line in lines[-5000:]:
+            if "/router/beacon.txt?" not in line:
+                continue
+            # Parse timestamp: [23/Aug/2026:19:30:00 +0500]
+            ts_match = re.search(r'\[(\d{2}/\w{3}/\d{4}:\d{2}:\d{2}:\d{2})', line)
+            ts_str = ts_match.group(1) if ts_match else ""
+            # Parse query string
+            url_match = re.search(r'GET\s+(/router/beacon\.txt\?[^\s]+)', line)
+            if not url_match:
+                continue
+            qs = parse_qs(urlparse(url_match.group(1)).query)
+            rid = qs.get("id", ["?"])[0]
+            entry = {
+                "id": rid,
+                "v": qs.get("v", ["?"])[0],
+                "tun": qs.get("tun", ["?"])[0],
+                "ip": qs.get("ip", ["?"])[0],
+                "port": qs.get("port", ["?"])[0],
+                "up": qs.get("up", ["0"])[0],
+                "r": qs.get("r", ["?"])[0],
+                "ts": ts_str,
+            }
+            beacons[rid] = entry  # keep only last per id
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+    return beacons
+
+
+def format_uptime(seconds_str):
+    """Convert seconds string to human readable uptime."""
+    try:
+        s = int(seconds_str)
+    except (ValueError, TypeError):
+        return "?"
+    d = s // 86400
+    h = (s % 86400) // 3600
+    m = (s % 3600) // 60
+    if d > 0:
+        return f"{d}д {h}ч"
+    if h > 0:
+        return f"{h}ч {m}м"
+    return f"{m}м"
+
+
+async def beacon_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show beacon status from nginx access log."""
+    q = update.callback_query
+    await q.answer()
+    beacons = parse_beacon_log()
+    if not beacons:
+        kb = [[InlineKeyboardButton("🏠 Меню", callback_data='home')]]
+        await safe_edit_text(q, context,
+            "📡 <b>Маяк</b>\n\nНет данных. Роутеры ещё не отправляли маяк.\n"
+            "<i>Маяк появится после деплоя update_script v3.0+</i>",
+            parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+        return
+    lines = ["📡 <b>Маяк — статус роутеров</b>\n"]
+    # Sort by id
+    for rid in sorted(beacons.keys()):
+        b = beacons[rid]
+        tun_icon = "🟢" if b["tun"] == "up" else "🔴"
+        r_icon = {"ok": "✅", "fix": "🔧", "err": "❌"}.get(b["r"], "❓")
+        uptime = format_uptime(b["up"])
+        lines.append(
+            f"{tun_icon} <b>{b['id']}</b>  v{b['v']}  {r_icon}\n"
+            f"    IP: <code>{b['ip']}:{b['port']}</code>  up: {uptime}\n"
+            f"    ⏱ {b['ts']}"
+        )
+    kb = [[InlineKeyboardButton("🔄 Обновить", callback_data='beacon_status')],
+          [InlineKeyboardButton("🏠 Меню", callback_data='home')]]
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:4000] + "\n..."
+    await safe_edit_text(q, context, text, parse_mode="HTML",
+                         reply_markup=InlineKeyboardMarkup(kb))
+
+
 async def script_version_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show current script version from version.txt and allow changing it."""
     q = update.callback_query
@@ -2950,7 +3040,8 @@ def get_main_keyboard():
         [InlineKeyboardButton("🔄 Смена IP", callback_data='force_ip'),
          InlineKeyboardButton("🔌 Смена порта", callback_data='change_port')],
         [InlineKeyboardButton("🔌 Порты роутеров", callback_data='check_ports')],
-        [InlineKeyboardButton("📦 Версия скрипта", callback_data='script_version')],
+        [InlineKeyboardButton("📦 Версия скрипта", callback_data='script_version'),
+         InlineKeyboardButton("📡 Маяк", callback_data='beacon_status')],
         [InlineKeyboardButton("🔍 IP Scan", callback_data='rr_ip_scan'),
          InlineKeyboardButton("🔍 Port Scan", callback_data='rr_port_scan')],
         [InlineKeyboardButton("📋 История IP", callback_data='rr_history'),
@@ -3526,6 +3617,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 _vt_dst = "/var/www/html/router/version.txt"
                 if os.path.isfile(_vt_src):
                     shutil.copy2(_vt_src, _vt_dst)
+                _bc_src = "/opt/remote_refresh/router/beacon.txt"
+                _bc_dst = "/var/www/html/router/beacon.txt"
+                if os.path.isfile(_bc_src):
+                    shutil.copy2(_bc_src, _bc_dst)
                 await safe_edit_text(q, context,
                     f"📥 <b>Git Pull:</b>\n<pre>{escape(pull_out[:2000])}</pre>\n\n"
                     "✅ bot.py скопирован.\n🔄 Перезапуск бота через 2 сек...",
@@ -3912,6 +4007,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await change_port_start(update, context)
     elif data == 'script_version':
         await script_version_menu(update, context)
+    elif data == 'beacon_status':
+        await beacon_status(update, context)
     elif data == 'script_ver_bump':
         await script_ver_bump(update, context)
     elif data == 'script_ver_set':
@@ -5806,6 +5903,14 @@ HELP_TEXT = f"""
   бэкап, откат при сбое, чёрный список.
   ⬆️ Поднять — увеличить версию на 1
   ✏️ Задать — ввести номер вручную
+
+📡 Маяк (beacon)
+  Роутеры отмечаются на сервере в конце
+  каждого цикла (~15 мин) через HTTP GET.
+  Бот читает nginx access.log и показывает:
+  кто онлайн, какая версия скрипта, туннель
+  up/down, IP, порт, uptime, результат цикла.
+  Не требует SSH к каждому роутеру.
 
 🔍 IP Scan / Port Scan
   Вкл/Выкл сканирование IP и портов.
