@@ -36,8 +36,18 @@ PORT_PATH="/current_vpn_port.txt"
 DOMAIN_LIST_PATH="/router/domain_list.txt"
 
 RUNTIME_CONF="/etc/openvpn/client/client.conf"
+STORAGE_CONF="/etc/storage/openvpn/client/client.conf"
 PID_FILE="/var/run/openvpn_cli.pid"
 TUN_IFACE="tun0"
+
+# Fast failover timeouts (default OpenVPN = 60s per dead remote)
+OPT_CONNECT_TIMEOUT=10
+OPT_HAND_WINDOW=25
+OPT_RESOLV_RETRY=5
+
+# Markers for managed block in flash config
+MARK_START="# vpn-update managed block start"
+MARK_END="# vpn-update managed block end"
 
 LOCK_FILE="/tmp/vpn_update.lock"
 STAMP_FILE="/tmp/vpn_update.last"
@@ -252,6 +262,68 @@ persist_flash() {
   done
   log "flash save FAILED: save utility not found"
   return 1
+}
+
+# -------- Flash config (managed block) --------
+# Writes remote + fast timeouts between markers. User's manual lines preserved.
+storage_conf_sync() {
+  _sc_ip="$1"; _sc_port="$2"
+  _sc_dir=$(dirname "$STORAGE_CONF")
+  [ -d "$_sc_dir" ] || mkdir -p "$_sc_dir" 2>/dev/null
+
+  _sc_tmp="${STORAGE_CONF}.new.$$"
+  rm -f "${STORAGE_CONF}".new.* 2>/dev/null
+
+  # Write managed block
+  {
+    echo "$MARK_START"
+    echo "remote $_sc_ip $_sc_port"
+    echo "connect-timeout $OPT_CONNECT_TIMEOUT"
+    echo "hand-window $OPT_HAND_WINDOW"
+    echo "resolv-retry $OPT_RESOLV_RETRY"
+    echo "$MARK_END"
+  } > "$_sc_tmp"
+
+  # Copy user's manual lines (skip old managed block)
+  if [ -f "$STORAGE_CONF" ]; then
+    _skip=0
+    while IFS= read -r _l; do
+      case "$_l" in
+        "$MARK_START") _skip=1; continue ;;
+        "$MARK_END")   _skip=0; continue ;;
+      esac
+      [ "$_skip" -eq 1 ] && continue
+      # Also skip bare remote lines outside markers (legacy cleanup)
+      echo "$_l" | grep -q '^remote ' && continue
+      echo "$_l" >> "$_sc_tmp"
+    done < "$STORAGE_CONF"
+  fi
+
+  # No change? skip flash write
+  if [ -f "$STORAGE_CONF" ] && cmp -s "$_sc_tmp" "$STORAGE_CONF"; then
+    rm -f "$_sc_tmp"
+    return 1
+  fi
+
+  mv "$_sc_tmp" "$STORAGE_CONF" || { rm -f "$_sc_tmp"; log "storage conf write failed"; return 1; }
+  log "storage conf updated: remote $_sc_ip $_sc_port"
+  persist_flash
+  return 0
+}
+
+# Add fast timeouts to live runtime config if missing
+ensure_runtime_opts() {
+  [ -f "$RUNTIME_CONF" ] || return 0
+  _add=""
+  grep -q '^connect-timeout ' "$RUNTIME_CONF" || _add="${_add}connect-timeout $OPT_CONNECT_TIMEOUT
+"
+  grep -q '^hand-window ' "$RUNTIME_CONF" || _add="${_add}hand-window $OPT_HAND_WINDOW
+"
+  grep -q '^resolv-retry ' "$RUNTIME_CONF" || _add="${_add}resolv-retry $OPT_RESOLV_RETRY
+"
+  [ -z "$_add" ] && return 0
+  printf '%s' "$_add" >> "$RUNTIME_CONF"
+  log "runtime: added fast timeouts"
 }
 
 # -------- Self-update helpers --------
@@ -550,6 +622,9 @@ else
   [ "$NEED_NVRAM" -eq 1 ] && nvram commit >/dev/null 2>&1
 fi
 
+# -------- Flash config (survives reboot) --------
+storage_conf_sync "$NEW_IP" "$NEW_PORT"
+
 # -------- Normalize config to a SINGLE managed remote line --------
 TMP_CONF="${RUNTIME_CONF}.tmp_edit"; : > "$TMP_CONF"; done_flag=0
 while IFS= read -r line; do
@@ -573,6 +648,8 @@ echo "$NEW_RUNTIME" | grep -q "remote $NEW_IP " || {
   send_beacon "$ACTIVE_DOMAIN" "err" "$NEW_IP" "$NEW_PORT"
   exit 1
 }
+
+ensure_runtime_opts
 
 # -------- Full restart so OpenVPN actually uses the new remote --------
 restart_openvpn
