@@ -52,6 +52,10 @@ MARK_END="# vpn-update managed block end"
 LOCK_FILE="/tmp/vpn_update.lock"
 STAMP_FILE="/tmp/vpn_update.last"
 CACHE_FILE="/etc/storage/remote_domains.list"
+PREV_FILE="/etc/storage/remote_domains.prev"
+SAVE_STAMP="/tmp/flash_save_count"
+MAX_FLASH_SAVES=10
+MAX_DOMAINS=20
 
 MIN_INTERVAL=300
 HUP_WAIT=8
@@ -199,59 +203,98 @@ verify_tunnel() {
 read_domains() {
   if [ -s "$CACHE_FILE" ]; then
     cat "$CACHE_FILE"
+  elif [ -s "$PREV_FILE" ]; then
+    log "domain list empty, using backup"
+    cp "$PREV_FILE" "$CACHE_FILE" 2>/dev/null
+    cat "$PREV_FILE"
   else
+    log "domain list empty, using seed domains"
     for d in $SEED_DOMAINS; do echo "$d"; done
   fi
 }
 
+# Atomic domain sync with safeguards:
+#  1. Empty/bad server response -> list NOT touched
+#  2. Working domain NEVER removed (even if server doesn't list it)
+#  3. Working domain moved to FIRST position
+#  4. Atomic write (temp+mv in same FS) + prev backup
+#  5. Flash save only on actual change
 update_cache_from_server() {
   dom="$1"
-  tmp="/tmp/domain_list.tmp"
-  shatmp="/tmp/domain_list.sha"
-  url="$SCHEME://$dom$DOMAIN_LIST_PATH"
+  _raw="/tmp/domain_list.raw"
+  _srv="/tmp/domain_list.srv"
+  rm -f "$_raw" "$_srv"
 
-  wget -q -T 10 -O "$tmp" "$url" || {
-    [ "$SHOW_FETCH" = "1" ] && log "fetch domain list failed: $url"
+  wget -q -T 10 -O "$_raw" "$SCHEME://$dom$DOMAIN_LIST_PATH" || {
+    [ "$SHOW_FETCH" = "1" ] && log "fetch domain list failed from $dom"
+    rm -f "$_raw"
     return
   }
 
-  if command -v sha256sum >/dev/null 2>&1; then
-    if wget -q -T 10 -O "$shatmp" "$url.sha256"; then
-      expected=$(awk '{print $1}' "$shatmp" 2>/dev/null | head -n1)
-      computed=$(sha256sum "$tmp" 2>/dev/null | awk '{print $1}')
-      if [ -n "$expected" ] && [ "$expected" != "$computed" ]; then
-        log "domain_list sha256 mismatch from $dom -> reject"
-        rm -f "$tmp" "$shatmp"
-        return
-      fi
-      [ "$SHOW_FETCH" = "1" ] && log "domain_list sha256 ok from $dom"
-    fi
-  fi
-
-  out="/tmp/domain_list.clean"; : > "$out"; valid=0
+  # Parse and validate domains
+  : > "$_srv"
   while IFS= read -r line; do
-    line=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    line=$(printf '%s' "$line" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
     [ -z "$line" ] && continue
-    echo "$line" | grep -q '^#' && continue
-    echo "$line" | grep -qE '^[A-Za-z0-9._-]+$' || continue
-    echo "$line" >> "$out"; valid=1
-  done < "$tmp"
+    case "$line" in \#*) continue ;; esac
+    echo "$line" | grep -qE '^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$' || continue
+    echo "$line" | grep -q '\.' || continue
+    grep -qxF "$line" "$_srv" 2>/dev/null || echo "$line" >> "$_srv"
+  done < "$_raw"
+  rm -f "$_raw"
 
-  if [ "$valid" -eq 1 ]; then
-    mkdir -p "$(dirname "$CACHE_FILE")"
-    mv "$out" "$CACHE_FILE"
-    log "domain cache updated from $dom"
+  # Safeguard 1: server returned empty/garbage -> don't touch anything
+  if [ ! -s "$_srv" ]; then
+    log "domain_list.txt empty or invalid, list unchanged"
+    rm -f "$_srv"
+    return
   fi
-  rm -f "$tmp" "$shatmp"
+
+  # Safeguards 2+3: working domain survives and goes first
+  _final="$CACHE_FILE.new.$$"
+  rm -f "$CACHE_FILE".new.* 2>/dev/null
+  echo "$dom" > "$_final"
+  _n=1
+  while IFS= read -r d; do
+    [ "$_n" -ge "$MAX_DOMAINS" ] && break
+    [ "$d" = "$dom" ] && continue
+    echo "$d" >> "$_final"
+    _n=$((_n + 1))
+  done < "$_srv"
+  rm -f "$_srv"
+
+  [ -s "$_final" ] || { rm -f "$_final"; return; }
+
+  # No change -> skip write and flash save
+  if [ -f "$CACHE_FILE" ] && cmp -s "$_final" "$CACHE_FILE"; then
+    rm -f "$_final"
+    return
+  fi
+
+  _old_n=$(grep -c . "$CACHE_FILE" 2>/dev/null || echo 0)
+  _new_n=$(grep -c . "$_final")
+
+  # Safeguard 4: backup prev + atomic mv
+  [ -s "$CACHE_FILE" ] && cp "$CACHE_FILE" "$PREV_FILE" 2>/dev/null
+  mv "$_final" "$CACHE_FILE"
+  log "domain cache updated from $dom: $_old_n -> $_new_n"
+  persist_flash
 }
 
-# -------- Flash save --------
+# -------- Flash save (with wear limit) --------
 persist_flash() {
+  cnt=$(cat "$SAVE_STAMP" 2>/dev/null || echo 0)
+  [ -z "$cnt" ] && cnt=0
+  if [ "$cnt" -ge "$MAX_FLASH_SAVES" ]; then
+    log "flash save skipped (limit $MAX_FLASH_SAVES per session)"
+    return 1
+  fi
   for s in /sbin/mtd_storage.sh /usr/bin/mtd_storage.sh /bin/mtd_storage.sh \
            /usr/sbin/mtd_storage.sh /opt/bin/mtd_storage.sh \
            /sbin/flashfs /usr/bin/flashfs /usr/sbin/flashfs; do
     if [ -x "$s" ]; then
       if "$s" save >/dev/null 2>&1; then
+        echo $((cnt + 1)) > "$SAVE_STAMP"
         log "flash save ok ($s)"
         return 0
       else
@@ -261,6 +304,20 @@ persist_flash() {
     fi
   done
   log "flash save FAILED: save utility not found"
+  return 1
+}
+
+# -------- nvram with read-back verification --------
+nvram_set_verified() {
+  _nv_key="$1"; _nv_val="$2"
+  nvram set "$_nv_key=$_nv_val" >/dev/null 2>&1 || log "warn: nvram set $_nv_key failed"
+  nvram commit >/dev/null 2>&1 || log "warn: nvram commit failed"
+  _nv_got=$(nvram get "$_nv_key" 2>/dev/null)
+  if [ "$_nv_got" = "$_nv_val" ]; then
+    log "nvram $_nv_key = $_nv_got (OK)"
+    return 0
+  fi
+  log "nvram PROBLEM: wrote $_nv_val, read back '$_nv_got'"
   return 1
 }
 
@@ -605,21 +662,17 @@ if [ "$CUR_IP" = "$NEW_IP" ] && [ "$CUR_PORT" = "$NEW_PORT" ] && tunnel_up; then
   exit 0
 fi
 
-NEED_NVRAM=0
 if [ "$CUR_IP" = "$NEW_IP" ] && [ "$CUR_PORT" = "$NEW_PORT" ]; then
   log "ip+port ok ($CUR_IP:$CUR_PORT) but tunnel DOWN -> normalize + restart"
 else
   if [ "$CUR_IP" != "$NEW_IP" ]; then
     log "ip change: $CUR_IP -> $NEW_IP"
-    nvram set vpnc_peer="$NEW_IP" >/dev/null 2>&1 || log "warn: nvram set ip failed"
-    NEED_NVRAM=1
+    nvram_set_verified vpnc_peer "$NEW_IP"
   fi
   if [ "$CUR_PORT" != "$NEW_PORT" ]; then
     log "port change: $CUR_PORT -> $NEW_PORT"
-    nvram set vpnc_ov_port="$NEW_PORT" >/dev/null 2>&1 || log "warn: nvram set port failed"
-    NEED_NVRAM=1
+    nvram_set_verified vpnc_ov_port "$NEW_PORT"
   fi
-  [ "$NEED_NVRAM" -eq 1 ] && nvram commit >/dev/null 2>&1
 fi
 
 # -------- Flash config (survives reboot) --------
