@@ -2466,32 +2466,57 @@ async def beacon_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
                          reply_markup=InlineKeyboardMarkup(kb))
 
 
-async def script_version_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show current script version from version.txt and allow changing it."""
-    q = update.callback_query
-    await q.answer()
-    cur_ver = "(не задана)"
+def read_version_file():
+    """Read version.txt and return dict with version, canary_version, canary_ids."""
+    data = {"version": "", "canary_version": "", "canary_ids": ""}
     try:
         with open(RR_VERSION_FILE, "r") as f:
             for line in f:
                 line = line.strip()
-                if line.startswith("version="):
-                    cur_ver = line.split("=", 1)[1].strip()
-                    break
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    k = k.strip()
+                    v = v.strip()
+                    if k in data:
+                        data[k] = v
     except FileNotFoundError:
         pass
+    return data
+
+
+def write_version_file(data: dict):
+    """Write version.txt preserving all fields."""
+    with open(RR_VERSION_FILE, "w") as f:
+        f.write(f"version={data.get('version', '1')}\n")
+        cv = data.get('canary_version', '')
+        ci = data.get('canary_ids', '')
+        if cv:
+            f.write(f"canary_version={cv}\n")
+        if ci:
+            f.write(f"canary_ids={ci}\n")
+
+
+async def script_version_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show current script version from version.txt and allow changing it."""
+    q = update.callback_query
+    await q.answer()
+    vd = read_version_file()
+    cur_ver = vd["version"] or "(не задана)"
+    canary_ver = vd["canary_version"] or "—"
+    canary_ids = vd["canary_ids"] or "—"
     kb = [
         [InlineKeyboardButton("⬆️ Поднять версию", callback_data='script_ver_bump')],
         [InlineKeyboardButton("✏️ Задать версию", callback_data='script_ver_set')],
+        [InlineKeyboardButton("🐤 Канарейка", callback_data='canary_menu')],
         [InlineKeyboardButton("🏠 Меню", callback_data='home')],
     ]
     await safe_edit_text(q, context,
         f"📦 <b>Версия скрипта (self-update)</b>\n\n"
-        f"Текущая версия в version.txt: <code>{cur_ver}</code>\n\n"
-        f"Роутеры сверяют свою версию с этим файлом.\n"
-        f"Если на сервере новее — скачают новый скрипт автоматически.\n\n"
-        f"<b>⬆️ Поднять</b> — увеличит на 1\n"
-        f"<b>✏️ Задать</b> — ввести номер вручную",
+        f"Общая версия: <code>{cur_ver}</code>\n"
+        f"Канарейка: <code>{canary_ver}</code>  роутеры: <code>{canary_ids}</code>\n\n"
+        f"<b>⬆️ Поднять</b> — увеличить общую версию на 1\n"
+        f"<b>✏️ Задать</b> — ввести номер вручную\n"
+        f"<b>🐤 Канарейка</b> — тест на выбранных роутерах",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
 
@@ -2499,19 +2524,11 @@ async def script_ver_bump(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Increment version in version.txt by 1."""
     q = update.callback_query
     await q.answer()
-    cur_ver = 0
-    try:
-        with open(RR_VERSION_FILE, "r") as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith("version="):
-                    cur_ver = int(line.split("=", 1)[1].strip())
-                    break
-    except (FileNotFoundError, ValueError):
-        pass
+    vd = read_version_file()
+    cur_ver = int(vd["version"]) if vd["version"].isdigit() else 0
     new_ver = cur_ver + 1
-    with open(RR_VERSION_FILE, "w") as f:
-        f.write(f"version={new_ver}\n")
+    vd["version"] = str(new_ver)
+    write_version_file(vd)
     rr_append_history(f"SCRIPT_VER: {cur_ver} -> {new_ver}")
     kb = [[InlineKeyboardButton("📦 Версия скрипта", callback_data='script_version')],
           [InlineKeyboardButton("🏠 Меню", callback_data='home')]]
@@ -2544,18 +2561,10 @@ async def script_ver_set_receive(update: Update, context: ContextTypes.DEFAULT_T
         return
     new_ver = int(text)
     context.user_data.pop('await_script_ver', None)
-    cur_ver = 0
-    try:
-        with open(RR_VERSION_FILE, "r") as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith("version="):
-                    cur_ver = int(line.split("=", 1)[1].strip())
-                    break
-    except (FileNotFoundError, ValueError):
-        pass
-    with open(RR_VERSION_FILE, "w") as f:
-        f.write(f"version={new_ver}\n")
+    vd = read_version_file()
+    cur_ver = int(vd["version"]) if vd["version"].isdigit() else 0
+    vd["version"] = str(new_ver)
+    write_version_file(vd)
     rr_append_history(f"SCRIPT_VER: {cur_ver} -> {new_ver}")
     kb = [[InlineKeyboardButton("📦 Версия скрипта", callback_data='script_version')],
           [InlineKeyboardButton("🏠 Меню", callback_data='home')]]
@@ -2563,6 +2572,108 @@ async def script_ver_set_receive(update: Update, context: ContextTypes.DEFAULT_T
         f"✅ Версия задана: <code>{cur_ver}</code> → <code>{new_ver}</code>\n\n"
         f"Роутеры подхватят новый скрипт в следующем цикле (~15 мин).",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def canary_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show canary deployment menu."""
+    q = update.callback_query
+    await q.answer()
+    vd = read_version_file()
+    cur_ver = vd["version"] or "—"
+    canary_ver = vd["canary_version"] or "—"
+    canary_ids = vd["canary_ids"] or "—"
+    kb = [
+        [InlineKeyboardButton("✏️ Канарейка версия", callback_data='canary_set_ver')],
+        [InlineKeyboardButton("📋 Канарейка роутеры", callback_data='canary_set_ids')],
+        [InlineKeyboardButton("🧹 Очистить канарейку", callback_data='canary_clear')],
+        [InlineKeyboardButton("📦 Назад", callback_data='script_version')],
+    ]
+    await safe_edit_text(q, context,
+        f"🐤 <b>Канарейка</b>\n\n"
+        f"Общая версия: <code>{cur_ver}</code>\n"
+        f"Канарейка версия: <code>{canary_ver}</code>\n"
+        f"Канарейка роутеры: <code>{canary_ids}</code>\n\n"
+        f"<i>Роутеры из списка получат canary_version.\n"
+        f"Остальные — общую version.\n"
+        f"Убедился что канарейки живы — подними общую версию.</i>",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def canary_set_ver_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    context.user_data['await_canary_ver'] = True
+    await safe_edit_text(q, context,
+        "🐤 Введите версию для канарейки (целое число):",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("❌ Отмена", callback_data="canary_menu")]]))
+
+
+async def canary_set_ver_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get('await_canary_ver'):
+        return
+    text = update.message.text.strip()
+    if not text.isdigit() or int(text) < 1:
+        await update.message.reply_text("Неверный номер (целое число >= 1).",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("❌ Отмена", callback_data="canary_menu")]]))
+        return
+    context.user_data.pop('await_canary_ver', None)
+    vd = read_version_file()
+    old = vd["canary_version"] or "—"
+    vd["canary_version"] = text
+    write_version_file(vd)
+    rr_append_history(f"CANARY_VER: {old} -> {text}")
+    kb = [[InlineKeyboardButton("🐤 Канарейка", callback_data='canary_menu')]]
+    await update.message.reply_text(
+        f"✅ Канарейка версия: <code>{old}</code> → <code>{text}</code>",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def canary_set_ids_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    context.user_data['await_canary_ids'] = True
+    vd = read_version_file()
+    cur_ids = vd["canary_ids"] or "(пусто)"
+    await safe_edit_text(q, context,
+        f"🐤 Текущие канарейки: <code>{cur_ids}</code>\n\n"
+        f"Введите ID роутеров через пробел.\n"
+        f"<i>ID = hostname роутера (nvram computer_name) или MAC.\n"
+        f"Посмотреть ID можно в 📡 Маяк.</i>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("❌ Отмена", callback_data="canary_menu")]]))
+
+
+async def canary_set_ids_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get('await_canary_ids'):
+        return
+    text = update.message.text.strip()
+    context.user_data.pop('await_canary_ids', None)
+    vd = read_version_file()
+    old = vd["canary_ids"] or "—"
+    vd["canary_ids"] = text
+    write_version_file(vd)
+    rr_append_history(f"CANARY_IDS: {old} -> {text}")
+    kb = [[InlineKeyboardButton("🐤 Канарейка", callback_data='canary_menu')]]
+    await update.message.reply_text(
+        f"✅ Канарейки: <code>{old}</code> → <code>{text}</code>",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def canary_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    vd = read_version_file()
+    vd["canary_version"] = ""
+    vd["canary_ids"] = ""
+    write_version_file(vd)
+    rr_append_history("CANARY: cleared")
+    kb = [[InlineKeyboardButton("📦 Версия скрипта", callback_data='script_version')]]
+    await safe_edit_text(q, context,
+        "✅ Канарейка очищена. Все роутеры получат общую версию.",
+        reply_markup=InlineKeyboardMarkup(kb))
 
 
 async def rr_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2960,7 +3071,8 @@ async def rr_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def rr_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer("Отменено")
     for k in ['await_rr_ip', 'await_rr_domain_add', 'await_force_ip',
-              'await_change_port', 'await_script_ver', 'await_oec_radd', 'await_oec_fedit', 'await_ssh_add']:
+              'await_change_port', 'await_script_ver', 'await_canary_ver', 'await_canary_ids',
+              'await_oec_radd', 'await_oec_fedit', 'await_ssh_add']:
         context.user_data.pop(k, None)
     await safe_edit_text(q, context, "Отменено.")
 
@@ -3273,6 +3385,11 @@ async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_T
     # Script version text input
     if context.user_data.get('await_script_ver'):
         await script_ver_set_receive(update, context); return
+    # Canary text inputs
+    if context.user_data.get('await_canary_ver'):
+        await canary_set_ver_receive(update, context); return
+    if context.user_data.get('await_canary_ids'):
+        await canary_set_ids_receive(update, context); return
     # Remote Refresh text inputs
     if context.user_data.get('await_rr_ip'):
         await rr_set_ip_receive(update, context); return
@@ -4013,6 +4130,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await script_ver_bump(update, context)
     elif data == 'script_ver_set':
         await script_ver_set_start(update, context)
+    elif data == 'canary_menu':
+        await canary_menu(update, context)
+    elif data == 'canary_set_ver':
+        await canary_set_ver_start(update, context)
+    elif data == 'canary_set_ids':
+        await canary_set_ids_start(update, context)
+    elif data == 'canary_clear':
+        await canary_clear(update, context)
 
     # --- Auto IP callbacks ---
     elif data == 'aip_menu':
@@ -5901,8 +6026,14 @@ HELP_TEXT = f"""
   скачивают и ставят новый скрипт сами.
   Защита: проверка синтаксиса, selftest,
   бэкап, откат при сбое, чёрный список.
-  ⬆️ Поднять — увеличить версию на 1
+  ⬆️ Поднять — увеличить общую версию на 1
   ✏️ Задать — ввести номер вручную
+  🐤 Канарейка — тест на выбранных роутерах:
+    - Задать canary_version (версия для теста)
+    - Задать canary_ids (ID роутеров-канареек)
+    - Очистить — все получат общую версию
+    Порядок: задать канарейку → проверить через
+    маяк что канарейки живы → поднять общую версию
 
 📡 Маяк (beacon)
   Роутеры отмечаются на сервере в конце

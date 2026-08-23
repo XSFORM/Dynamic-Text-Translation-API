@@ -301,15 +301,32 @@ self_update() {
   wget -q -T 10 -O "$vt" "$SCHEME://$_su_dom$VERSION_PATH" || { rm -f "$vt"; return 0; }
 
   sv=$(vt_get "$vt" version)
+  _cv=$(vt_get "$vt" canary_version)
+  _cids=$(vt_get "$vt" canary_ids)
   rm -f "$vt"
   is_number "$sv" || { log "selfupd: no valid version= in version.txt"; return 0; }
 
-  log "selfupd: my=$SELF_VERSION server=$sv"
-  [ "$sv" = "$SELF_VERSION" ] && return 0
-  [ "$sv" -lt "$SELF_VERSION" ] 2>/dev/null && { log "selfupd: server older, skip"; return 0; }
+  # Canary: if my id is in canary_ids, use canary_version instead
+  TARGET="$sv"
+  _why="general"
+  _myid=$(router_id)
+  if is_number "$_cv" && [ -n "$_cids" ] && [ -n "$_myid" ]; then
+    for _one in $_cids; do
+      _one=$(printf '%s' "$_one" | tr -cd 'A-Za-z0-9._-')
+      if [ "$_one" = "$_myid" ]; then
+        TARGET="$_cv"
+        _why="canary"
+        break
+      fi
+    done
+  fi
 
-  if is_failed "$sv"; then
-    log "selfupd: version $sv already failed on this router, skip"
+  log "selfupd: my=$SELF_VERSION target=$TARGET ($_why) id=$_myid"
+  [ "$TARGET" = "$SELF_VERSION" ] && return 0
+  [ "$TARGET" -lt "$SELF_VERSION" ] 2>/dev/null && { log "selfupd: target older, skip"; return 0; }
+
+  if is_failed "$TARGET"; then
+    log "selfupd: version $TARGET already failed on this router, skip"
     return 0
   fi
 
@@ -319,7 +336,7 @@ self_update() {
     log "selfupd: download failed"; rm -f "$new"; return 0
   }
 
-  candidate_ok "$new" "$sv" || { rm -f "$new"; return 0; }
+  candidate_ok "$new" "$TARGET" || { rm -f "$new"; return 0; }
 
   # backup current
   cp "$SELF_FILE" "$BAK_FILE" 2>/dev/null || {
@@ -336,8 +353,8 @@ self_update() {
   # selftest
   out=$(sh "$SELF_FILE" --selftest 2>&1)
   case "$out" in
-    *"$SELFTEST_TOKEN $sv"*)
-      log "selfupd: $SELF_VERSION -> $sv installed OK"
+    *"$SELFTEST_TOKEN $TARGET"*)
+      log "selfupd: $SELF_VERSION -> $TARGET installed OK"
       persist_flash
       return 0
       ;;
@@ -346,7 +363,7 @@ self_update() {
   # rollback
   log "selfupd: selftest FAILED ($out) -> rollback"
   cp "$BAK_FILE" "$SELF_FILE" 2>/dev/null && chmod 755 "$SELF_FILE" 2>/dev/null
-  mark_failed "$sv"
+  mark_failed "$TARGET"
   persist_flash
   return 0
 }
