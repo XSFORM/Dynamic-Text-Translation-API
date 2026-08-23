@@ -1,6 +1,6 @@
 #!/bin/sh
 # update_script.sh  --  unified OpenVPN "remote" updater for Padavan / BusyBox
-# Version: v3.0_selfupdate
+# Version: v2.3_port_scan
 #
 # v2.1 changes (self-heal fix):
 #   - "no change" now checks the LIVE tunnel, not just the config IP.
@@ -53,32 +53,8 @@ USE_HTTPS=0
 USE_INTERVAL=0
 SHOW_FETCH=0
 
-# -------- Self-update config --------
-SELF_VERSION=1
-VERSION_PATH="/router/version.txt"
-SCRIPT_PATH="/router/update_script.sh"
-SELF_FILE="/etc/storage/update_script.sh"
-BAK_FILE="/etc/storage/update_script.sh.bak"
-FAIL_FILE="/etc/storage/update_fail"
-SELFUPD_ENABLE=1
-MIN_SCRIPT_BYTES=4000
-SELFTEST_TOKEN="UPDATE_SCRIPT_SELFTEST_OK"
-
-# -------- Arguments --------
 FORCE=0
-for a in "$@"; do
-  case "$a" in
-    --force|-f) FORCE=1 ;;
-    --selftest)
-      echo "$SELFTEST_TOKEN $SELF_VERSION"
-      exit 0
-      ;;
-    --version|-v)
-      echo "$SELF_VERSION"
-      exit 0
-      ;;
-  esac
-done
+[ "$1" = "--force" ] && FORCE=1
 
 SCHEME="http"
 [ "$USE_HTTPS" = "1" ] && SCHEME="https"
@@ -231,122 +207,6 @@ update_cache_from_server() {
   rm -f "$tmp" "$shatmp"
 }
 
-# -------- Flash save --------
-persist_flash() {
-  for s in /sbin/mtd_storage.sh /usr/bin/mtd_storage.sh /bin/mtd_storage.sh \
-           /usr/sbin/mtd_storage.sh /opt/bin/mtd_storage.sh \
-           /sbin/flashfs /usr/bin/flashfs /usr/sbin/flashfs; do
-    if [ -x "$s" ]; then
-      if "$s" save >/dev/null 2>&1; then
-        log "flash save ok ($s)"
-        return 0
-      else
-        log "flash save FAILED ($s)"
-        return 1
-      fi
-    fi
-  done
-  log "flash save FAILED: save utility not found"
-  return 1
-}
-
-# -------- Self-update helpers --------
-vt_get() {
-  f="$1"; k="$2"
-  grep "^[[:space:]]*$k[[:space:]]*=" "$f" 2>/dev/null | head -n1 \
-    | sed "s/^[[:space:]]*$k[[:space:]]*=//" \
-    | sed 's/#.*$//' | tr -d '\r' \
-    | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
-}
-
-is_number() {
-  [ -n "$1" ] || return 1
-  echo "$1" | grep -q '^[0-9]\{1,6\}$'
-}
-
-candidate_ok() {
-  f="$1"; want="$2"
-  [ -s "$f" ] || { log "selfupd: file empty"; return 1; }
-  sz=$(wc -c < "$f" 2>/dev/null || echo 0)
-  [ "$sz" -lt "$MIN_SCRIPT_BYTES" ] && { log "selfupd: too small ($sz b)"; return 1; }
-  head -n1 "$f" | grep -q '^#!/bin/sh' || { log "selfupd: no shebang"; return 1; }
-  got=$(grep '^SELF_VERSION=' "$f" 2>/dev/null | head -n1 | cut -d= -f2 | tr -d '\r ')
-  [ -z "$got" ] && { log "selfupd: no SELF_VERSION in file"; return 1; }
-  [ "$got" != "$want" ] && { log "selfupd: version mismatch (want $want, got $got)"; return 1; }
-  sh -n "$f" 2>/dev/null || { log "selfupd: SYNTAX ERROR"; return 1; }
-  return 0
-}
-
-mark_failed() {
-  echo "$1" >> "$FAIL_FILE"
-  tail -n 20 "$FAIL_FILE" > "$FAIL_FILE.t" 2>/dev/null && mv "$FAIL_FILE.t" "$FAIL_FILE"
-}
-
-is_failed() {
-  [ -f "$FAIL_FILE" ] || return 1
-  grep -qx "$1" "$FAIL_FILE" 2>/dev/null
-}
-
-self_update() {
-  _su_dom="$1"
-  [ "$SELFUPD_ENABLE" -eq 1 ] || return 0
-  [ -f "$SELF_FILE" ] || { log "selfupd: $SELF_FILE not found"; return 0; }
-
-  vt="/tmp/version.txt"
-  rm -f "$vt"
-  wget -q -T 10 -O "$vt" "$SCHEME://$_su_dom$VERSION_PATH" || { rm -f "$vt"; return 0; }
-
-  sv=$(vt_get "$vt" version)
-  rm -f "$vt"
-  is_number "$sv" || { log "selfupd: no valid version= in version.txt"; return 0; }
-
-  log "selfupd: my=$SELF_VERSION server=$sv"
-  [ "$sv" = "$SELF_VERSION" ] && return 0
-  [ "$sv" -lt "$SELF_VERSION" ] 2>/dev/null && { log "selfupd: server older, skip"; return 0; }
-
-  if is_failed "$sv"; then
-    log "selfupd: version $sv already failed on this router, skip"
-    return 0
-  fi
-
-  new="/tmp/update_script.new"
-  rm -f "$new"
-  wget -q -T 20 -O "$new" "$SCHEME://$_su_dom$SCRIPT_PATH" || {
-    log "selfupd: download failed"; rm -f "$new"; return 0
-  }
-
-  candidate_ok "$new" "$sv" || { rm -f "$new"; return 0; }
-
-  # backup current
-  cp "$SELF_FILE" "$BAK_FILE" 2>/dev/null || {
-    log "selfupd: backup failed, abort"; rm -f "$new"; return 0
-  }
-
-  # install
-  cp "$new" "$SELF_FILE" 2>/dev/null || {
-    log "selfupd: write failed"; rm -f "$new"; return 0
-  }
-  chmod 755 "$SELF_FILE" 2>/dev/null
-  rm -f "$new"
-
-  # selftest
-  out=$(sh "$SELF_FILE" --selftest 2>&1)
-  case "$out" in
-    *"$SELFTEST_TOKEN $sv"*)
-      log "selfupd: $SELF_VERSION -> $sv installed OK"
-      persist_flash
-      return 0
-      ;;
-  esac
-
-  # rollback
-  log "selfupd: selftest FAILED ($out) -> rollback"
-  cp "$BAK_FILE" "$SELF_FILE" 2>/dev/null && chmod 755 "$SELF_FILE" 2>/dev/null
-  mark_failed "$sv"
-  persist_flash
-  return 0
-}
-
 # -------- Lock (timestamped) --------
 NOW=$(date +%s)
 if [ -f "$LOCK_FILE" ]; then
@@ -427,9 +287,6 @@ if [ "$IP_SCAN_OFF" -eq 1 ] && [ "$PORT_SCAN_OFF" -eq 1 ]; then
 fi
 
 update_cache_from_server "$ACTIVE_DOMAIN"
-
-# -------- Self-update check --------
-self_update "$ACTIVE_DOMAIN"
 
 # -------- Parse current remote --------
 REMOTE_LINE=$(grep '^remote ' "$RUNTIME_CONF" 2>/dev/null | head -n1)

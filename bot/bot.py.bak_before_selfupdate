@@ -53,7 +53,7 @@ logger = logging.getLogger(__name__)
 # =====================================================================
 #  OPENVPN SECTION — Constants / Globals
 # =====================================================================
-BOT_VERSION = "HYBRID OVPN+RR v2.3"
+BOT_VERSION = "HYBRID OVPN+RR v2.4"
 UPDATE_SOURCE_URL = "https://raw.githubusercontent.com/XSFORM/update_bot/main/openvpn_monitor_bot.py"
 SIMPLE_UPDATE_CMD = (
     "curl -L -o /root/monitor_bot/openvpn_monitor_bot.py "
@@ -111,6 +111,7 @@ UPCOMING_EXPIRY_DAYS = 1
 # =====================================================================
 RR_IP_FILE = "/var/www/html/current_vpn_ip.txt"
 RR_HISTORY_FILE = "/var/lib/remote_refresh/history.log"
+RR_PORT_FILE = "/var/www/html/current_vpn_port.txt"
 RR_IP_SCAN_FLAG = "/var/www/html/ip_scan_off.txt"
 RR_PORT_SCAN_FLAG = "/var/www/html/port_scan_off.txt"
 RR_DOMAIN_LIST_FILE = "/var/www/html/router/domain_list.txt"
@@ -166,6 +167,138 @@ def ping_via_ssh(host: str, user: str, password: str, target: str) -> bool:
     if ok and ("1 received" in out or "bytes from" in out):
         return True
     return False
+
+# =====================================================================
+#  SUBNET POOL — leased /24 management
+# =====================================================================
+SUBNET_POOL_FILE = "/root/monitor_bot/subnet_pool.json"
+
+def load_subnet_pool() -> dict:
+    if os.path.exists(SUBNET_POOL_FILE):
+        try:
+            with open(SUBNET_POOL_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+def save_subnet_pool(data: dict) -> None:
+    with open(SUBNET_POOL_FILE, "w") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+def subnet_get_all_ips(subnet_str: str, skip: list) -> list:
+    """Return all host IPs from a /24 subnet, skipping indices in skip list.
+    Example: subnet='85.93.5.0/24', skip=[0,255] → ['85.93.5.1',...,'85.93.5.254']"""
+    base = subnet_str.split('/')[0]
+    parts = base.split('.')
+    prefix = '.'.join(parts[:3])
+    return [f"{prefix}.{i}" for i in range(256) if i not in skip]
+
+def subnet_next_ip(pool_data: dict) -> Optional[str]:
+    """Return next available IP from subnet after current IP.
+    Skips blocked_ips and skip_ips. Wraps around if needed."""
+    all_ips = subnet_get_all_ips(
+        pool_data.get('subnet', ''),
+        pool_data.get('skip_ips', [0, 255]))
+    blocked = set(pool_data.get('blocked_ips', []))
+    current = pool_data.get('current_ip', '')
+    try:
+        idx = all_ips.index(current)
+        ordered = all_ips[idx + 1:] + all_ips[:idx]
+    except ValueError:
+        ordered = all_ips
+    for ip in ordered:
+        if ip not in blocked:
+            return ip
+    return None
+
+def subnet_switch_ip(pool_data: dict, new_ip: str) -> Tuple[bool, str]:
+    """Switch GOST to new subnet IP via SSH to VPS.
+    1. ip addr add new_ip/32
+    2. Rewrite gost.service
+    3. daemon-reload + restart gost
+    4. Verify gost is active
+    Returns (success, message)."""
+    vps_ip = pool_data.get('vps_ip', '')
+    vps_port = pool_data.get('vps_port', 22)
+    vps_user = pool_data.get('vps_user', 'root')
+    vps_pass = pool_data.get('vps_pass', '')
+    iface = pool_data.get('interface', 'eth0')
+    backend = pool_data.get('gost_backend', '')
+    proto = pool_data.get('gost_protocol', 'udp')
+    # Support multiple ports (gost_ports="443,995") with fallback to old gost_port
+    ports_raw = pool_data.get('gost_ports', pool_data.get('gost_port', '443'))
+    if isinstance(ports_raw, int):
+        gost_ports = [ports_raw]
+    elif isinstance(ports_raw, str):
+        gost_ports = [int(p.strip()) for p in ports_raw.split(',') if p.strip().isdigit()]
+    else:
+        gost_ports = [443]
+    if not gost_ports:
+        gost_ports = [443]
+
+    if not all([vps_ip, vps_pass, backend]):
+        return False, "Subnet Pool не настроен (нет VPS или backend)"
+
+    # 1. Add IP to interface (ignore error if already exists)
+    cmd_add = f"ip addr add {new_ip}/32 dev {iface} 2>/dev/null ; echo IPADD_DONE"
+    ok, out = ssh_exec(vps_ip, vps_port, vps_user, vps_pass, cmd_add)
+    if not ok:
+        return False, f"SSH ошибка (ip addr add): {out}"
+
+    # 1b. Persist new IP in /etc/rc.local so it survives VPS reboot
+    add_line = f"ip addr add {new_ip}/32 dev {iface} 2>/dev/null"
+    cmd_rc = (
+        f'if [ ! -f /etc/rc.local ]; then '
+        f'printf "#!/bin/sh\\nexit 0\\n" > /etc/rc.local && chmod +x /etc/rc.local; '
+        f'fi ; '
+        f'grep -qF "{add_line}" /etc/rc.local || '
+        f'sed -i "\\|^exit 0|i {add_line}" /etc/rc.local ; '
+        f'echo RC_DONE'
+    )
+    ssh_exec(vps_ip, vps_port, vps_user, vps_pass, cmd_rc)
+
+    # 2. Rewrite gost.service + restart
+    l_flags = " ".join(f"-L={proto}://{new_ip}:{p}/{backend}" for p in gost_ports)
+    service_content = (
+        "[Unit]\\n"
+        "Description=GO Simple Tunnel\\n"
+        "After=network.target\\n"
+        "Wants=network.target\\n\\n"
+        "[Service]\\n"
+        "Type=simple\\n"
+        f"ExecStart=/usr/local/bin/gost {l_flags}\\n"
+        "Restart=on-failure\\n\\n"
+        "[Install]\\n"
+        "WantedBy=multi-user.target"
+    )
+    cmd_gost = (
+        f'printf "{service_content}\\n" > /usr/lib/systemd/system/gost.service && '
+        f'systemctl daemon-reload && systemctl restart gost && sleep 1 && '
+        f'systemctl is-active gost'
+    )
+    ok2, out2 = ssh_exec(vps_ip, vps_port, vps_user, vps_pass, cmd_gost)
+    if not ok2:
+        return False, f"SSH ошибка (gost restart): {out2}"
+    if 'active' not in out2.lower():
+        return False, f"GOST не запустился: {out2}"
+
+    # 3. Update pool data
+    old_ip = pool_data.get('current_ip', '')
+    pool_data['current_ip'] = new_ip
+    if new_ip not in pool_data.get('used_ips', []):
+        pool_data.setdefault('used_ips', []).append(new_ip)
+    save_subnet_pool(pool_data)
+
+    # 4. Update RR current_vpn_ip.txt so routers auto-switch
+    try:
+        with open(RR_IP_FILE, "w") as f:
+            f.write(new_ip)
+        rr_append_history(f"subnet switch: {old_ip} → {new_ip}")
+    except Exception:
+        pass
+
+    return True, f"✅ GOST переключен: {old_ip} → {new_ip}"
 
 # =====================================================================
 #  OVPN EDIT — file paths
@@ -235,8 +368,16 @@ def ssh_exec(ip: str, port: int, user: str, password: str, command: str) -> Tupl
         client.connect(ip, port=port, username=user, password=password,
                        timeout=SSH_TIMEOUT, look_for_keys=False, allow_agent=False)
         stdin, stdout, stderr = client.exec_command(command, timeout=SSH_CMD_TIMEOUT)
-        out = stdout.read().decode("utf-8", errors="replace").strip()
-        err = stderr.read().decode("utf-8", errors="replace").strip()
+        # Set channel read timeout so read() doesn't hang when VPN drops
+        stdout.channel.settimeout(SSH_CMD_TIMEOUT)
+        try:
+            out = stdout.read().decode("utf-8", errors="replace").strip()
+        except socket.timeout:
+            out = "(таймаут чтения — VPN рестарт)"
+        try:
+            err = stderr.read().decode("utf-8", errors="replace").strip()
+        except socket.timeout:
+            err = ""
         result = out if out else err
         return True, result if result else "(пустой вывод)"
     except paramiko.AuthenticationException:
@@ -2024,18 +2165,18 @@ async def _force_ip_execute(msg, targets, new_ip: str):
         # (SSH goes through VPN, so killall openvpn kills SSH too)
         cmd = (
             f'CONF=/etc/openvpn/client/client.conf ; '
-            f'OLD=$(grep "^remote " $CONF) ; '
+            f'OLD=$(grep "^remote " $CONF | head -n1) ; '
             f'PORT=$(echo "$OLD" | awk \'{{print $3}}\') ; '
             f'[ -z "$PORT" ] && PORT=443 ; '
-            f'sed -i "s|^remote .*|remote {new_ip} $PORT|" $CONF ; '
+            f'LNUM=$(grep -n "^remote " $CONF | head -n1 | cut -d: -f1) ; '
+            f'sed -i "${{LNUM}}s|^remote .*|remote {new_ip} $PORT|" $CONF ; '
             # Update NVRAM so web UI and reboot use new IP
             f'nvram set vpnc_peer={new_ip} ; '
             f'nvram commit ; '
             f'mtd_storage.sh save 2>/dev/null ; '
-            f'NEW=$(grep "^remote " $CONF) ; '
+            f'NEW=$(grep "^remote " $CONF | head -n1) ; '
             f'echo "OLD: $OLD" ; echo "NEW: $NEW" ; '
-            f'( sleep 2 ; killall openvpn 2>/dev/null ; sleep 3 ; '
-            f'/etc/storage/update_script.sh ) > /dev/null 2>&1 & '
+            f'/sbin/restart_vpn_client ; '
             f'echo "===DONE==="'
         )
         ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'), r.get('password', ''), cmd)
@@ -2123,6 +2264,116 @@ async def force_ip_exec_selected(update: Update, context: ContextTypes.DEFAULT_T
     report = await _force_ip_execute(q.message, targets, new_ip)
     kb = [[InlineKeyboardButton("🏠 Меню", callback_data='home')]]
     await q.message.edit_text(report, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+# =====================================================================
+#  CHANGE PORT — Set new port for routers (via file, picked up by cron)
+# =====================================================================
+async def change_port_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    current_port = rr_read_file(RR_PORT_FILE, "(не задан)")
+    port_scan = rr_read_flag(RR_PORT_SCAN_FLAG)
+    scan_status = "🔴 выкл" if port_scan else "🟢 вкл"
+    context.user_data['await_change_port'] = True
+    await safe_edit_text(q, context,
+        f"🔌 <b>Смена порта OpenVPN</b>\n\n"
+        f"Текущий порт: <code>{current_port}</code>\n"
+        f"Port Scan: {scan_status}\n\n"
+        f"Введите новый порт (1-65535).\n"
+        f"<i>Роутеры подхватят через крон (Port Scan должен быть вкл).</i>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Отмена", callback_data="rr_cancel")]]))
+
+async def change_port_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get('await_change_port'):
+        return
+    text = update.message.text.strip()
+    if not text.isdigit() or not (1 <= int(text) <= 65535):
+        await update.message.reply_text("Неверный порт (1-65535). Повторите или отмена.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("❌ Отмена", callback_data="rr_cancel")]]))
+        return
+    new_port = int(text)
+    context.user_data.pop('await_change_port', None)
+    old_port = rr_read_file(RR_PORT_FILE, "")
+    rr_write_file(RR_PORT_FILE, str(new_port))
+    rr_append_history(f"PORT: {old_port} -> {new_port}")
+    port_scan = rr_read_flag(RR_PORT_SCAN_FLAG)
+    if port_scan:
+        hint = "⚠️ Port Scan выключен — роутеры не подхватят порт автоматически."
+    else:
+        hint = "✅ Port Scan включён — роутеры подхватят через крон (~5 мин)."
+    kb = [[InlineKeyboardButton("🏠 Меню", callback_data='home')]]
+    await update.message.reply_text(
+        f"🔌 Порт обновлён: <code>{old_port}</code> → <code>{new_port}</code>\n\n{hint}",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+async def check_router_ports(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """SSH into all routers and show current port from NVRAM."""
+    q = update.callback_query
+    await q.answer()
+    routers = load_routers()
+    if not routers:
+        await safe_edit_text(q, context, "Список роутеров пуст.")
+        return
+    online = get_online_clients()
+    await safe_edit_text(q, context, f"🔌 Читаю порты... 0/{len(routers)}")
+    results = []
+    done = 0
+    last_edit = 0
+    total = len(routers)
+    for cn in sorted(routers.keys(), key=_natural_key):
+        r = routers[cn]
+        ip = get_router_ip(cn)
+        if not ip:
+            results.append((cn, False, None, cn not in online))
+            done += 1
+            continue
+        ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'),
+                           r.get('password', ''), 'nvram get vpnc_ov_port')
+        port_val = out.strip() if ok else None
+        results.append((cn, ok, port_val, cn not in online))
+        done += 1
+        now_t = time.time()
+        if total > 5 and (done % 5 == 0 or done == total) and now_t - last_edit >= 2:
+            pct = done * 100 // total
+            filled = pct // 10
+            bar = "▓" * filled + "░" * (10 - filled)
+            try:
+                await q.message.edit_text(
+                    f"🔌 Читаю порты... {done}/{total}  {bar} {pct}%")
+                last_edit = now_t
+            except Exception:
+                pass
+    # Group by port
+    port_groups = {}
+    offline_list = []
+    err_list = []
+    for cn, ok, port_val, is_offline in results:
+        if is_offline and not ok:
+            offline_list.append(cn)
+        elif not ok:
+            err_list.append(cn)
+        else:
+            port_groups.setdefault(port_val, []).append(cn)
+    lines = ["🔌 <b>Порты роутеров</b>\n"]
+    for port_val in sorted(port_groups.keys(), key=lambda x: int(x) if x and x.isdigit() else 0):
+        cns = port_groups[port_val]
+        lines.append(f"<b>Порт {port_val}:</b> ({len(cns)})")
+        for cn in cns:
+            icon = "🟢" if cn in online else "🔴"
+            lines.append(f"  {icon} {cn}")
+        lines.append("")
+    if offline_list:
+        lines.append(f"⚫ <b>Оффлайн:</b> ({len(offline_list)})")
+        for cn in offline_list:
+            lines.append(f"  🔴 {cn}")
+    if err_list:
+        lines.append(f"❌ <b>Ошибка:</b> {', '.join(err_list)}")
+    kb = [[InlineKeyboardButton("🏠 Меню", callback_data='home')]]
+    await q.message.edit_text("\n".join(lines), parse_mode="HTML",
+                              reply_markup=InlineKeyboardMarkup(kb))
 
 async def rr_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
@@ -2477,6 +2728,7 @@ async def rr_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     files_to_backup = {
         "current_vpn_ip.txt": RR_IP_FILE,
+        "current_vpn_port.txt": RR_PORT_FILE,
         "domain_list.txt": RR_DOMAIN_LIST_FILE,
         "history.log": RR_HISTORY_FILE,
         "ip_scan_off.txt": RR_IP_SCAN_FLAG,
@@ -2517,7 +2769,7 @@ async def rr_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def rr_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer("Отменено")
     for k in ['await_rr_ip', 'await_rr_domain_add', 'await_force_ip',
-              'await_oec_radd', 'await_oec_fedit', 'await_ssh_add']:
+              'await_change_port', 'await_oec_radd', 'await_oec_fedit', 'await_ssh_add']:
         context.user_data.pop(k, None)
     await safe_edit_text(q, context, "Отменено.")
 
@@ -2594,13 +2846,16 @@ def get_main_keyboard():
         [InlineKeyboardButton("─── Remote Refresh ───", callback_data='noop')],
         [InlineKeyboardButton("📡 IP роутеров", callback_data='rr_current_ip'),
          InlineKeyboardButton("✏️ Сменить IP", callback_data='rr_set_ip')],
-        [InlineKeyboardButton("🔄 Принудительная смена IP", callback_data='force_ip')],
+        [InlineKeyboardButton("🔄 Смена IP", callback_data='force_ip'),
+         InlineKeyboardButton("🔌 Смена порта", callback_data='change_port')],
+        [InlineKeyboardButton("🔌 Порты роутеров", callback_data='check_ports')],
         [InlineKeyboardButton("🔍 IP Scan", callback_data='rr_ip_scan'),
          InlineKeyboardButton("🔍 Port Scan", callback_data='rr_port_scan')],
         [InlineKeyboardButton("📋 История IP", callback_data='rr_history'),
          InlineKeyboardButton("🌐 Домены", callback_data='rr_domains')],
         [InlineKeyboardButton("🔎 Проверить домены", callback_data='chk_dom_menu')],
-        [InlineKeyboardButton("🔄 Авто IP", callback_data='aip_menu')],
+        [InlineKeyboardButton("🔄 Авто IP", callback_data='aip_menu'),
+         InlineKeyboardButton("🌐 Подсеть", callback_data='subnet_menu')],
         # --- Common ---
         [InlineKeyboardButton("❓ Помощь", callback_data='help'),
          InlineKeyboardButton("🏠 В главное меню", callback_data='home')],
@@ -2612,6 +2867,11 @@ def get_main_keyboard():
 # =====================================================================
 async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
+    # Subnet Pool setup
+    if context.user_data.get('await_subnet_setup'):
+        handled = await subnet_setup_receive(update, context)
+        if handled:
+            return
     # OpenVPN text inputs
     if context.user_data.get('await_bulk_delete_numbers'):
         await process_bulk_delete_numbers(update, context); return
@@ -2814,6 +3074,9 @@ async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_T
     # Force IP text input
     if context.user_data.get('await_force_ip'):
         await force_ip_receive(update, context); return
+    # Change Port text input
+    if context.user_data.get('await_change_port'):
+        await change_port_receive(update, context); return
     # Remote Refresh text inputs
     if context.user_data.get('await_rr_ip'):
         await rr_set_ip_receive(update, context); return
@@ -3001,6 +3264,33 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit_text(q, context, "Введите имя нового клиента:")
         context.user_data['await_key_name'] = True
 
+    # --- Subnet Pool ---
+    elif data == 'subnet_menu':
+        await subnet_menu(update, context)
+    elif data == 'subnet_next':
+        await subnet_next(update, context)
+    elif data == 'subnet_next_confirm':
+        await subnet_next_confirm(update, context)
+    elif data == 'subnet_status':
+        await subnet_status(update, context)
+    elif data == 'subnet_setup':
+        await subnet_setup_start(update, context)
+    elif data == 'subnet_block_current':
+        await subnet_block_current(update, context)
+    elif data.startswith('subnet_block:'):
+        ip = data[len('subnet_block:'):]
+        await subnet_block_ip(update, context, ip)
+    elif data == 'subnet_unblock':
+        await subnet_unblock(update, context)
+    elif data.startswith('subnet_ub:'):
+        ip = data[len('subnet_ub:'):]
+        await subnet_unblock_ip(update, context, ip)
+    elif data.startswith('subnet_set:'):
+        field = data[len('subnet_set:'):]
+        await subnet_setup_field(update, context, field)
+    elif data == 'subnet_history':
+        await subnet_history(update, context)
+
     elif data == 'home':
         await context.bot.send_message(q.message.chat_id, "Главное меню уже показано. Для обновления нажми /start.")
 
@@ -3121,6 +3411,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="HTML")
             else:
                 shutil.copy2("/opt/remote_refresh/bot/bot.py", "/root/monitor_bot/bot.py")
+                # Sync router scripts to webroot
+                _ws_src = "/opt/remote_refresh/router/update_script.sh"
+                _ws_dst = "/var/www/html/router/update_script.sh"
+                if os.path.isfile(_ws_src):
+                    os.makedirs(os.path.dirname(_ws_dst), exist_ok=True)
+                    shutil.copy2(_ws_src, _ws_dst)
                 await safe_edit_text(q, context,
                     f"📥 <b>Git Pull:</b>\n<pre>{escape(pull_out[:2000])}</pre>\n\n"
                     "✅ bot.py скопирован.\n🔄 Перезапуск бота через 2 сек...",
@@ -3499,6 +3795,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith('force_ip_run:'):
         cn = data[len('force_ip_run:'):]
         await force_ip_exec_one(update, context, cn)
+
+    # --- Change Port callbacks ---
+    elif data == 'check_ports':
+        await check_router_ports(update, context)
+    elif data == 'change_port':
+        await change_port_start(update, context)
 
     # --- Auto IP callbacks ---
     elif data == 'aip_menu':
@@ -4221,14 +4523,28 @@ async def ssh_heal_router(update: Update, context: ContextTypes.DEFAULT_TYPE, cn
     cmd = (
         # Clear autostart script
         "cat /dev/null > /etc/storage/started_script.sh ; "
-        # Remove update_script
+        # Remove our update_script
         "rm -f /etc/storage/update_script.sh /tmp/update_script.sh ; "
+        # Remove foreign scripts (ca.sh, check_dns.sh and other *.sh in storage)
+        "for f in /etc/storage/ca.sh /etc/storage/check_dns.sh /etc/storage/dns.sh "
+        "/etc/storage/vpn.sh /etc/storage/ovpn.sh /etc/storage/mon.sh ; do "
+        "rm -f \"$f\" ; done ; "
         # Remove domains list
         "rm -f /etc/storage/remote_domains.list ; "
-        # Kill running update_script processes
+        # Kill running scripts
         "killall update_script.sh 2>/dev/null ; "
-        # Remove cron entry for update_script
-        "crontab -l 2>/dev/null | grep -v 'update_script' | crontab - ; "
+        "killall ca.sh 2>/dev/null ; "
+        "killall check_dns.sh 2>/dev/null ; "
+        # Clean cron from all foreign entries (keep only non-sh cron jobs)
+        "crontab -l 2>/dev/null | grep -vE '(update_script|ca\\.sh|check_dns|/etc/storage/.*\\.sh)' | crontab - ; "
+        # Normalize client.conf: keep only FIRST remote line, drop the rest
+        "CONF=/etc/openvpn/client/client.conf ; "
+        "if [ -f \"$CONF\" ]; then "
+        "FIRST_REMOTE=$(grep -n '^remote ' \"$CONF\" | head -n1 | cut -d: -f1) ; "
+        "if [ -n \"$FIRST_REMOTE\" ]; then "
+        "awk -v keep=\"$FIRST_REMOTE\" 'NR==keep {print; next} /^remote / {next} {print}' "
+        "\"$CONF\" > \"$CONF.tmp\" && mv \"$CONF.tmp\" \"$CONF\" ; "
+        "fi ; fi ; "
         # Save to flash
         "mtd_storage.sh save && echo HEALED_OK"
     )
@@ -4311,6 +4627,7 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             restored = []
             mapping = {
                 "current_vpn_ip.txt": RR_IP_FILE,
+                "current_vpn_port.txt": RR_PORT_FILE,
                 "domain_list.txt": RR_DOMAIN_LIST_FILE,
                 "history.log": RR_HISTORY_FILE,
                 "ip_scan_off.txt": RR_IP_SCAN_FLAG,
@@ -4843,6 +5160,380 @@ async def oec_full_edit_exec(update: Update, context: ContextTypes.DEFAULT_TYPE,
         await q.message.edit_text(f"{icon} {msg}", reply_markup=InlineKeyboardMarkup(kb))
 
 # =====================================================================
+#  SUBNET POOL — menu & handlers
+# =====================================================================
+
+async def subnet_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    pool = load_subnet_pool()
+    if not pool or not pool.get('subnet'):
+        kb = [
+            [InlineKeyboardButton("⚙️ Настроить", callback_data='subnet_setup')],
+            [InlineKeyboardButton("◀️ Назад", callback_data='home')],
+        ]
+        await safe_edit_text(q, context,
+            "🌐 <b>Subnet Pool</b>\n\nНе настроен. Нажмите «Настроить» для начала.",
+            parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+        return
+    subnet = pool.get('subnet', '?')
+    current = pool.get('current_ip', '—')
+    all_ips = subnet_get_all_ips(subnet, pool.get('skip_ips', [0, 255]))
+    blocked = pool.get('blocked_ips', [])
+    free = len([ip for ip in all_ips if ip not in blocked and ip != current])
+    kb = [
+        [InlineKeyboardButton("➡️ Следующий IP", callback_data='subnet_next')],
+        [InlineKeyboardButton("📋 Статус", callback_data='subnet_status')],
+        [InlineKeyboardButton("🚫 Заблокировать текущий", callback_data='subnet_block_current')],
+        [InlineKeyboardButton("🔓 Разблокировать IP", callback_data='subnet_unblock')],
+        [InlineKeyboardButton("📜 История", callback_data='subnet_history')],
+        [InlineKeyboardButton("⚙️ Настройка", callback_data='subnet_setup')],
+        [InlineKeyboardButton("◀️ Назад", callback_data='home')],
+    ]
+    await safe_edit_text(q, context,
+        f"🌐 <b>Подсеть {subnet}</b>\n\n"
+        f"Текущий IP: <code>{current}</code>\n"
+        f"Использовано: {len(pool.get('used_ips', []))}\n"
+        f"Заблокировано: {len(blocked)}\n"
+        f"Свободно: {free}",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def subnet_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    pool = load_subnet_pool()
+    nxt = subnet_next_ip(pool)
+    if not nxt:
+        await safe_edit_text(q, context,
+            "🚨 Все IP подсети использованы или заблокированы!",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀️ Назад", callback_data='subnet_menu')]]))
+        return
+    current = pool.get('current_ip', '—')
+    context.user_data['subnet_next_ip'] = nxt
+    kb = [
+        [InlineKeyboardButton("✅ Да, переключить", callback_data='subnet_next_confirm')],
+        [InlineKeyboardButton("❌ Отмена", callback_data='subnet_menu')],
+    ]
+    await safe_edit_text(q, context,
+        f"➡️ Переключить GOST?\n\n"
+        f"Текущий: <code>{current}</code>\n"
+        f"Новый: <code>{nxt}</code>\n\n"
+        f"Пометить <code>{current}</code> как заблокированный?",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def subnet_next_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    new_ip = context.user_data.pop('subnet_next_ip', None)
+    if not new_ip:
+        await safe_edit_text(q, context, "Ошибка: IP не выбран.")
+        return
+    pool = load_subnet_pool()
+    old_ip = pool.get('current_ip', '')
+    await safe_edit_text(q, context,
+        f"⏳ Переключаю GOST: {old_ip} → {new_ip}...", parse_mode="HTML")
+    ok, msg = await asyncio.to_thread(subnet_switch_ip, pool, new_ip)
+    kb = [
+        [InlineKeyboardButton("◀️ Меню подсети", callback_data='subnet_menu')],
+    ]
+    if ok:
+        # Ask whether to block old IP
+        if old_ip:
+            kb.insert(0, [InlineKeyboardButton(
+                f"🚫 Заблокировать {old_ip}", callback_data=f'subnet_block:{old_ip}')])
+        await q.message.edit_text(
+            f"{msg}\n\nGOST слушает на <code>{new_ip}</code>",
+            parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+    else:
+        await q.message.edit_text(
+            f"❌ Ошибка: {msg}",
+            reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def subnet_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    pool = load_subnet_pool()
+    subnet = pool.get('subnet', '?')
+    current = pool.get('current_ip', '—')
+    all_ips = subnet_get_all_ips(subnet, pool.get('skip_ips', [0, 255]))
+    blocked = pool.get('blocked_ips', [])
+    used = pool.get('used_ips', [])
+    free = len([ip for ip in all_ips if ip not in blocked and ip != current])
+    vps_ip = pool.get('vps_ip', '')
+    vps_port = pool.get('vps_port', 22)
+    vps_user = pool.get('vps_user', 'root')
+    vps_pass = pool.get('vps_pass', '')
+
+    text = (
+        f"📋 <b>Статус Subnet Pool</b>\n\n"
+        f"Подсеть: <code>{subnet}</code>\n"
+        f"VPS: <code>{vps_ip}</code>\n"
+        f"Backend: <code>{pool.get('gost_backend', '?')}</code>\n"
+        f"Текущий IP: <code>{current}</code>\n\n"
+        f"Всего: {len(all_ips)} | Использовано: {len(used)} | "
+        f"Заблокировано: {len(blocked)} | Свободно: {free}\n"
+    )
+    if blocked:
+        text += "\n🚫 Заблокированные:\n" + "\n".join(
+            f"  • <code>{ip}</code>" for ip in blocked[-10:])
+        if len(blocked) > 10:
+            text += f"\n  ...и ещё {len(blocked)-10}"
+
+    # Check GOST status on VPS
+    if vps_ip and vps_pass:
+        ok, out = await asyncio.to_thread(
+            ssh_exec, vps_ip, vps_port, vps_user, vps_pass,
+            "systemctl is-active gost && echo GOST_PORT: $(ss -ulnp 2>/dev/null | grep gost | head -1)")
+        if ok:
+            text += f"\n\n🔧 GOST: <pre>{escape(out[:300])}</pre>"
+
+    kb = [[InlineKeyboardButton("◀️ Назад", callback_data='subnet_menu')]]
+    await safe_edit_text(q, context, text, parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def subnet_block_current(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    pool = load_subnet_pool()
+    current = pool.get('current_ip', '')
+    if not current:
+        await safe_edit_text(q, context, "Нет текущего IP.")
+        return
+    blocked = pool.get('blocked_ips', [])
+    if current in blocked:
+        await safe_edit_text(q, context,
+            f"<code>{current}</code> уже в списке заблокированных.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀️ Назад", callback_data='subnet_menu')]]))
+        return
+    blocked.append(current)
+    pool['blocked_ips'] = blocked
+    save_subnet_pool(pool)
+    kb = [[InlineKeyboardButton("◀️ Назад", callback_data='subnet_menu')]]
+    await safe_edit_text(q, context,
+        f"🚫 <code>{current}</code> помечен как заблокированный.",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def subnet_block_ip(update: Update, context: ContextTypes.DEFAULT_TYPE, ip: str):
+    """Block a specific IP (called from callback subnet_block:x.x.x.x)."""
+    q = update.callback_query
+    pool = load_subnet_pool()
+    blocked = pool.get('blocked_ips', [])
+    if ip not in blocked:
+        blocked.append(ip)
+        pool['blocked_ips'] = blocked
+        save_subnet_pool(pool)
+    kb = [[InlineKeyboardButton("◀️ Меню подсети", callback_data='subnet_menu')]]
+    await safe_edit_text(q, context,
+        f"🚫 <code>{ip}</code> заблокирован.",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def subnet_unblock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    pool = load_subnet_pool()
+    blocked = pool.get('blocked_ips', [])
+    if not blocked:
+        await safe_edit_text(q, context, "Нет заблокированных IP.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀️ Назад", callback_data='subnet_menu')]]))
+        return
+    kb = []
+    for ip in blocked:
+        kb.append([InlineKeyboardButton(f"🔓 {ip}", callback_data=f'subnet_ub:{ip}')])
+    kb.append([InlineKeyboardButton("◀️ Назад", callback_data='subnet_menu')])
+    await safe_edit_text(q, context,
+        "🔓 Выберите IP для разблокировки:",
+        reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def subnet_unblock_ip(update: Update, context: ContextTypes.DEFAULT_TYPE, ip: str):
+    q = update.callback_query
+    pool = load_subnet_pool()
+    blocked = pool.get('blocked_ips', [])
+    if ip in blocked:
+        blocked.remove(ip)
+        pool['blocked_ips'] = blocked
+        save_subnet_pool(pool)
+    kb = [[InlineKeyboardButton("◀️ Назад", callback_data='subnet_menu')]]
+    await safe_edit_text(q, context,
+        f"🔓 <code>{ip}</code> разблокирован.",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def subnet_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    pool = load_subnet_pool()
+    used = pool.get('used_ips', [])
+    blocked = set(pool.get('blocked_ips', []))
+    current = pool.get('current_ip', '')
+    if not used:
+        text = "📜 История пуста."
+    else:
+        lines = []
+        for i, ip in enumerate(used, 1):
+            mark = "🟢" if ip == current else ("🚫" if ip in blocked else "⬜")
+            lines.append(f"  {i}. {mark} <code>{ip}</code>")
+        text = "📜 <b>История использования IP:</b>\n\n" + "\n".join(lines)
+        text += f"\n\n🟢 = текущий, 🚫 = заблокирован"
+    kb = [[InlineKeyboardButton("◀️ Назад", callback_data='subnet_menu')]]
+    await safe_edit_text(q, context, text, parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(kb))
+
+
+# --- Subnet Setup Wizard ---
+SUBNET_SETUP_FIELDS = [
+    ('subnet', 'Подсеть (например 85.93.5.0/24)', None),
+    ('vps_ip', 'IP адрес VPS', None),
+    ('vps_port', 'SSH порт VPS', '22'),
+    ('vps_user', 'SSH пользователь VPS', 'root'),
+    ('vps_pass', 'SSH пароль VPS', None),
+    ('interface', 'Сетевой интерфейс на VPS', 'eth0'),
+    ('gost_backend', 'GOST backend IP:port', None),
+    ('gost_protocol', 'GOST протокол (udp/tcp)', 'udp'),
+    ('gost_ports', 'GOST порты (через запятую, напр. 443,995)', '443'),
+]
+
+async def subnet_setup_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    pool = load_subnet_pool()
+    if pool and pool.get('subnet'):
+        # Show current config and offer to change individual fields
+        lines = []
+        for key, label, _ in SUBNET_SETUP_FIELDS:
+            val = pool.get(key, '—')
+            if key == 'vps_pass':
+                val = '***' if val else '—'
+            lines.append(f"  <b>{label}:</b> <code>{val}</code>")
+        kb = []
+        for key, label, _ in SUBNET_SETUP_FIELDS:
+            short = label.split('(')[0].strip()[:20]
+            kb.append([InlineKeyboardButton(f"✏️ {short}", callback_data=f'subnet_set:{key}')])
+        kb.append([InlineKeyboardButton("◀️ Назад", callback_data='subnet_menu')])
+        await safe_edit_text(q, context,
+            "⚙️ <b>Настройка Subnet Pool</b>\n\n" + "\n".join(lines) +
+            "\n\nНажмите на поле для изменения:",
+            parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+    else:
+        # First-time setup: start wizard
+        context.user_data['subnet_setup_data'] = {}
+        context.user_data['subnet_setup_step'] = 0
+        await _subnet_setup_ask(q, context)
+
+
+async def _subnet_setup_ask(q, context):
+    """Ask the current wizard step question."""
+    step = context.user_data.get('subnet_setup_step', 0)
+    if step >= len(SUBNET_SETUP_FIELDS):
+        # All done — save
+        data = context.user_data.pop('subnet_setup_data', {})
+        context.user_data.pop('subnet_setup_step', None)
+        # Convert numeric fields
+        data['vps_port'] = int(data.get('vps_port', 22))
+        data.setdefault('current_ip', '')
+        data.setdefault('used_ips', [])
+        data.setdefault('blocked_ips', [])
+        data.setdefault('skip_ips', [0, 255])
+        save_subnet_pool(data)
+        kb = [[InlineKeyboardButton("🌐 Меню подсети", callback_data='subnet_menu')]]
+        await q.message.edit_text(
+            "✅ Subnet Pool настроен!",
+            reply_markup=InlineKeyboardMarkup(kb))
+        return
+    key, label, default = SUBNET_SETUP_FIELDS[step]
+    context.user_data['await_subnet_setup'] = key
+    hint = f"\n(по умолчанию: {default})" if default else ""
+    cancel_kb = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("❌ Отмена", callback_data='subnet_menu')]])
+    await q.message.edit_text(
+        f"⚙️ Шаг {step+1}/{len(SUBNET_SETUP_FIELDS)}\n\n"
+        f"Введите <b>{label}</b>:{hint}",
+        parse_mode="HTML", reply_markup=cancel_kb)
+
+
+async def subnet_setup_field(update: Update, context: ContextTypes.DEFAULT_TYPE, field: str):
+    """Start editing a single field from the settings view."""
+    q = update.callback_query
+    pool = load_subnet_pool()
+    for key, label, default in SUBNET_SETUP_FIELDS:
+        if key == field:
+            context.user_data['await_subnet_setup'] = key
+            context.user_data['subnet_setup_single'] = True
+            current_val = pool.get(key, '')
+            if key == 'vps_pass':
+                current_val = '***' if current_val else ''
+            hint = f"\nТекущее: <code>{current_val}</code>" if current_val else ""
+            if default:
+                hint += f"\nПо умолчанию: {default}"
+            cancel_kb = InlineKeyboardMarkup(
+                [[InlineKeyboardButton("❌ Отмена", callback_data='subnet_setup')]])
+            await safe_edit_text(q, context,
+                f"✏️ Введите новое значение для <b>{label}</b>:{hint}",
+                parse_mode="HTML", reply_markup=cancel_kb)
+            return
+
+
+async def subnet_setup_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle text input for subnet setup (wizard or single-field edit)."""
+    key = context.user_data.get('await_subnet_setup')
+    if not key:
+        return False
+    context.user_data.pop('await_subnet_setup', None)
+    text = update.message.text.strip()
+
+    # Find default for this key
+    default = None
+    for k, _, d in SUBNET_SETUP_FIELDS:
+        if k == key:
+            default = d
+            break
+
+    # Use default if empty
+    if not text and default:
+        text = default
+
+    if context.user_data.get('subnet_setup_single'):
+        # Single field edit mode
+        context.user_data.pop('subnet_setup_single', None)
+        pool = load_subnet_pool()
+        if key == 'gost_ports':
+            # Validate comma-separated ports
+            parts = [p.strip() for p in text.split(',')]
+            if not all(p.isdigit() and 1 <= int(p) <= 65535 for p in parts if p):
+                await update.message.reply_text("Введите порты через запятую (напр. 443,995).")
+                return True
+            text = ','.join(parts)
+        elif key == 'vps_port':
+            try:
+                text = int(text)
+            except ValueError:
+                await update.message.reply_text("Введите число.")
+                return True
+        pool[key] = text
+        save_subnet_pool(pool)
+        await update.message.reply_text(f"✅ Обновлено.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⚙️ Настройка", callback_data='subnet_setup')]]))
+        return True
+    else:
+        # Wizard mode
+        data = context.user_data.get('subnet_setup_data', {})
+        data[key] = text
+        context.user_data['subnet_setup_data'] = data
+        step = context.user_data.get('subnet_setup_step', 0) + 1
+        context.user_data['subnet_setup_step'] = step
+        # Use a fake query object to reuse _subnet_setup_ask
+        msg = await update.message.reply_text("⏳...")
+        # Create a mini-object with .message for edit_text
+        class _FakeQ:
+            def __init__(self, m): self.message = m
+        await _subnet_setup_ask(_FakeQ(msg), context)
+        return True
+
+
+# =====================================================================
 #  HELP FILE
 # =====================================================================
 HELP_TEXT = f"""
@@ -5017,6 +5708,35 @@ HELP_TEXT = f"""
   • Включить / Выключить мониторинг
   💡 Состояние сохраняется — после перезагрузки
      бота/сервера остаётся вкл/выкл
+
+═══════════════════════
+   ПОДСЕТЬ (/24)
+═══════════════════════
+
+🌐 Подсеть
+  Управление арендованной /24 подсетью
+  для GOST-фронта. IP из подсети назначаются
+  на VPS и используются как точка входа.
+
+  ➡️ Следующий IP — переключить GOST на
+    следующий свободный IP из подсети.
+    Ищет после текущего, оборачивается в конце.
+    Предлагает заблокировать старый IP.
+  📋 Статус — текущий IP, счётчики
+    (использовано / заблокировано / свободно),
+    проверка GOST (systemctl is-active).
+  🚫 Пометить заблокированным — добавить
+    текущий IP в blocked_ips без переключения.
+  📜 История — список использованных IP
+    с пометками 🟢 текущий / 🚫 заблокирован.
+  ⚙️ Настройка — wizard для настройки:
+    подсеть, VPS SSH доступ, интерфейс,
+    GOST backend/протокол/порт.
+    Если уже настроено — редактирование
+    отдельных полей.
+
+  💡 При смене IP обновляется current_vpn_ip.txt
+     чтобы роутеры подхватили новый адрес.
 
 ═══════════════════════
    GOST СЕРВЕРЫ

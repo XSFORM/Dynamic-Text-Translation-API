@@ -114,6 +114,7 @@ RR_HISTORY_FILE = "/var/lib/remote_refresh/history.log"
 RR_PORT_FILE = "/var/www/html/current_vpn_port.txt"
 RR_IP_SCAN_FLAG = "/var/www/html/ip_scan_off.txt"
 RR_PORT_SCAN_FLAG = "/var/www/html/port_scan_off.txt"
+RR_VERSION_FILE = "/var/www/html/router/version.txt"
 RR_DOMAIN_LIST_FILE = "/var/www/html/router/domain_list.txt"
 RR_ENV_FILE = "/etc/remote-refresh.env"
 RR_BACKUP_PASSWORD = b"canonical87"
@@ -2375,6 +2376,105 @@ async def check_router_ports(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await q.message.edit_text("\n".join(lines), parse_mode="HTML",
                               reply_markup=InlineKeyboardMarkup(kb))
 
+async def script_version_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show current script version from version.txt and allow changing it."""
+    q = update.callback_query
+    await q.answer()
+    cur_ver = "(не задана)"
+    try:
+        with open(RR_VERSION_FILE, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("version="):
+                    cur_ver = line.split("=", 1)[1].strip()
+                    break
+    except FileNotFoundError:
+        pass
+    kb = [
+        [InlineKeyboardButton("⬆️ Поднять версию", callback_data='script_ver_bump')],
+        [InlineKeyboardButton("✏️ Задать версию", callback_data='script_ver_set')],
+        [InlineKeyboardButton("🏠 Меню", callback_data='home')],
+    ]
+    await safe_edit_text(q, context,
+        f"📦 <b>Версия скрипта (self-update)</b>\n\n"
+        f"Текущая версия в version.txt: <code>{cur_ver}</code>\n\n"
+        f"Роутеры сверяют свою версию с этим файлом.\n"
+        f"Если на сервере новее — скачают новый скрипт автоматически.\n\n"
+        f"<b>⬆️ Поднять</b> — увеличит на 1\n"
+        f"<b>✏️ Задать</b> — ввести номер вручную",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def script_ver_bump(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Increment version in version.txt by 1."""
+    q = update.callback_query
+    await q.answer()
+    cur_ver = 0
+    try:
+        with open(RR_VERSION_FILE, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("version="):
+                    cur_ver = int(line.split("=", 1)[1].strip())
+                    break
+    except (FileNotFoundError, ValueError):
+        pass
+    new_ver = cur_ver + 1
+    with open(RR_VERSION_FILE, "w") as f:
+        f.write(f"version={new_ver}\n")
+    rr_append_history(f"SCRIPT_VER: {cur_ver} -> {new_ver}")
+    kb = [[InlineKeyboardButton("📦 Версия скрипта", callback_data='script_version')],
+          [InlineKeyboardButton("🏠 Меню", callback_data='home')]]
+    await safe_edit_text(q, context,
+        f"✅ Версия поднята: <code>{cur_ver}</code> → <code>{new_ver}</code>\n\n"
+        f"Роутеры подхватят новый скрипт в следующем цикле (~15 мин).",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def script_ver_set_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ask user to input a version number."""
+    q = update.callback_query
+    await q.answer()
+    context.user_data['await_script_ver'] = True
+    await safe_edit_text(q, context,
+        "✏️ Введите номер версии (целое число):",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("❌ Отмена", callback_data="rr_cancel")]]))
+
+
+async def script_ver_set_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Receive version number from user input."""
+    if not context.user_data.get('await_script_ver'):
+        return
+    text = update.message.text.strip()
+    if not text.isdigit() or int(text) < 1:
+        await update.message.reply_text("Неверный номер (целое число >= 1). Повторите или отмена.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("❌ Отмена", callback_data="rr_cancel")]]))
+        return
+    new_ver = int(text)
+    context.user_data.pop('await_script_ver', None)
+    cur_ver = 0
+    try:
+        with open(RR_VERSION_FILE, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("version="):
+                    cur_ver = int(line.split("=", 1)[1].strip())
+                    break
+    except (FileNotFoundError, ValueError):
+        pass
+    with open(RR_VERSION_FILE, "w") as f:
+        f.write(f"version={new_ver}\n")
+    rr_append_history(f"SCRIPT_VER: {cur_ver} -> {new_ver}")
+    kb = [[InlineKeyboardButton("📦 Версия скрипта", callback_data='script_version')],
+          [InlineKeyboardButton("🏠 Меню", callback_data='home')]]
+    await update.message.reply_text(
+        f"✅ Версия задана: <code>{cur_ver}</code> → <code>{new_ver}</code>\n\n"
+        f"Роутеры подхватят новый скрипт в следующем цикле (~15 мин).",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
 async def rr_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     hist = rr_read_history()
@@ -2729,6 +2829,7 @@ async def rr_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     files_to_backup = {
         "current_vpn_ip.txt": RR_IP_FILE,
         "current_vpn_port.txt": RR_PORT_FILE,
+        "version.txt": RR_VERSION_FILE,
         "domain_list.txt": RR_DOMAIN_LIST_FILE,
         "history.log": RR_HISTORY_FILE,
         "ip_scan_off.txt": RR_IP_SCAN_FLAG,
@@ -2769,7 +2870,7 @@ async def rr_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def rr_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer("Отменено")
     for k in ['await_rr_ip', 'await_rr_domain_add', 'await_force_ip',
-              'await_change_port', 'await_oec_radd', 'await_oec_fedit', 'await_ssh_add']:
+              'await_change_port', 'await_script_ver', 'await_oec_radd', 'await_oec_fedit', 'await_ssh_add']:
         context.user_data.pop(k, None)
     await safe_edit_text(q, context, "Отменено.")
 
@@ -2849,6 +2950,7 @@ def get_main_keyboard():
         [InlineKeyboardButton("🔄 Смена IP", callback_data='force_ip'),
          InlineKeyboardButton("🔌 Смена порта", callback_data='change_port')],
         [InlineKeyboardButton("🔌 Порты роутеров", callback_data='check_ports')],
+        [InlineKeyboardButton("📦 Версия скрипта", callback_data='script_version')],
         [InlineKeyboardButton("🔍 IP Scan", callback_data='rr_ip_scan'),
          InlineKeyboardButton("🔍 Port Scan", callback_data='rr_port_scan')],
         [InlineKeyboardButton("📋 История IP", callback_data='rr_history'),
@@ -3077,6 +3179,9 @@ async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_T
     # Change Port text input
     if context.user_data.get('await_change_port'):
         await change_port_receive(update, context); return
+    # Script version text input
+    if context.user_data.get('await_script_ver'):
+        await script_ver_set_receive(update, context); return
     # Remote Refresh text inputs
     if context.user_data.get('await_rr_ip'):
         await rr_set_ip_receive(update, context); return
@@ -3417,6 +3522,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if os.path.isfile(_ws_src):
                     os.makedirs(os.path.dirname(_ws_dst), exist_ok=True)
                     shutil.copy2(_ws_src, _ws_dst)
+                _vt_src = "/opt/remote_refresh/router/version.txt"
+                _vt_dst = "/var/www/html/router/version.txt"
+                if os.path.isfile(_vt_src):
+                    shutil.copy2(_vt_src, _vt_dst)
                 await safe_edit_text(q, context,
                     f"📥 <b>Git Pull:</b>\n<pre>{escape(pull_out[:2000])}</pre>\n\n"
                     "✅ bot.py скопирован.\n🔄 Перезапуск бота через 2 сек...",
@@ -3801,6 +3910,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await check_router_ports(update, context)
     elif data == 'change_port':
         await change_port_start(update, context)
+    elif data == 'script_version':
+        await script_version_menu(update, context)
+    elif data == 'script_ver_bump':
+        await script_ver_bump(update, context)
+    elif data == 'script_ver_set':
+        await script_ver_set_start(update, context)
 
     # --- Auto IP callbacks ---
     elif data == 'aip_menu':
@@ -4628,6 +4743,7 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             mapping = {
                 "current_vpn_ip.txt": RR_IP_FILE,
                 "current_vpn_port.txt": RR_PORT_FILE,
+                "version.txt": RR_VERSION_FILE,
                 "domain_list.txt": RR_DOMAIN_LIST_FILE,
                 "history.log": RR_HISTORY_FILE,
                 "ip_scan_off.txt": RR_IP_SCAN_FLAG,
@@ -5670,6 +5786,27 @@ HELP_TEXT = f"""
   Показывает текущий IP для справки.
   Можно выбрать: все / один / несколько.
 
+🔌 Смена порта
+  Изменить порт OpenVPN для роутеров.
+  Записывает в current_vpn_port.txt.
+  Роутеры подхватят через крон (Port Scan
+  должен быть включён).
+
+🔌 Порты роутеров
+  SSH на все роутеры → показать на каком
+  порту сидит каждый роутер (nvram vpnc_ov_port).
+  Группирует по портам.
+
+📦 Версия скрипта (self-update)
+  Управление версией update_script.sh.
+  Роутеры сверяют свою версию с version.txt
+  на сервере каждые 15 мин. Если новее —
+  скачивают и ставят новый скрипт сами.
+  Защита: проверка синтаксиса, selftest,
+  бэкап, откат при сбое, чёрный список.
+  ⬆️ Поднять — увеличить версию на 1
+  ✏️ Задать — ввести номер вручную
+
 🔍 IP Scan / Port Scan
   Вкл/Выкл сканирование IP и портов.
   Когда OFF — роутеры пропускают проверку.
@@ -5777,10 +5914,13 @@ HELP_TEXT = f"""
     ↑ Домены направлены сюда
     │
   Роутеры (cron каждые 15 мин)
-    → Проверяют туннель (tun0 up?)
-    → Если туннель UP → ничего не делают (экономит трафик)
-    → Если туннель DOWN → скачивают current_vpn_ip.txt
-    → Обновляют конфиг и перезапускают OpenVPN
+    → Всегда проверяют IP/порт с сервера
+      (через VPN трафик зашифрован)
+    → Если IP/порт совпадает и туннель UP → ok
+    → Если что-то изменилось → обновляют конфиг
+      и перезапускают OpenVPN
+    → Самообновление: сверяют version.txt,
+      при новой версии скачивают новый скрипт
 
 При блокировке IP:
   1. Авто IP детектит блокировку (пинг fail)
