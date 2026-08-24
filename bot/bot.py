@@ -326,8 +326,19 @@ def load_routers() -> Dict:
         return {}
 
 def save_routers(data: Dict):
-    with open(ROUTERS_FILE, "w") as f:
+    tmp = ROUTERS_FILE + ".tmp"
+    bak = ROUTERS_FILE + ".bak"
+    with open(tmp, "w") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    # verify written file is valid JSON
+    with open(tmp, "r") as f:
+        json.load(f)
+    # backup current file
+    if os.path.exists(ROUTERS_FILE):
+        shutil.copy2(ROUTERS_FILE, bak)
+    os.replace(tmp, ROUTERS_FILE)
 
 def get_router_ip(cn: str) -> Optional[str]:
     """Get router VPN IP from ipp.txt by CN name."""
