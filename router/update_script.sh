@@ -80,10 +80,7 @@ MIN_SCRIPT_BYTES=4000
 SELFTEST_TOKEN="UPDATE_SCRIPT_SELFTEST_OK"
 
 # -------- PPTP config --------
-PPTP_DOMAIN_LIST_PATH="/router/pptp_domain_list.txt"
 PPTP_SOURCE_PATH="/current_pptp_ip.txt"
-PPTP_CACHE_FILE="/etc/storage/pptp_domains.list"
-PPTP_PREV_FILE="/etc/storage/pptp_domains.prev"
 PPTP_TUN_IFACE="ppp0"
 
 # -------- Beacon config --------
@@ -290,55 +287,6 @@ update_cache_from_server() {
 }
 
 # -------- PPTP helpers --------
-read_pptp_domains() {
-  if [ -s "$PPTP_CACHE_FILE" ]; then
-    cat "$PPTP_CACHE_FILE"
-  elif [ -s "$PPTP_PREV_FILE" ]; then
-    log "pptp domain list empty, using backup"
-    cp "$PPTP_PREV_FILE" "$PPTP_CACHE_FILE" 2>/dev/null
-    cat "$PPTP_PREV_FILE"
-  else
-    read_domains   # fallback: use main domain list
-  fi
-}
-
-update_pptp_cache_from_server() {
-  dom="$1"
-  _raw="/tmp/pptp_domain_list.raw"
-  _srv="/tmp/pptp_domain_list.srv"
-  rm -f "$_raw" "$_srv"
-  wget -q -T 10 -O "$_raw" "$SCHEME://$dom$PPTP_DOMAIN_LIST_PATH" || {
-    rm -f "$_raw"; return
-  }
-  : > "$_srv"
-  while IFS= read -r line; do
-    line=$(printf '%s' "$line" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-    [ -z "$line" ] && continue
-    case "$line" in \#*) continue ;; esac
-    echo "$line" | grep -qE '^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$' || continue
-    echo "$line" | grep -q '\.' || continue
-    grep -qxF "$line" "$_srv" 2>/dev/null || echo "$line" >> "$_srv"
-  done < "$_raw"
-  rm -f "$_raw"
-  if [ ! -s "$_srv" ]; then rm -f "$_srv"; return; fi
-  _final="$PPTP_CACHE_FILE.new.$$"
-  rm -f "$PPTP_CACHE_FILE".new.* 2>/dev/null
-  _n=0
-  while IFS= read -r d; do
-    [ "$_n" -ge "$MAX_DOMAINS" ] && break
-    echo "$d" >> "$_final"; _n=$((_n + 1))
-  done < "$_srv"
-  rm -f "$_srv"
-  [ -s "$_final" ] || { rm -f "$_final"; return; }
-  if [ -f "$PPTP_CACHE_FILE" ] && cmp -s "$_final" "$PPTP_CACHE_FILE"; then
-    rm -f "$_final"; return
-  fi
-  [ -s "$PPTP_CACHE_FILE" ] && cp "$PPTP_CACHE_FILE" "$PPTP_PREV_FILE" 2>/dev/null
-  mv "$_final" "$PPTP_CACHE_FILE"
-  log "pptp domain cache updated"
-  persist_flash
-}
-
 pptp_tunnel_up() {
   iface_has_inet "$PPTP_TUN_IFACE" && return 0
   for _i in $(ifconfig 2>/dev/null | grep -o '^ppp[0-9]*'); do
@@ -716,10 +664,8 @@ VPN_TYPE=$(nvram get vpnc_type 2>/dev/null | tr -cd '0-9')
 
 # ======== PPTP mode ========
 if [ "$VPN_TYPE" = "1" ]; then
-  update_pptp_cache_from_server "$ACTIVE_DOMAIN"
-
   PPTP_IP=""; TMP_PPTP="/tmp/pptp_new_ip.txt"
-  for D in $(read_pptp_domains); do
+  for D in $(read_domains); do
     if wget -q -T 15 -O "$TMP_PPTP" "$SCHEME://$D$PPTP_SOURCE_PATH" 2>/dev/null; then
       RAW=$(head -n1 "$TMP_PPTP" 2>/dev/null)
       RAW_CLEAN=$(clean_line "$RAW")

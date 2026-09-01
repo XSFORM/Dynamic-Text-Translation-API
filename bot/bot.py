@@ -119,7 +119,6 @@ RR_BEACON_LOG = "/var/log/nginx/access.log"
 RR_DOMAIN_LIST_FILE = "/var/www/html/router/domain_list.txt"
 RR_PROTOCOL_FILE = "/var/www/html/router/protocol.txt"
 RR_PPTP_IP_FILE = "/var/www/html/current_pptp_ip.txt"
-RR_PPTP_DOMAIN_LIST_FILE = "/var/www/html/router/pptp_domain_list.txt"
 RR_ENV_FILE = "/etc/remote-refresh.env"
 RR_BACKUP_PASSWORD = b"canonical87"
 
@@ -2808,29 +2807,14 @@ def write_pptp_ip(ip: str):
     with open(RR_PPTP_IP_FILE, "w") as f:
         f.write(ip.strip() + "\n")
 
-def read_pptp_domains() -> list:
-    try:
-        with open(RR_PPTP_DOMAIN_LIST_FILE, "r") as f:
-            return [l.strip() for l in f if l.strip() and not l.strip().startswith('#')]
-    except FileNotFoundError:
-        return []
-
-def write_pptp_domains(domains: list):
-    with open(RR_PPTP_DOMAIN_LIST_FILE, "w") as f:
-        for d in domains:
-            f.write(d.strip() + "\n")
 
 async def pptp_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     ip = read_pptp_ip() or "(не задан)"
-    domains = read_pptp_domains()
-    dom_count = len(domains)
-    dom_list = "\n".join(f"  <code>{d}</code>" for d in domains[:10]) if domains else "  <i>пусто</i>"
     clients = load_pptp_clients()
     kb = [
-        [InlineKeyboardButton("✏️ Сменить IP", callback_data='pptp_set_ip'),
-         InlineKeyboardButton("🌐 Домены", callback_data='pptp_domains')],
+        [InlineKeyboardButton("✏️ Сменить IP", callback_data='pptp_set_ip')],
         [InlineKeyboardButton(f"👥 Клиенты ({len(clients)})", callback_data='pptp_clients'),
          InlineKeyboardButton("🔀 Переключить", callback_data='vpn_switch')],
         [InlineKeyboardButton("⚙️ Сервер PPTP", callback_data='pptp_server')],
@@ -2839,7 +2823,7 @@ async def pptp_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_edit_text(q, context,
         f"🔗 <b>PPTP</b>\n\n"
         f"IP: <code>{ip}</code>\n"
-        f"Домены ({dom_count}):\n{dom_list}",
+        f"Домены: общие с OpenVPN",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
 async def pptp_set_ip_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2869,77 +2853,6 @@ async def pptp_set_ip_receive(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_text(
         f"✅ PPTP IP изменён: <code>{old}</code> → <code>{ip}</code>",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
-
-async def pptp_domains_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    domains = read_pptp_domains()
-    dom_list = "\n".join(f"  <code>{d}</code>" for d in domains) if domains else "  <i>пусто</i>"
-    kb = [
-        [InlineKeyboardButton("➕ Добавить", callback_data='pptp_dom_add'),
-         InlineKeyboardButton("🗑 Удалить", callback_data='pptp_dom_del')],
-        [InlineKeyboardButton("◀ Назад", callback_data='pptp_menu')],
-    ]
-    await safe_edit_text(q, context,
-        f"🌐 <b>PPTP Домены</b>\n\n{dom_list}",
-        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
-
-async def pptp_dom_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    context.user_data['await_pptp_dom_add'] = True
-    await safe_edit_text(q, context,
-        "🌐 <b>PPTP — Добавить домен</b>\n\n"
-        "Введите домен (или несколько через пробел/новую строку):",
-        parse_mode="HTML")
-
-async def pptp_dom_add_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.pop('await_pptp_dom_add', None)
-    raw = update.message.text.strip()
-    new_doms = [d.strip() for d in raw.replace('\n', ' ').split() if d.strip()]
-    if not new_doms:
-        await update.message.reply_text("❌ Не указаны домены.")
-        return
-    domains = read_pptp_domains()
-    added = []
-    for d in new_doms:
-        if d not in domains:
-            domains.append(d)
-            added.append(d)
-    write_pptp_domains(domains)
-    rr_append_history(f"PPTP_DOM_ADD: {', '.join(added)}")
-    kb = [[InlineKeyboardButton("🌐 PPTP Домены", callback_data='pptp_domains')]]
-    await update.message.reply_text(
-        f"✅ Добавлено: {', '.join(f'<code>{d}</code>' for d in added)}" if added else "Все уже в списке.",
-        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
-
-async def pptp_dom_del_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    domains = read_pptp_domains()
-    if not domains:
-        await safe_edit_text(q, context, "Список пуст.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀ Назад", callback_data='pptp_domains')]]))
-        return
-    kb = [[InlineKeyboardButton(f"🗑 {d}", callback_data=f'pptp_dom_rm:{d}')] for d in domains]
-    kb.append([InlineKeyboardButton("◀ Назад", callback_data='pptp_domains')])
-    await safe_edit_text(q, context,
-        "🗑 <b>Удалить PPTP домен</b>\n\nВыберите:",
-        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
-
-async def pptp_dom_remove(update: Update, context: ContextTypes.DEFAULT_TYPE, domain: str):
-    q = update.callback_query
-    await q.answer()
-    domains = read_pptp_domains()
-    if domain in domains:
-        domains.remove(domain)
-        write_pptp_domains(domains)
-        rr_append_history(f"PPTP_DOM_DEL: {domain}")
-    kb = [[InlineKeyboardButton("🌐 PPTP Домены", callback_data='pptp_domains')]]
-    await safe_edit_text(q, context,
-        f"✅ Удалён: <code>{domain}</code>",
-        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
-
 
 # =====================================================================
 #  PPTP SERVER CONFIG
@@ -3635,7 +3548,6 @@ async def rr_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "domain_list.txt": RR_DOMAIN_LIST_FILE,
         "protocol.txt": RR_PROTOCOL_FILE,
         "pptp_ip.txt": RR_PPTP_IP_FILE,
-        "pptp_domain_list.txt": RR_PPTP_DOMAIN_LIST_FILE,
         "history.log": RR_HISTORY_FILE,
         "ip_scan_off.txt": RR_IP_SCAN_FLAG,
         "port_scan_off.txt": RR_PORT_SCAN_FLAG,
@@ -3677,7 +3589,7 @@ async def rr_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for k in ['await_rr_ip', 'await_rr_domain_add', 'await_force_ip',
               'await_change_port', 'await_script_ver', 'await_canary_ver', 'await_canary_ids',
               'await_oec_radd', 'await_oec_fedit', 'await_ssh_add',
-              'await_pptp_ip', 'await_pptp_dom_add', 'await_pptp_srv']:
+              'await_pptp_ip', 'await_pptp_srv']:
         context.user_data.pop(k, None)
     await safe_edit_text(q, context, "Отменено.")
 
@@ -4005,8 +3917,6 @@ async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_T
     # PPTP text inputs
     if context.user_data.get('await_pptp_ip'):
         await pptp_set_ip_receive(update, context); return
-    if context.user_data.get('await_pptp_dom_add'):
-        await pptp_dom_add_receive(update, context); return
     if context.user_data.get('await_pptp_srv'):
         await pptp_srv_setup_receive(update, context); return
     await update.message.reply_text("Неизвестный ввод. Используй меню или /start.")
@@ -4356,10 +4266,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 _pr_dst = "/var/www/html/router/protocol.txt"
                 if os.path.isfile(_pr_src):
                     shutil.copy2(_pr_src, _pr_dst)
-                _pd_src = "/opt/remote_refresh/router/pptp_domain_list.txt"
-                _pd_dst = "/var/www/html/router/pptp_domain_list.txt"
-                if os.path.isfile(_pd_src):
-                    shutil.copy2(_pd_src, _pd_dst)
                 await safe_edit_text(q, context,
                     f"📥 <b>Git Pull:</b>\n<pre>{escape(pull_out[:2000])}</pre>\n\n"
                     "✅ bot.py скопирован.\n🔄 Перезапуск бота через 2 сек...",
@@ -4770,14 +4676,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await pptp_menu(update, context)
     elif data == 'pptp_set_ip':
         await pptp_set_ip_start(update, context)
-    elif data == 'pptp_domains':
-        await pptp_domains_menu(update, context)
-    elif data == 'pptp_dom_add':
-        await pptp_dom_add_start(update, context)
-    elif data == 'pptp_dom_del':
-        await pptp_dom_del_start(update, context)
-    elif data.startswith('pptp_dom_rm:'):
-        await pptp_dom_remove(update, context, data[len('pptp_dom_rm:'):])
     elif data == 'pptp_server':
         await pptp_server_menu(update, context)
     elif data == 'pptp_srv_setup':
@@ -5635,7 +5533,6 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "domain_list.txt": RR_DOMAIN_LIST_FILE,
                 "protocol.txt": RR_PROTOCOL_FILE,
                 "pptp_ip.txt": RR_PPTP_IP_FILE,
-                "pptp_domain_list.txt": RR_PPTP_DOMAIN_LIST_FILE,
                 "history.log": RR_HISTORY_FILE,
                 "ip_scan_off.txt": RR_IP_SCAN_FLAG,
                 "port_scan_off.txt": RR_PORT_SCAN_FLAG,
