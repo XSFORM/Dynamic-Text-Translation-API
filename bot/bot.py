@@ -317,6 +317,10 @@ OVPN_EDIT_FILES = {
 #  SSH ROUTERS — config
 # =====================================================================
 ROUTERS_FILE = "/root/monitor_bot/routers.json"
+PPTP_SERVER_FILE = "/root/monitor_bot/pptp_server.json"
+PPTP_CLIENTS_FILE = "/root/monitor_bot/pptp_clients.json"
+PPTP_IP_START = 10          # 172.16.0.10
+PPTP_IP_PREFIX = "172.16.0"
 IPP_FILE = "/etc/openvpn/ipp.txt"
 SSH_TIMEOUT = 10
 SSH_CMD_TIMEOUT = 15
@@ -344,7 +348,13 @@ def save_routers(data: Dict):
     os.replace(tmp, ROUTERS_FILE)
 
 def get_router_ip(cn: str) -> Optional[str]:
-    """Get router VPN IP from ipp.txt by CN name."""
+    """Get router VPN IP — auto-detect OpenVPN or PPTP based on vpn_type in routers.json."""
+    routers = load_routers()
+    r = routers.get(cn, {})
+    if r.get("vpn_type") == "pptp":
+        clients = load_pptp_clients()
+        return clients.get(cn)
+    # Default: OpenVPN — read from ipp.txt
     try:
         with open(IPP_FILE, "r") as f:
             for line in f:
@@ -375,6 +385,49 @@ def get_online_clients() -> set:
     except FileNotFoundError:
         pass
     return online
+
+# -------- PPTP server & clients helpers --------
+
+def load_pptp_server() -> Dict:
+    try:
+        with open(PPTP_SERVER_FILE, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+def save_pptp_server(data: Dict):
+    with open(PPTP_SERVER_FILE, "w") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+def load_pptp_clients() -> Dict:
+    try:
+        with open(PPTP_CLIENTS_FILE, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+def save_pptp_clients(data: Dict):
+    with open(PPTP_CLIENTS_FILE, "w") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+def next_pptp_ip(clients: Dict) -> Optional[str]:
+    """Find next available IP in PPTP pool (172.16.0.10-254)."""
+    used = set(clients.values())
+    for i in range(PPTP_IP_START, 255):
+        ip = f"{PPTP_IP_PREFIX}.{i}"
+        if ip not in used:
+            return ip
+    return None
+
+def pptp_ssh_exec(command: str) -> Tuple[bool, str]:
+    """Execute SSH command on the PPTP server."""
+    srv = load_pptp_server()
+    if not srv.get("host"):
+        return False, "PPTP сервер не настроен. Используйте ⚙️ Сервер PPTP."
+    return ssh_exec(
+        srv["host"], srv.get("port", 22),
+        srv.get("user", "root"), srv.get("password", ""),
+        command)
 
 def ssh_exec(ip: str, port: int, user: str, password: str, command: str) -> Tuple[bool, str]:
     """Execute SSH command on router. Returns (success, output)."""
@@ -2774,9 +2827,13 @@ async def pptp_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     domains = read_pptp_domains()
     dom_count = len(domains)
     dom_list = "\n".join(f"  <code>{d}</code>" for d in domains[:10]) if domains else "  <i>пусто</i>"
+    clients = load_pptp_clients()
     kb = [
         [InlineKeyboardButton("✏️ Сменить IP", callback_data='pptp_set_ip'),
          InlineKeyboardButton("🌐 Домены", callback_data='pptp_domains')],
+        [InlineKeyboardButton(f"👥 Клиенты ({len(clients)})", callback_data='pptp_clients'),
+         InlineKeyboardButton("🔀 Переключить", callback_data='vpn_switch')],
+        [InlineKeyboardButton("⚙️ Сервер PPTP", callback_data='pptp_server')],
         [InlineKeyboardButton("🏠 Меню", callback_data='home')],
     ]
     await safe_edit_text(q, context,
@@ -2881,6 +2938,342 @@ async def pptp_dom_remove(update: Update, context: ContextTypes.DEFAULT_TYPE, do
     kb = [[InlineKeyboardButton("🌐 PPTP Домены", callback_data='pptp_domains')]]
     await safe_edit_text(q, context,
         f"✅ Удалён: <code>{domain}</code>",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+# =====================================================================
+#  PPTP SERVER CONFIG
+# =====================================================================
+
+async def pptp_server_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    srv = load_pptp_server()
+    host = srv.get("host", "(не задан)")
+    user = srv.get("user", "root")
+    port = srv.get("port", 22)
+    vpn_pass = srv.get("vpn_password", "(не задан)")
+    kb = [
+        [InlineKeyboardButton("✏️ Настроить", callback_data='pptp_srv_setup')],
+        [InlineKeyboardButton("🔗 PPTP", callback_data='pptp_menu')],
+    ]
+    await safe_edit_text(q, context,
+        f"⚙️ <b>PPTP Сервер</b>\n\n"
+        f"SSH: <code>{user}@{host}:{port}</code>\n"
+        f"VPN пароль: <code>{vpn_pass}</code>\n\n"
+        f"Эти данные нужны для управления chap-secrets\n"
+        f"и добавления/удаления PPTP клиентов.",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+async def pptp_srv_setup_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    context.user_data['await_pptp_srv'] = True
+    await safe_edit_text(q, context,
+        "⚙️ <b>Настройка PPTP сервера</b>\n\n"
+        "Введите в формате:\n"
+        "<code>host password vpn_password</code>\n"
+        "или\n"
+        "<code>host user password port vpn_password</code>\n\n"
+        "Пример: <code>1.2.3.4 rootpass123 vpnpass123</code>\n"
+        "или: <code>1.2.3.4 root rootpass123 22 vpnpass123</code>",
+        parse_mode="HTML")
+
+async def pptp_srv_setup_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop('await_pptp_srv', None)
+    parts = update.message.text.strip().split()
+    if len(parts) == 3:
+        srv = {"host": parts[0], "user": "root", "password": parts[1],
+               "port": 22, "vpn_password": parts[2]}
+    elif len(parts) >= 5:
+        srv = {"host": parts[0], "user": parts[1], "password": parts[2],
+               "port": int(parts[3]) if parts[3].isdigit() else 22,
+               "vpn_password": parts[4]}
+    else:
+        await update.message.reply_text("❌ Неверный формат. Нужно 3 или 5 параметров.")
+        return
+    save_pptp_server(srv)
+    # Test connection
+    ok, out = pptp_ssh_exec("echo ok")
+    status = "✅ Подключение успешно" if ok else f"❌ Ошибка: {out}"
+    kb = [[InlineKeyboardButton("⚙️ Сервер PPTP", callback_data='pptp_server')]]
+    await update.message.reply_text(
+        f"✅ PPTP сервер сохранён:\n"
+        f"<code>{srv['user']}@{srv['host']}:{srv['port']}</code>\n\n{status}",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+# =====================================================================
+#  PPTP CLIENTS (chap-secrets management)
+# =====================================================================
+
+async def pptp_clients_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    clients = load_pptp_clients()
+    if clients:
+        lines = [f"  <code>{cn}</code> → <code>{ip}</code>" for cn, ip in
+                 sorted(clients.items(), key=lambda x: x[1])]
+        clist = "\n".join(lines[:30])
+    else:
+        clist = "  <i>пусто</i>"
+    kb = [
+        [InlineKeyboardButton("➕ Добавить", callback_data='pptp_cl_add'),
+         InlineKeyboardButton("➕ Все роутеры", callback_data='pptp_cl_bulk')],
+        [InlineKeyboardButton("🗑 Удалить", callback_data='pptp_cl_del')],
+        [InlineKeyboardButton("🔗 PPTP", callback_data='pptp_menu')],
+    ]
+    await safe_edit_text(q, context,
+        f"👥 <b>PPTP Клиенты</b> ({len(clients)})\n\n{clist}",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+async def pptp_cl_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show SSH routers not yet in PPTP clients for selection."""
+    q = update.callback_query
+    await q.answer()
+    routers = load_routers()
+    clients = load_pptp_clients()
+    available = [cn for cn in sorted(routers.keys(), key=_natural_key)
+                 if cn not in clients]
+    if not available:
+        await safe_edit_text(q, context, "Все SSH роутеры уже добавлены в PPTP.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀ Назад", callback_data='pptp_clients')]]))
+        return
+    kb = [[InlineKeyboardButton(cn, callback_data=f'pptp_cl_add1:{cn}')]
+          for cn in available[:20]]
+    kb.append([InlineKeyboardButton("◀ Назад", callback_data='pptp_clients')])
+    await safe_edit_text(q, context,
+        "➕ <b>Добавить PPTP клиента</b>\n\nВыберите роутер:",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+async def pptp_cl_add_one(update: Update, context: ContextTypes.DEFAULT_TYPE, cn: str):
+    q = update.callback_query
+    await q.answer()
+    clients = load_pptp_clients()
+    if cn in clients:
+        await safe_edit_text(q, context, f"{cn} уже в списке ({clients[cn]})")
+        return
+    ip = next_pptp_ip(clients)
+    if not ip:
+        await safe_edit_text(q, context, "❌ Нет свободных IP в пуле.")
+        return
+    srv = load_pptp_server()
+    vpn_pass = srv.get("vpn_password", "pass123")
+    # Add to chap-secrets on PPTP server
+    cmd = (f'grep -q "^{cn} " /etc/ppp/chap-secrets && '
+           f'sed -i "s/^{cn} .*/{cn} pptpd {vpn_pass} {ip}/" /etc/ppp/chap-secrets || '
+           f'echo "{cn} pptpd {vpn_pass} {ip}" >> /etc/ppp/chap-secrets')
+    ok, out = pptp_ssh_exec(cmd)
+    if not ok:
+        await safe_edit_text(q, context, f"❌ Ошибка SSH: {out}",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀ Назад", callback_data='pptp_clients')]]))
+        return
+    clients[cn] = ip
+    save_pptp_clients(clients)
+    rr_append_history(f"PPTP_CLIENT_ADD: {cn} -> {ip}")
+    kb = [[InlineKeyboardButton("👥 Клиенты", callback_data='pptp_clients')]]
+    await safe_edit_text(q, context,
+        f"✅ <b>{cn}</b> добавлен: <code>{ip}</code>",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+async def pptp_cl_bulk(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Add all SSH routers as PPTP clients at once."""
+    q = update.callback_query
+    await q.answer()
+    routers = load_routers()
+    clients = load_pptp_clients()
+    srv = load_pptp_server()
+    if not srv.get("host"):
+        await safe_edit_text(q, context, "❌ PPTP сервер не настроен.")
+        return
+    vpn_pass = srv.get("vpn_password", "pass123")
+    added = []
+    for cn in sorted(routers.keys(), key=_natural_key):
+        if cn in clients:
+            continue
+        ip = next_pptp_ip(clients)
+        if not ip:
+            break
+        clients[cn] = ip
+        added.append(f"{cn} pptpd {vpn_pass} {ip}")
+    if not added:
+        await safe_edit_text(q, context, "Все роутеры уже добавлены.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀ Назад", callback_data='pptp_clients')]]))
+        return
+    # Bulk add to chap-secrets
+    lines_str = "\\n".join(added)
+    cmd = f'printf "{lines_str}\\n" >> /etc/ppp/chap-secrets'
+    ok, out = pptp_ssh_exec(cmd)
+    if not ok:
+        await safe_edit_text(q, context, f"❌ Ошибка SSH: {out}")
+        return
+    save_pptp_clients(clients)
+    rr_append_history(f"PPTP_BULK_ADD: {len(added)} clients")
+    kb = [[InlineKeyboardButton("👥 Клиенты", callback_data='pptp_clients')]]
+    await safe_edit_text(q, context,
+        f"✅ Добавлено <b>{len(added)}</b> клиентов в chap-secrets.",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+async def pptp_cl_del_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    clients = load_pptp_clients()
+    if not clients:
+        await safe_edit_text(q, context, "Список пуст.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀ Назад", callback_data='pptp_clients')]]))
+        return
+    kb = [[InlineKeyboardButton(f"🗑 {cn} ({ip})", callback_data=f'pptp_cl_rm:{cn}')]
+          for cn, ip in sorted(clients.items(), key=lambda x: x[1])][:20]
+    kb.append([InlineKeyboardButton("◀ Назад", callback_data='pptp_clients')])
+    await safe_edit_text(q, context,
+        "🗑 <b>Удалить PPTP клиента</b>",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+async def pptp_cl_remove(update: Update, context: ContextTypes.DEFAULT_TYPE, cn: str):
+    q = update.callback_query
+    await q.answer()
+    clients = load_pptp_clients()
+    ip = clients.pop(cn, None)
+    if ip is None:
+        await safe_edit_text(q, context, "Клиент не найден.")
+        return
+    # Remove from chap-secrets
+    cmd = f'sed -i "/^{cn} /d" /etc/ppp/chap-secrets'
+    ok, out = pptp_ssh_exec(cmd)
+    save_pptp_clients(clients)
+    rr_append_history(f"PPTP_CLIENT_DEL: {cn} ({ip})")
+    status = "✅" if ok else f"⚠️ chap-secrets: {out}"
+    kb = [[InlineKeyboardButton("👥 Клиенты", callback_data='pptp_clients')]]
+    await safe_edit_text(q, context,
+        f"{status} <b>{cn}</b> ({ip}) удалён.",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+# =====================================================================
+#  VPN SWITCHER (OpenVPN ↔ PPTP)
+# =====================================================================
+
+async def vpn_switch_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    kb = [
+        [InlineKeyboardButton("→ PPTP", callback_data='vpn_to_pptp'),
+         InlineKeyboardButton("→ OpenVPN", callback_data='vpn_to_ovpn')],
+        [InlineKeyboardButton("🔗 PPTP", callback_data='pptp_menu')],
+    ]
+    await safe_edit_text(q, context,
+        "🔀 <b>Переключить VPN</b>\n\n"
+        "Выберите направление, потом роутер(ы).\n"
+        "Переключение идёт по SSH, соединение оборвётся\n"
+        "и роутер подключится к новому VPN.",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+async def vpn_switch_select(update: Update, context: ContextTypes.DEFAULT_TYPE, target_type: str):
+    """Show routers to switch. target_type = 'pptp' or 'openvpn'."""
+    q = update.callback_query
+    await q.answer()
+    routers = load_routers()
+    # Show routers currently on the OPPOSITE type
+    items = []
+    for cn in sorted(routers.keys(), key=_natural_key):
+        cur = routers[cn].get("vpn_type", "openvpn")
+        if target_type == "pptp" and cur != "pptp":
+            items.append(cn)
+        elif target_type == "openvpn" and cur == "pptp":
+            items.append(cn)
+    if not items:
+        label = "PPTP" if target_type == "pptp" else "OpenVPN"
+        await safe_edit_text(q, context,
+            f"Нет роутеров для переключения на {label}.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀ Назад", callback_data='vpn_switch')]]))
+        return
+    kb = [[InlineKeyboardButton(cn, callback_data=f'vpn_sw_{target_type}:{cn}')]
+          for cn in items[:20]]
+    kb.append([InlineKeyboardButton("🔄 ВСЕ", callback_data=f'vpn_sw_{target_type}:__all__')])
+    kb.append([InlineKeyboardButton("◀ Назад", callback_data='vpn_switch')])
+    label = "PPTP" if target_type == "pptp" else "OpenVPN"
+    await safe_edit_text(q, context,
+        f"🔀 <b>Переключить → {label}</b>\n\nВыберите роутер:",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+async def vpn_switch_exec(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                          target_type: str, cn: str):
+    q = update.callback_query
+    await q.answer()
+    routers = load_routers()
+
+    if cn == '__all__':
+        targets = [c for c in sorted(routers.keys(), key=_natural_key)
+                   if (target_type == "pptp" and routers[c].get("vpn_type", "openvpn") != "pptp")
+                   or (target_type == "openvpn" and routers[c].get("vpn_type") == "pptp")]
+    else:
+        targets = [cn]
+
+    if not targets:
+        await safe_edit_text(q, context, "Нет роутеров для переключения.")
+        return
+
+    msg = await context.bot.send_message(
+        chat_id=q.message.chat_id,
+        text=f"🔀 Переключаю {len(targets)} роутер(ов) → {target_type.upper()}...")
+
+    results = []
+    pptp_ip_text = read_pptp_ip()
+    srv = load_pptp_server()
+    vpn_pass = srv.get("vpn_password", "pass123")
+    clients = load_pptp_clients()
+
+    for c in targets:
+        r = routers.get(c)
+        if not r:
+            results.append(f"❌ {c}: не найден")
+            continue
+        ip = get_router_ip(c)
+        if not ip:
+            results.append(f"🔴 {c}: нет IP")
+            continue
+
+        if target_type == "pptp":
+            if c not in clients:
+                results.append(f"⚠️ {c}: нет PPTP аккаунта (добавьте в Клиенты)")
+                continue
+            # Switch to PPTP: set type, peer, user, pass, restart
+            cmd = (f'nvram set vpnc_type=1 ; '
+                   f'nvram set vpnc_peer="{pptp_ip_text}" ; '
+                   f'nvram set vpnc_user="{c}" ; '
+                   f'nvram set vpnc_pass="{vpn_pass}" ; '
+                   f'nvram commit ; '
+                   f'sleep 1 ; restart_vpnc')
+        else:
+            # Switch to OpenVPN: set type, restart
+            cmd = (f'nvram set vpnc_type=3 ; '
+                   f'nvram commit ; '
+                   f'sleep 1 ; restart_vpnc')
+
+        ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'),
+                           r.get('password', ''), cmd)
+        # Update vpn_type in routers.json
+        if target_type == "pptp":
+            routers[c]["vpn_type"] = "pptp"
+        else:
+            routers[c].pop("vpn_type", None)  # default = openvpn
+
+        if ok or "таймаут" in out.lower():
+            results.append(f"✅ {c}: команда отправлена")
+        else:
+            results.append(f"❌ {c}: {out[:80]}")
+
+    save_routers(routers)
+    report = "\n".join(results)
+    kb = [[InlineKeyboardButton("🔀 Переключатель", callback_data='vpn_switch')],
+          [InlineKeyboardButton("🏠 Меню", callback_data='home')]]
+    await msg.edit_text(
+        f"🔀 <b>Переключение → {target_type.upper()}</b>\n\n{report}\n\n"
+        f"<i>SSH может оборваться — это нормально.\n"
+        f"Роутеры подключатся к новому VPN через ~30 сек.</i>",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
 
@@ -3284,7 +3677,7 @@ async def rr_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for k in ['await_rr_ip', 'await_rr_domain_add', 'await_force_ip',
               'await_change_port', 'await_script_ver', 'await_canary_ver', 'await_canary_ids',
               'await_oec_radd', 'await_oec_fedit', 'await_ssh_add',
-              'await_pptp_ip', 'await_pptp_dom_add']:
+              'await_pptp_ip', 'await_pptp_dom_add', 'await_pptp_srv']:
         context.user_data.pop(k, None)
     await safe_edit_text(q, context, "Отменено.")
 
@@ -3614,6 +4007,8 @@ async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_T
         await pptp_set_ip_receive(update, context); return
     if context.user_data.get('await_pptp_dom_add'):
         await pptp_dom_add_receive(update, context); return
+    if context.user_data.get('await_pptp_srv'):
+        await pptp_srv_setup_receive(update, context); return
     await update.message.reply_text("Неизвестный ввод. Используй меню или /start.")
 
 # =====================================================================
@@ -4383,6 +4778,32 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await pptp_dom_del_start(update, context)
     elif data.startswith('pptp_dom_rm:'):
         await pptp_dom_remove(update, context, data[len('pptp_dom_rm:'):])
+    elif data == 'pptp_server':
+        await pptp_server_menu(update, context)
+    elif data == 'pptp_srv_setup':
+        await pptp_srv_setup_start(update, context)
+    elif data == 'pptp_clients':
+        await pptp_clients_menu(update, context)
+    elif data == 'pptp_cl_add':
+        await pptp_cl_add_start(update, context)
+    elif data.startswith('pptp_cl_add1:'):
+        await pptp_cl_add_one(update, context, data[len('pptp_cl_add1:'):])
+    elif data == 'pptp_cl_bulk':
+        await pptp_cl_bulk(update, context)
+    elif data == 'pptp_cl_del':
+        await pptp_cl_del_start(update, context)
+    elif data.startswith('pptp_cl_rm:'):
+        await pptp_cl_remove(update, context, data[len('pptp_cl_rm:'):])
+    elif data == 'vpn_switch':
+        await vpn_switch_menu(update, context)
+    elif data == 'vpn_to_pptp':
+        await vpn_switch_select(update, context, 'pptp')
+    elif data == 'vpn_to_ovpn':
+        await vpn_switch_select(update, context, 'openvpn')
+    elif data.startswith('vpn_sw_pptp:'):
+        await vpn_switch_exec(update, context, 'pptp', data[len('vpn_sw_pptp:'):])
+    elif data.startswith('vpn_sw_openvpn:'):
+        await vpn_switch_exec(update, context, 'openvpn', data[len('vpn_sw_openvpn:'):])
 
     # --- Auto IP callbacks ---
     elif data == 'aip_menu':
