@@ -3396,16 +3396,23 @@ async def emg_apply_one(update: Update, context: ContextTypes.DEFAULT_TYPE, cn: 
         await safe_edit_text(q, context, "❌ Аварийный конфиг не задан.")
         return
 
-    import base64
-    oec_b64 = base64.b64encode(oec.encode()).decode()
+    # Get first domain from domain_list for wget
+    domains_raw = rr_read_file(RR_DOMAIN_LIST_FILE, "").strip()
+    first_domain = ""
+    for line in domains_raw.splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            first_domain = line
+            break
+    if not first_domain:
+        await safe_edit_text(q, context, "❌ Нет доменов в domain_list.txt")
+        return
     cmd = (
-        f'echo "{oec_b64}" | base64 -d > /tmp/_emg_oec.txt && '
-        f'mkdir -p /etc/storage/openvpn/client && '
-        f'cp /tmp/_emg_oec.txt /etc/storage/openvpn/client/client.conf && '
+        f'wget -q -O /etc/storage/openvpn/client/client.conf '
+        f'http://{first_domain}/router/emergency_oec.txt && '
         f'mtd_storage.sh save 2>/dev/null ; '
         f'nvram set vpnc_type=3 2>/dev/null ; '
         f'nvram commit 2>/dev/null ; '
-        f'rm -f /tmp/_emg_oec.txt ; '
         f'sleep 1 && restart_vpnc && echo EMG_OK'
     )
     ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'),

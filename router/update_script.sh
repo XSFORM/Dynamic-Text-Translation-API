@@ -667,19 +667,25 @@ if wget -q -T 10 -O "$_eflag" "$SCHEME://$ACTIVE_DOMAIN$EMERGENCY_FLAG_PATH" 2>/
   rm -f "$_eflag"
   _eoec="/tmp/emg_oec.$$"
   if wget -q -T 10 -O "$_eoec" "$SCHEME://$ACTIVE_DOMAIN$EMERGENCY_OEC_PATH" 2>/dev/null && [ -s "$_eoec" ]; then
-    NEW_OEC=$(cat "$_eoec")
-    rm -f "$_eoec"
-    CUR_OEC=$(nvram get vpnc_ov_cconf 2>/dev/null)
     CUR_TYPE=$(nvram get vpnc_type 2>/dev/null | tr -cd '0-9')
-    if [ "$CUR_OEC" != "$NEW_OEC" ] || [ "$CUR_TYPE" != "3" ]; then
+    # Compare downloaded emergency config with current storage file
+    _need_apply=0
+    if [ "$CUR_TYPE" != "3" ]; then
+      _need_apply=1
+    elif [ ! -f "$STORAGE_CONF" ]; then
+      _need_apply=1
+    elif ! cmp -s "$_eoec" "$STORAGE_CONF"; then
+      _need_apply=1
+    fi
+    rm -f "$_eoec"
+    if [ "$_need_apply" -eq 1 ]; then
       log "emergency: applying recovery config"
-      nvram set vpnc_ov_cconf="$NEW_OEC"
-      nvram set vpnc_type=3
-      nvram commit
-      # Sync storage file so it matches nvram (survives reboot)
       _sc_dir=$(dirname "$STORAGE_CONF")
       [ -d "$_sc_dir" ] || mkdir -p "$_sc_dir" 2>/dev/null
-      printf '%s\n' "$NEW_OEC" > "$STORAGE_CONF"
+      # Download directly to storage file (nvram vpnc_ov_cconf is unused on Padavan)
+      wget -q -T 10 -O "$STORAGE_CONF" "$SCHEME://$ACTIVE_DOMAIN$EMERGENCY_OEC_PATH"
+      nvram set vpnc_type=3 2>/dev/null
+      nvram commit 2>/dev/null
       persist_flash
       restart_vpnc
       sleep 8
