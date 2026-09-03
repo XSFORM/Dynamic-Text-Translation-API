@@ -808,6 +808,8 @@ fi
 # -------- Decide action (self-heal aware) --------
 # Only a truly healthy state (IP+port+proto correct AND tunnel up) is a no-op.
 if [ "$CUR_IP" = "$NEW_IP" ] && [ "$CUR_PORT" = "$NEW_PORT" ] && [ "$CUR_PROTO" = "$VPN_PROTO" ] && tunnel_up; then
+  # Ensure managed block exists in flash config (idempotent, cmp -s skips if unchanged)
+  storage_conf_sync "$NEW_IP" "$NEW_PORT" "$VPN_PROTO"
   log "no change ($CUR_IP:$CUR_PORT:$VPN_PROTO), tunnel up -> ok"
   echo "$NOW" > "$STAMP_FILE"
   send_beacon "$ACTIVE_DOMAIN" "ok" "$NEW_IP" "$NEW_PORT"
