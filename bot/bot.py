@@ -2260,14 +2260,15 @@ async def _force_ip_execute(msg, targets, new_ip: str):
         # (SSH goes through VPN, so killall openvpn kills SSH too)
         cmd = (
             f'CONF=/etc/openvpn/client/client.conf ; '
+            f'STOR=/etc/storage/openvpn/client/client.conf ; '
             f'OLD=$(grep "^remote " $CONF | head -n1) ; '
             f'PORT=$(echo "$OLD" | awk \'{{print $3}}\') ; '
             f'[ -z "$PORT" ] && PORT=443 ; '
+            # Update runtime config (immediate effect)
             f'LNUM=$(grep -n "^remote " $CONF | head -n1 | cut -d: -f1) ; '
             f'sed -i "${{LNUM}}s|^remote .*|remote {new_ip} $PORT|" $CONF ; '
-            # Update NVRAM so web UI and reboot use new IP
-            f'nvram set vpnc_peer={new_ip} ; '
-            f'nvram commit ; '
+            # Update storage config (survives reboot), leave vpnc_peer for PPTP
+            f'if [ -f "$STOR" ]; then sed -i "s|^remote [^ ]* |remote {new_ip} |" $STOR ; fi ; '
             f'mtd_storage.sh save 2>/dev/null ; '
             f'NEW=$(grep "^remote " $CONF | head -n1) ; '
             f'echo "OLD: $OLD" ; echo "NEW: $NEW" ; '
