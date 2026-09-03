@@ -69,7 +69,7 @@ USE_INTERVAL=0
 SHOW_FETCH=0
 
 # -------- Self-update config --------
-SELF_VERSION=2
+SELF_VERSION=3
 VERSION_PATH="/router/version.txt"
 SCRIPT_PATH="/router/update_script.sh"
 SELF_FILE="/etc/storage/update_script.sh"
