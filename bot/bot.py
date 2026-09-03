@@ -3372,7 +3372,7 @@ async def emg_apply_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     routers = load_routers()
     kb = [[InlineKeyboardButton(cn, callback_data=f'emg_apply:{cn}')]
-          for cn in sorted(routers.keys(), key=_natural_key)][:20]
+          for cn in sorted(routers.keys(), key=_natural_key)]
     kb.append([InlineKeyboardButton("◀ Назад", callback_data='emergency')])
     await safe_edit_text(q, context,
         "📡 <b>Применить аварийный конфиг</b>\n\n"
@@ -5393,7 +5393,7 @@ async def ssh_ver_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     routers = load_routers()
     kb = [[InlineKeyboardButton(cn, callback_data=f'ssh_ver_one:{cn}')]
-          for cn in sorted(routers.keys(), key=_natural_key)][:20]
+          for cn in sorted(routers.keys(), key=_natural_key)]
     kb.append([InlineKeyboardButton("◀ Назад", callback_data='ssh_check_ver')])
     await safe_edit_text(q, context,
         "📋 Выберите роутер:",
