@@ -2621,16 +2621,35 @@ async def script_ver_bump(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur_ver = int(vd["version"]) if vd["version"].isdigit() else 0
     new_ver = cur_ver + 1
     kb = [
-        [InlineKeyboardButton(f"✅ Да, поднять до v{new_ver}", callback_data='script_ver_bump_yes')],
+        [InlineKeyboardButton(f"✅ Да, git pull сделан — поднять до v{new_ver}", callback_data='script_ver_bump_yes')],
         [InlineKeyboardButton("◀ Отмена", callback_data='script_version')],
     ]
     await safe_edit_text(q, context,
         f"⚠️ <b>Поднять версию?</b>\n\n"
         f"<code>v{cur_ver}</code> → <code>v{new_ver}</code>\n\n"
-        f"Все роутеры скачают новый скрипт\n"
-        f"в следующем цикле (~5-15 мин).\n\n"
-        f"Уверены?",
+        f"❗ Убедитесь что <b>git pull</b> уже выполнен!\n"
+        f"Иначе роутеры скачают старый скрипт с новой версией.\n\n"
+        f"Все роутеры подхватят в следующем цикле (~5-15 мин).",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+def _patch_self_version(new_ver: int) -> bool:
+    """Update SELF_VERSION=N in the webroot update_script.sh."""
+    script = "/var/www/html/router/update_script.sh"
+    try:
+        with open(script, "r") as f:
+            lines = f.readlines()
+        patched = False
+        for i, line in enumerate(lines):
+            if line.startswith("SELF_VERSION="):
+                lines[i] = f"SELF_VERSION={new_ver}\n"
+                patched = True
+                break
+        if patched:
+            with open(script, "w") as f:
+                f.writelines(lines)
+        return patched
+    except Exception:
+        return False
 
 async def script_ver_bump_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Actually increment version after confirmation."""
@@ -2641,11 +2660,16 @@ async def script_ver_bump_confirm(update: Update, context: ContextTypes.DEFAULT_
     new_ver = cur_ver + 1
     vd["version"] = str(new_ver)
     write_version_file(vd)
-    rr_append_history(f"SCRIPT_VER: {cur_ver} -> {new_ver}")
+    patched = _patch_self_version(new_ver)
+    rr_append_history(f"SCRIPT_VER: {cur_ver} -> {new_ver} (self_ver={'ok' if patched else 'fail'})")
+    warn = ""
+    if not patched:
+        warn = "\n⚠️ Не удалось обновить SELF_VERSION в скрипте!"
     kb = [[InlineKeyboardButton("📦 Версия скрипта", callback_data='script_version')],
           [InlineKeyboardButton("🏠 Меню", callback_data='home')]]
     await safe_edit_text(q, context,
-        f"✅ Версия поднята: <code>{cur_ver}</code> → <code>{new_ver}</code>\n\n"
+        f"✅ Версия поднята: <code>{cur_ver}</code> → <code>{new_ver}</code>\n"
+        f"📝 SELF_VERSION в скрипте: <code>{new_ver}</code>{warn}\n\n"
         f"Роутеры подхватят новый скрипт в следующем цикле (~15 мин).",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
@@ -2677,11 +2701,16 @@ async def script_ver_set_receive(update: Update, context: ContextTypes.DEFAULT_T
     cur_ver = int(vd["version"]) if vd["version"].isdigit() else 0
     vd["version"] = str(new_ver)
     write_version_file(vd)
-    rr_append_history(f"SCRIPT_VER: {cur_ver} -> {new_ver}")
+    patched = _patch_self_version(new_ver)
+    rr_append_history(f"SCRIPT_VER: {cur_ver} -> {new_ver} (self_ver={'ok' if patched else 'fail'})")
+    warn = ""
+    if not patched:
+        warn = "\n⚠️ Не удалось обновить SELF_VERSION в скрипте!"
     kb = [[InlineKeyboardButton("📦 Версия скрипта", callback_data='script_version')],
           [InlineKeyboardButton("🏠 Меню", callback_data='home')]]
     await update.message.reply_text(
-        f"✅ Версия задана: <code>{cur_ver}</code> → <code>{new_ver}</code>\n\n"
+        f"✅ Версия задана: <code>{cur_ver}</code> → <code>{new_ver}</code>\n"
+        f"📝 SELF_VERSION в скрипте: <code>{new_ver}</code>{warn}\n\n"
         f"Роутеры подхватят новый скрипт в следующем цикле (~15 мин).",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
