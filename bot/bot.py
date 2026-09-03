@@ -4162,13 +4162,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if is_client_ccd_disabled(name):
                 st = "⛔"
                 cnt_disabled += 1
+                lines.append(f"{st} {name}")
             elif name in online_names:
                 st = "🟢"
                 cnt_online += 1
+                tip = tunnel_ips.get(name, "")
+                if tip:
+                    lines.append(f'{st} {name}  <a href="http://{tip}">{tip}</a>')
+                else:
+                    lines.append(f"{st} {name}")
             else:
                 st = "🔴"
                 cnt_offline += 1
-            lines.append(f"{st} {name}")
+                lines.append(f"{st} {name}")
         lines.append("")
         lines.append(f"🟢 Онлайн: <b>{cnt_online}</b>")
         lines.append(f"🔴 Оффлайн: <b>{cnt_offline}</b>")
@@ -4176,9 +4182,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"📊 Всего: <b>{cnt_online + cnt_offline + cnt_disabled}</b>")
         text = "\n".join(lines)
         msgs = split_message(text)
-        await safe_edit_text(q, context, msgs[0], parse_mode="HTML")
+        await safe_edit_text(q, context, msgs[0], parse_mode="HTML",
+                             disable_web_page_preview=True)
         for m in msgs[1:]:
-            await context.bot.send_message(chat_id=q.message.chat_id, text=m, parse_mode="HTML")
+            await context.bot.send_message(chat_id=q.message.chat_id, text=m,
+                                           parse_mode="HTML", disable_web_page_preview=True)
 
     elif data == 'traffic':
         save_traffic_db(force=True)
