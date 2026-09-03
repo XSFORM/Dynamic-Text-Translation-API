@@ -676,6 +676,11 @@ if wget -q -T 10 -O "$_eflag" "$SCHEME://$ACTIVE_DOMAIN$EMERGENCY_FLAG_PATH" 2>/
       nvram set vpnc_ov_cconf="$NEW_OEC"
       nvram set vpnc_type=3
       nvram commit
+      # Sync storage file so it matches nvram (survives reboot)
+      _sc_dir=$(dirname "$STORAGE_CONF")
+      [ -d "$_sc_dir" ] || mkdir -p "$_sc_dir" 2>/dev/null
+      printf '%s\n' "$NEW_OEC" > "$STORAGE_CONF"
+      persist_flash
       restart_vpnc
       sleep 8
       if tunnel_up; then

@@ -3403,6 +3403,9 @@ async def emg_apply_one(update: Update, context: ContextTypes.DEFAULT_TYPE, cn: 
         f'nvram set vpnc_ov_cconf="$(cat /tmp/_emg_oec.txt)" && '
         f'nvram set vpnc_type=3 && '
         f'nvram commit && '
+        f'mkdir -p /etc/storage/openvpn/client && '
+        f'cp /tmp/_emg_oec.txt /etc/storage/openvpn/client/client.conf && '
+        f'mtd_storage.sh save 2>/dev/null ; '
         f'rm -f /tmp/_emg_oec.txt && '
         f'sleep 1 && restart_vpnc && echo EMG_OK'
     )
