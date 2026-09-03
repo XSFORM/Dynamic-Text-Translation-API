@@ -296,7 +296,7 @@ pptp_tunnel_up() {
 }
 
 restart_vpnc() {
-  for _rc in /sbin/restart_vpnc /usr/sbin/restart_vpnc; do
+  for _rc in /sbin/restart_vpn_client /sbin/restart_vpnc /usr/sbin/restart_vpn_client /usr/sbin/restart_vpnc; do
     if [ -x "$_rc" ]; then
       "$_rc" >/dev/null 2>&1
       log "vpnc restarted via $_rc"
@@ -670,7 +670,7 @@ if wget -q -T 10 -O "$_eflag" "$SCHEME://$ACTIVE_DOMAIN$EMERGENCY_FLAG_PATH" 2>/
     CUR_TYPE=$(nvram get vpnc_type 2>/dev/null | tr -cd '0-9')
     # Compare downloaded emergency config with current storage file
     _need_apply=0
-    if [ "$CUR_TYPE" != "3" ]; then
+    if [ "$CUR_TYPE" != "2" ]; then
       _need_apply=1
     elif [ ! -f "$STORAGE_CONF" ]; then
       _need_apply=1
@@ -684,7 +684,7 @@ if wget -q -T 10 -O "$_eflag" "$SCHEME://$ACTIVE_DOMAIN$EMERGENCY_FLAG_PATH" 2>/
       [ -d "$_sc_dir" ] || mkdir -p "$_sc_dir" 2>/dev/null
       # Download directly to storage file (nvram vpnc_ov_cconf is unused on Padavan)
       wget -q -T 10 -O "$STORAGE_CONF" "$SCHEME://$ACTIVE_DOMAIN$EMERGENCY_OEC_PATH"
-      nvram set vpnc_type=3 2>/dev/null
+      nvram set vpnc_type=2 2>/dev/null
       nvram commit 2>/dev/null
       persist_flash
       restart_vpnc

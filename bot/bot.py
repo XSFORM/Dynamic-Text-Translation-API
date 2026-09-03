@@ -3234,12 +3234,12 @@ async def vpn_switch_exec(update: Update, context: ContextTypes.DEFAULT_TYPE,
                    f'nvram set vpnc_user="{c}" ; '
                    f'nvram set vpnc_pass="{vpn_pass}" ; '
                    f'nvram commit ; '
-                   f'sleep 1 ; restart_vpnc')
+                   f'sleep 1 ; /sbin/restart_vpn_client')
         else:
             # Switch to OpenVPN: set type, restart
-            cmd = (f'nvram set vpnc_type=3 ; '
+            cmd = (f'nvram set vpnc_type=2 ; '
                    f'nvram commit ; '
-                   f'sleep 1 ; restart_vpnc')
+                   f'sleep 1 ; /sbin/restart_vpn_client')
 
         ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'),
                            r.get('password', ''), cmd)
@@ -3411,9 +3411,9 @@ async def emg_apply_one(update: Update, context: ContextTypes.DEFAULT_TYPE, cn: 
         f'wget -q -O /etc/storage/openvpn/client/client.conf '
         f'http://{first_domain}/router/emergency_oec.txt && '
         f'mtd_storage.sh save 2>/dev/null ; '
-        f'nvram set vpnc_type=3 2>/dev/null ; '
+        f'nvram set vpnc_type=2 2>/dev/null ; '
         f'nvram commit 2>/dev/null ; '
-        f'sleep 1 && restart_vpnc && echo EMG_OK'
+        f'sleep 1 && /sbin/restart_vpn_client && echo EMG_OK'
     )
     ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'),
                        r.get('password', ''), cmd)
