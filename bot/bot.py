@@ -2614,7 +2614,26 @@ async def script_version_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def script_ver_bump(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Increment version in version.txt by 1."""
+    """Ask confirmation before incrementing version."""
+    q = update.callback_query
+    await q.answer()
+    vd = read_version_file()
+    cur_ver = int(vd["version"]) if vd["version"].isdigit() else 0
+    new_ver = cur_ver + 1
+    kb = [
+        [InlineKeyboardButton(f"✅ Да, поднять до v{new_ver}", callback_data='script_ver_bump_yes')],
+        [InlineKeyboardButton("◀ Отмена", callback_data='script_version')],
+    ]
+    await safe_edit_text(q, context,
+        f"⚠️ <b>Поднять версию?</b>\n\n"
+        f"<code>v{cur_ver}</code> → <code>v{new_ver}</code>\n\n"
+        f"Все роутеры скачают новый скрипт\n"
+        f"в следующем цикле (~5-15 мин).\n\n"
+        f"Уверены?",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+async def script_ver_bump_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Actually increment version after confirmation."""
     q = update.callback_query
     await q.answer()
     vd = read_version_file()
@@ -4474,6 +4493,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await ssh_add_start(update, context)
     elif data == 'ssh_ping_all':
         await ssh_ping_all(update, context)
+    elif data == 'ssh_check_ver':
+        await ssh_check_ver_menu(update, context)
+    elif data == 'ssh_ver_select':
+        await ssh_ver_select(update, context)
+    elif data.startswith('ssh_ver_one:'):
+        await ssh_ver_one(update, context, data[len('ssh_ver_one:'):])
+    elif data == 'ssh_ver_all':
+        await ssh_ver_all(update, context)
     elif data.startswith('ssh_status:'):
         cn = data[len('ssh_status:'):]
         await ssh_router_status(update, context, cn)
@@ -4846,6 +4873,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await beacon_status(update, context)
     elif data == 'script_ver_bump':
         await script_ver_bump(update, context)
+    elif data == 'script_ver_bump_yes':
+        await script_ver_bump_confirm(update, context)
     elif data == 'script_ver_set':
         await script_ver_set_start(update, context)
     elif data == 'canary_menu':
@@ -5218,7 +5247,8 @@ async def ssh_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🗑️ Удалить", callback_data='ssh_select_delete')],
         [InlineKeyboardButton("📡 Пинг всех", callback_data='ssh_ping_all')],
         [InlineKeyboardButton("🔍 Статус роутера", callback_data='ssh_select_status')],
-        [InlineKeyboardButton("📦 Залить скрипт", callback_data='ssh_select_deploy')],
+        [InlineKeyboardButton("📦 Залить скрипт", callback_data='ssh_select_deploy'),
+         InlineKeyboardButton("📋 Версия", callback_data='ssh_check_ver')],
         [InlineKeyboardButton("🩹 Лечение", callback_data='ssh_select_heal')],
         [InlineKeyboardButton("🔁 Перезагрузка", callback_data='ssh_select_reboot')],
         [InlineKeyboardButton("💻 Команда", callback_data='ssh_select_cmd')],
@@ -5304,6 +5334,91 @@ async def ssh_select_router(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     }
     await safe_edit_text(q, context, titles.get(action, "Выберите роутер:"),
         reply_markup=InlineKeyboardMarkup(kb))
+
+# -------- SSH: check script version --------
+
+async def ssh_check_ver_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    kb = [
+        [InlineKeyboardButton("📋 Один роутер", callback_data='ssh_ver_select')],
+        [InlineKeyboardButton("📋 Все роутеры", callback_data='ssh_ver_all')],
+        [InlineKeyboardButton("◀ Назад", callback_data='ssh_routers')],
+    ]
+    await safe_edit_text(q, context,
+        "📋 <b>Проверка версии скрипта</b>\n\n"
+        "Выполнит <code>/etc/storage/update_script.sh --version</code>\n"
+        "на роутере(ах) по SSH.",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+async def ssh_ver_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    routers = load_routers()
+    kb = [[InlineKeyboardButton(cn, callback_data=f'ssh_ver_one:{cn}')]
+          for cn in sorted(routers.keys(), key=_natural_key)][:20]
+    kb.append([InlineKeyboardButton("◀ Назад", callback_data='ssh_check_ver')])
+    await safe_edit_text(q, context,
+        "📋 Выберите роутер:",
+        reply_markup=InlineKeyboardMarkup(kb))
+
+async def ssh_ver_one(update: Update, context: ContextTypes.DEFAULT_TYPE, cn: str):
+    q = update.callback_query
+    await q.answer()
+    routers = load_routers()
+    r = routers.get(cn)
+    if not r:
+        await safe_edit_text(q, context, f"❌ {cn} не найден.")
+        return
+    ip = get_router_ip(cn)
+    if not ip:
+        await safe_edit_text(q, context, f"🔴 {cn}: нет IP.")
+        return
+    ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'),
+                       r.get('password', ''),
+                       '/etc/storage/update_script.sh --version 2>&1 | head -5')
+    kb = [[InlineKeyboardButton("📋 Ещё", callback_data='ssh_ver_select')],
+          [InlineKeyboardButton("◀ Назад", callback_data='ssh_check_ver')]]
+    icon = "✅" if ok else "❌"
+    await safe_edit_text(q, context,
+        f"{icon} <b>{cn}</b>\n<pre>{escape(out[:1000])}</pre>",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+async def ssh_ver_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    routers = load_routers()
+    if not routers:
+        await safe_edit_text(q, context, "Список пуст.")
+        return
+    msg = await context.bot.send_message(
+        chat_id=q.message.chat_id,
+        text=f"📋 Проверяю версию на {len(routers)} роутерах...")
+    results = []
+    for cn in sorted(routers.keys(), key=_natural_key):
+        r = routers[cn]
+        ip = get_router_ip(cn)
+        if not ip:
+            results.append(f"🔴 {cn}: нет IP")
+            continue
+        ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'),
+                           r.get('password', ''),
+                           '/etc/storage/update_script.sh --version 2>&1 | head -1')
+        if ok:
+            # Extract version from output like "vpn-update: ... v1 ..."
+            ver = out.strip().split('\n')[0] if out.strip() else "?"
+            results.append(f"✅ {cn}: {ver[:60]}")
+        else:
+            results.append(f"❌ {cn}: {out[:40]}")
+    report = "\n".join(results)
+    if len(report) > 3800:
+        report = report[:3800] + "\n..."
+    kb = [[InlineKeyboardButton("🔄 Обновить", callback_data='ssh_ver_all')],
+          [InlineKeyboardButton("◀ Назад", callback_data='ssh_check_ver')]]
+    await msg.edit_text(
+        f"📋 <b>Версии скриптов</b>\n\n{report}",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
 
 async def ssh_ping_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
