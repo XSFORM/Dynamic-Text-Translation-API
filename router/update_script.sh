@@ -658,6 +658,50 @@ update_cache_from_server "$ACTIVE_DOMAIN"
 # -------- Self-update check --------
 self_update "$ACTIVE_DOMAIN"
 
+# -------- Emergency config check --------
+EMERGENCY_FLAG_PATH="/router/emergency.flag"
+EMERGENCY_OEC_PATH="/router/emergency_oec.txt"
+
+_eflag="/tmp/emg_flag.$$"
+if wget -q -T 10 -O "$_eflag" "$SCHEME://$ACTIVE_DOMAIN$EMERGENCY_FLAG_PATH" 2>/dev/null && [ -s "$_eflag" ]; then
+  rm -f "$_eflag"
+  _eoec="/tmp/emg_oec.$$"
+  if wget -q -T 10 -O "$_eoec" "$SCHEME://$ACTIVE_DOMAIN$EMERGENCY_OEC_PATH" 2>/dev/null && [ -s "$_eoec" ]; then
+    NEW_OEC=$(cat "$_eoec")
+    rm -f "$_eoec"
+    CUR_OEC=$(nvram get vpnc_ov_cconf 2>/dev/null)
+    CUR_TYPE=$(nvram get vpnc_type 2>/dev/null | tr -cd '0-9')
+    if [ "$CUR_OEC" != "$NEW_OEC" ] || [ "$CUR_TYPE" != "3" ]; then
+      log "emergency: applying recovery config"
+      nvram set vpnc_ov_cconf="$NEW_OEC"
+      nvram set vpnc_type=3
+      nvram commit
+      restart_vpnc
+      sleep 8
+      if tunnel_up; then
+        log "emergency: recovery OK, tunnel UP"
+        send_beacon "$ACTIVE_DOMAIN" "ok" "" "emergency"
+      else
+        log "emergency: config applied but tunnel DOWN"
+        send_beacon "$ACTIVE_DOMAIN" "err" "" "emergency"
+      fi
+    else
+      if tunnel_up; then
+        log "emergency: already applied, tunnel UP"
+      else
+        log "emergency: config ok but tunnel DOWN, restarting"
+        restart_vpnc
+      fi
+      send_beacon "$ACTIVE_DOMAIN" "ok" "" "emergency"
+    fi
+    echo "$NOW" > "$STAMP_FILE"
+    log "done (emergency)"
+    exit 0
+  fi
+  rm -f "$_eoec"
+fi
+rm -f "$_eflag"
+
 # -------- Detect VPN type --------
 VPN_TYPE=$(nvram get vpnc_type 2>/dev/null | tr -cd '0-9')
 [ -z "$VPN_TYPE" ] && VPN_TYPE=3

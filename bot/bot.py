@@ -119,6 +119,8 @@ RR_BEACON_LOG = "/var/log/nginx/access.log"
 RR_DOMAIN_LIST_FILE = "/var/www/html/router/domain_list.txt"
 RR_PROTOCOL_FILE = "/var/www/html/router/protocol.txt"
 RR_PPTP_IP_FILE = "/var/www/html/current_pptp_ip.txt"
+RR_EMERGENCY_OEC_FILE = "/var/www/html/router/emergency_oec.txt"
+RR_EMERGENCY_FLAG_FILE = "/var/www/html/router/emergency.flag"
 RR_ENV_FILE = "/etc/remote-refresh.env"
 RR_BACKUP_PASSWORD = b"canonical87"
 
@@ -427,6 +429,31 @@ def pptp_ssh_exec(command: str) -> Tuple[bool, str]:
         srv["host"], srv.get("port", 22),
         srv.get("user", "root"), srv.get("password", ""),
         command)
+
+# -------- Emergency OEC helpers --------
+def read_emergency_oec() -> str:
+    try:
+        with open(RR_EMERGENCY_OEC_FILE, "r") as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return ""
+
+def write_emergency_oec(text: str):
+    with open(RR_EMERGENCY_OEC_FILE, "w") as f:
+        f.write(text.strip() + "\n")
+
+def is_emergency_enabled() -> bool:
+    return os.path.isfile(RR_EMERGENCY_FLAG_FILE)
+
+def set_emergency_flag(enabled: bool):
+    if enabled:
+        with open(RR_EMERGENCY_FLAG_FILE, "w") as f:
+            f.write("on\n")
+    else:
+        try:
+            os.remove(RR_EMERGENCY_FLAG_FILE)
+        except FileNotFoundError:
+            pass
 
 def ssh_exec(ip: str, port: int, user: str, password: str, command: str) -> Tuple[bool, str]:
     """Execute SSH command on router. Returns (success, output)."""
@@ -3190,6 +3217,165 @@ async def vpn_switch_exec(update: Update, context: ContextTypes.DEFAULT_TYPE,
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
 
+# =====================================================================
+#  EMERGENCY OEC RECOVERY
+# =====================================================================
+
+async def emergency_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    enabled = is_emergency_enabled()
+    oec = read_emergency_oec()
+    status = "🟢 ВКЛ — роутеры применят на след. кроне" if enabled else "🔴 ВЫКЛ"
+    preview = f"<pre>{escape(oec[:500])}</pre>" if oec else "<i>не задан</i>"
+    toggle_btn = "🔴 Выключить" if enabled else "🟢 Включить"
+    toggle_cb = "emg_off" if enabled else "emg_on"
+    kb = [
+        [InlineKeyboardButton("✏️ Редактировать", callback_data='emg_edit')],
+        [InlineKeyboardButton(toggle_btn, callback_data=toggle_cb)],
+        [InlineKeyboardButton("📡 Применить к одному", callback_data='emg_apply_one')],
+        [InlineKeyboardButton("🏠 Меню", callback_data='home')],
+    ]
+    await safe_edit_text(q, context,
+        f"🛟 <b>Аварийный конфиг</b>\n\n"
+        f"Статус: {status}\n\n"
+        f"Конфиг:\n{preview}\n\n"
+        f"<i>При включении скрипт на роутерах полностью\n"
+        f"перезапишет расширенный конфиг и перезапустит VPN.\n"
+        f"Сертификаты в стандартных полях не затрагиваются.</i>",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+async def emergency_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    cur = read_emergency_oec()
+    context.user_data['await_emg_edit'] = True
+    text = (
+        "✏️ <b>Аварийный конфиг — редактирование</b>\n\n"
+        "Введите полный текст расширенной конфигурации\n"
+        "(remote, scramble и т.д. — без сертификатов).\n\n"
+        "Этот текст полностью заменит расширенный конфиг\n"
+        "на роутерах при включении аварийного режима.\n\n"
+    )
+    if cur:
+        text += f"Текущий:\n<pre>{escape(cur[:800])}</pre>"
+    await safe_edit_text(q, context, text, parse_mode="HTML")
+
+async def emergency_edit_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop('await_emg_edit', None)
+    text = update.message.text.strip()
+    if not text:
+        await update.message.reply_text("❌ Пустой конфиг.")
+        return
+    write_emergency_oec(text)
+    rr_append_history(f"EMERGENCY_OEC_EDIT")
+    kb = [[InlineKeyboardButton("🛟 Аварийный", callback_data='emergency')]]
+    await update.message.reply_text(
+        f"✅ Аварийный конфиг сохранён:\n<pre>{escape(text[:500])}</pre>",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+async def emergency_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE, enable: bool):
+    q = update.callback_query
+    await q.answer()
+    if enable:
+        oec = read_emergency_oec()
+        if not oec:
+            await safe_edit_text(q, context,
+                "❌ Сначала задайте аварийный конфиг (✏️ Редактировать).",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("◀ Назад", callback_data='emergency')]]))
+            return
+        # Confirmation step
+        kb = [
+            [InlineKeyboardButton("✅ Да, включить", callback_data='emg_on_confirm')],
+            [InlineKeyboardButton("◀ Отмена", callback_data='emergency')],
+        ]
+        await safe_edit_text(q, context,
+            "⚠️ <b>Включить аварийный режим?</b>\n\n"
+            "Все роутеры на следующем кроне:\n"
+            "• Полностью сотрут расширенный конфиг\n"
+            "• Запишут аварийный конфиг\n"
+            "• Переключатся на OpenVPN\n"
+            "• Перезапустят VPN\n\n"
+            "Белые ключи будут стёрты из расширенного конфига!",
+            parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+        return
+    set_emergency_flag(False)
+    rr_append_history("EMERGENCY_OFF")
+    await emergency_menu(update, context)
+
+async def emergency_on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    set_emergency_flag(True)
+    rr_append_history("EMERGENCY_ON")
+    await emergency_menu(update, context)
+
+async def emg_apply_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show router list to apply emergency config via SSH."""
+    q = update.callback_query
+    await q.answer()
+    oec = read_emergency_oec()
+    if not oec:
+        await safe_edit_text(q, context,
+            "❌ Сначала задайте аварийный конфиг.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀ Назад", callback_data='emergency')]]))
+        return
+    routers = load_routers()
+    kb = [[InlineKeyboardButton(cn, callback_data=f'emg_apply:{cn}')]
+          for cn in sorted(routers.keys(), key=_natural_key)][:20]
+    kb.append([InlineKeyboardButton("◀ Назад", callback_data='emergency')])
+    await safe_edit_text(q, context,
+        "📡 <b>Применить аварийный конфиг</b>\n\n"
+        "Выберите роутер (через SSH):",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+async def emg_apply_one(update: Update, context: ContextTypes.DEFAULT_TYPE, cn: str):
+    q = update.callback_query
+    await q.answer()
+    routers = load_routers()
+    r = routers.get(cn)
+    if not r:
+        await safe_edit_text(q, context, f"❌ {cn} не найден.")
+        return
+    ip = get_router_ip(cn)
+    if not ip:
+        await safe_edit_text(q, context, f"🔴 {cn}: нет IP для SSH.")
+        return
+    oec = read_emergency_oec()
+    if not oec:
+        await safe_edit_text(q, context, "❌ Аварийный конфиг не задан.")
+        return
+
+    import base64
+    oec_b64 = base64.b64encode(oec.encode()).decode()
+    cmd = (
+        f'echo "{oec_b64}" | base64 -d > /tmp/_emg_oec.txt && '
+        f'nvram set vpnc_ov_cconf="$(cat /tmp/_emg_oec.txt)" && '
+        f'nvram set vpnc_type=3 && '
+        f'nvram commit && '
+        f'rm -f /tmp/_emg_oec.txt && '
+        f'sleep 1 && restart_vpnc && echo EMG_OK'
+    )
+    ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'),
+                       r.get('password', ''), cmd)
+    # Update vpn_type
+    routers[cn].pop("vpn_type", None)  # back to openvpn
+    save_routers(routers)
+    rr_append_history(f"EMERGENCY_APPLY: {cn}")
+
+    if ok or "EMG_OK" in out:
+        status = f"✅ <b>{cn}</b>: аварийный конфиг применён"
+    else:
+        status = f"⚠️ <b>{cn}</b>: команда отправлена\n{escape(out[:200])}"
+
+    kb = [[InlineKeyboardButton("📡 Ещё роутер", callback_data='emg_apply_one')],
+          [InlineKeyboardButton("🛟 Аварийный", callback_data='emergency')]]
+    await safe_edit_text(q, context, status,
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
 async def rr_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     hist = rr_read_history()
@@ -3548,6 +3734,7 @@ async def rr_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "domain_list.txt": RR_DOMAIN_LIST_FILE,
         "protocol.txt": RR_PROTOCOL_FILE,
         "pptp_ip.txt": RR_PPTP_IP_FILE,
+        "emergency_oec.txt": RR_EMERGENCY_OEC_FILE,
         "history.log": RR_HISTORY_FILE,
         "ip_scan_off.txt": RR_IP_SCAN_FLAG,
         "port_scan_off.txt": RR_PORT_SCAN_FLAG,
@@ -3589,7 +3776,7 @@ async def rr_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for k in ['await_rr_ip', 'await_rr_domain_add', 'await_force_ip',
               'await_change_port', 'await_script_ver', 'await_canary_ver', 'await_canary_ids',
               'await_oec_radd', 'await_oec_fedit', 'await_ssh_add',
-              'await_pptp_ip', 'await_pptp_srv']:
+              'await_pptp_ip', 'await_pptp_srv', 'await_emg_edit']:
         context.user_data.pop(k, None)
     await safe_edit_text(q, context, "Отменено.")
 
@@ -3673,6 +3860,7 @@ def get_main_keyboard():
          InlineKeyboardButton("📡 Маяк", callback_data='beacon_status')],
         [InlineKeyboardButton("🔀 Протокол", callback_data='protocol_menu'),
          InlineKeyboardButton("🔗 PPTP", callback_data='pptp_menu')],
+        [InlineKeyboardButton("🛟 Аварийный конфиг", callback_data='emergency')],
         [InlineKeyboardButton("🔍 IP Scan", callback_data='rr_ip_scan'),
          InlineKeyboardButton("🔍 Port Scan", callback_data='rr_port_scan')],
         [InlineKeyboardButton("📋 История IP", callback_data='rr_history'),
@@ -3919,6 +4107,8 @@ async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_T
         await pptp_set_ip_receive(update, context); return
     if context.user_data.get('await_pptp_srv'):
         await pptp_srv_setup_receive(update, context); return
+    if context.user_data.get('await_emg_edit'):
+        await emergency_edit_receive(update, context); return
     await update.message.reply_text("Неизвестный ввод. Используй меню или /start.")
 
 # =====================================================================
@@ -4702,6 +4892,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await vpn_switch_exec(update, context, 'pptp', data[len('vpn_sw_pptp:'):])
     elif data.startswith('vpn_sw_openvpn:'):
         await vpn_switch_exec(update, context, 'openvpn', data[len('vpn_sw_openvpn:'):])
+    elif data == 'emergency':
+        await emergency_menu(update, context)
+    elif data == 'emg_edit':
+        await emergency_edit_start(update, context)
+    elif data == 'emg_on':
+        await emergency_toggle(update, context, True)
+    elif data == 'emg_off':
+        await emergency_toggle(update, context, False)
+    elif data == 'emg_on_confirm':
+        await emergency_on_confirm(update, context)
+    elif data == 'emg_apply_one':
+        await emg_apply_select(update, context)
+    elif data.startswith('emg_apply:'):
+        await emg_apply_one(update, context, data[len('emg_apply:'):])
 
     # --- Auto IP callbacks ---
     elif data == 'aip_menu':
@@ -5533,6 +5737,7 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "domain_list.txt": RR_DOMAIN_LIST_FILE,
                 "protocol.txt": RR_PROTOCOL_FILE,
                 "pptp_ip.txt": RR_PPTP_IP_FILE,
+                "emergency_oec.txt": RR_EMERGENCY_OEC_FILE,
                 "history.log": RR_HISTORY_FILE,
                 "ip_scan_off.txt": RR_IP_SCAN_FLAG,
                 "port_scan_off.txt": RR_PORT_SCAN_FLAG,
