@@ -297,14 +297,16 @@ pptp_tunnel_up() {
 
 restart_vpnc() {
   for _rc in /sbin/restart_vpn_client /sbin/restart_vpnc /usr/sbin/restart_vpn_client /usr/sbin/restart_vpnc; do
-    if [ -x "$_rc" ]; then
-      "$_rc" >/dev/null 2>&1
-      log "vpnc restarted via $_rc"
-      return 0
-    fi
+    [ -e "$_rc" ] || continue
+    "$_rc" >/dev/null 2>&1
+    log "vpnc restarted via $_rc"
+    return 0
   done
-  killall pppd 2>/dev/null; sleep 2
-  log "pppd killed, waiting for auto-restart"
+  # Fallback: kill only openvpn process (NEVER pppd — it runs PPPoE/internet!)
+  kill $(cat "$PID_FILE" 2>/dev/null) 2>/dev/null
+  killall openvpn 2>/dev/null
+  sleep 2
+  log "openvpn killed, waiting for auto-restart"
 }
 
 verify_pptp_tunnel() {
@@ -677,13 +679,13 @@ if wget -q -T 10 -O "$_eflag" "$SCHEME://$ACTIVE_DOMAIN$EMERGENCY_FLAG_PATH" 2>/
     elif ! cmp -s "$_eoec" "$STORAGE_CONF"; then
       _need_apply=1
     fi
-    rm -f "$_eoec"
     if [ "$_need_apply" -eq 1 ]; then
       log "emergency: applying recovery config"
       _sc_dir=$(dirname "$STORAGE_CONF")
       [ -d "$_sc_dir" ] || mkdir -p "$_sc_dir" 2>/dev/null
-      # Download directly to storage file (nvram vpnc_ov_cconf is unused on Padavan)
-      wget -q -T 10 -O "$STORAGE_CONF" "$SCHEME://$ACTIVE_DOMAIN$EMERGENCY_OEC_PATH"
+      # Copy already-downloaded temp file to storage (no second wget)
+      cp "$_eoec" "$STORAGE_CONF"
+      rm -f "$_eoec"
       nvram set vpnc_type=2 2>/dev/null
       nvram commit 2>/dev/null
       persist_flash
@@ -697,6 +699,7 @@ if wget -q -T 10 -O "$_eflag" "$SCHEME://$ACTIVE_DOMAIN$EMERGENCY_FLAG_PATH" 2>/
         send_beacon "$ACTIVE_DOMAIN" "err" "" "emergency"
       fi
     else
+      rm -f "$_eoec"
       if tunnel_up; then
         log "emergency: already applied, tunnel UP"
       else
