@@ -8775,8 +8775,8 @@ async def pptp_fwd_backend_receive(update: Update, context: ContextTypes.DEFAULT
             f"Бэкенд: <code>{backend}</code>", parse_mode="HTML")
         install_cmd = (
             # Enable forwarding
-            "sysctl -w net.ipv4.ip_forward=1 && "
-            "grep -q '^net.ipv4.ip_forward=1' /etc/sysctl.conf || "
+            "sysctl -w net.ipv4.ip_forward=1 > /dev/null 2>&1 ; "
+            "grep -q 'net.ipv4.ip_forward=1' /etc/sysctl.conf 2>/dev/null || "
             "echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf ; "
             # Load kernel modules
             "modprobe nf_nat_pptp 2>/dev/null ; "
@@ -8788,16 +8788,16 @@ async def pptp_fwd_backend_receive(update: Update, context: ContextTypes.DEFAULT
             "iptables -t nat -D PREROUTING -p gre ! -s "
             f"{backend} -j DNAT --to-destination {backend} 2>/dev/null ; "
             "iptables -t raw -D PREROUTING -p tcp --dport 1723 -j CT --helper pptp 2>/dev/null ; "
-            # Add fresh rules
-            f"iptables -t nat -A PREROUTING -p tcp --dport 1723 -j DNAT --to-destination {backend}:1723 && "
-            f"iptables -t nat -A PREROUTING -p gre ! -s {backend} -j DNAT --to-destination {backend} && "
-            # Ensure MASQUERADE + FORWARD exist (idempotent via -C check)
+            # Add fresh rules (each separate, don't break chain)
+            f"iptables -t nat -A PREROUTING -p tcp --dport 1723 -j DNAT --to-destination {backend}:1723 ; "
+            f"iptables -t nat -A PREROUTING -p gre ! -s {backend} -j DNAT --to-destination {backend} ; "
+            # Ensure MASQUERADE + FORWARD exist
             "iptables -t nat -C POSTROUTING -j MASQUERADE 2>/dev/null || "
             "iptables -t nat -A POSTROUTING -j MASQUERADE ; "
             "iptables -C FORWARD -j ACCEPT 2>/dev/null || "
             "iptables -A FORWARD -j ACCEPT ; "
             # CT helper (critical for GRE through NAT)
-            "iptables -t raw -A PREROUTING -p tcp --dport 1723 -j CT --helper pptp && "
+            "iptables -t raw -A PREROUTING -p tcp --dport 1723 -j CT --helper pptp 2>/dev/null ; "
             # Persist modules
             "grep -q nf_nat_pptp /etc/modules 2>/dev/null || echo nf_nat_pptp >> /etc/modules ; "
             "grep -q nf_conntrack_pptp /etc/modules 2>/dev/null || echo nf_conntrack_pptp >> /etc/modules ; "
@@ -8811,12 +8811,16 @@ async def pptp_fwd_backend_receive(update: Update, context: ContextTypes.DEFAULT
             "iptables -t raw -A PREROUTING -p tcp --dport 1723 -j CT --helper pptp\n"
             "exit 0\n"
             "RCEOF\n"
-            "chmod +x /etc/rc.local && "
+            "chmod +x /etc/rc.local ; "
             "systemctl enable rc-local 2>/dev/null ; "
-            # Save iptables
-            "apt-get install -y -qq iptables-persistent 2>/dev/null ; "
-            "netfilter-persistent save 2>/dev/null && "
-            "echo PPTP_FWD_OK"
+            # Save iptables (try both apt and yum)
+            "which netfilter-persistent >/dev/null 2>&1 || "
+            "apt-get install -y -qq iptables-persistent 2>/dev/null || "
+            "yum install -y -q iptables-services 2>/dev/null ; "
+            "netfilter-persistent save 2>/dev/null || "
+            "service iptables save 2>/dev/null ; "
+            # Verify rules are in place
+            "iptables -t nat -S PREROUTING 2>/dev/null | grep -q '1723' && echo PPTP_FWD_OK || echo PPTP_FWD_FAIL"
         )
         ok, out = ssh_exec(front_ip, 22, srv["ssh_user"], srv["ssh_pass"], install_cmd)
         if ok and "PPTP_FWD_OK" in out:
@@ -8837,18 +8841,19 @@ async def pptp_fwd_backend_receive(update: Update, context: ContextTypes.DEFAULT
             f"⏳ Меняю PPTP бэкенд на <code>{front_ip}</code>\n"
             f"Новый бэкенд: <code>{backend}</code>", parse_mode="HTML")
         change_cmd = (
-            # Remove old PPTP DNAT rules (flush nat PREROUTING selectively)
+            # Remove old PPTP DNAT rules
             "iptables -t nat -S PREROUTING 2>/dev/null | grep -E '(--dport 1723|-p gre)' | "
             "sed 's/^-A/-D/' | while read rule; do iptables -t nat $rule 2>/dev/null; done ; "
             # Remove old CT helper
             "iptables -t raw -S PREROUTING 2>/dev/null | grep '1723.*pptp' | "
             "sed 's/^-A/-D/' | while read rule; do iptables -t raw $rule 2>/dev/null; done ; "
             # Add new rules
-            f"iptables -t nat -A PREROUTING -p tcp --dport 1723 -j DNAT --to-destination {backend}:1723 && "
-            f"iptables -t nat -A PREROUTING -p gre ! -s {backend} -j DNAT --to-destination {backend} && "
-            "iptables -t raw -A PREROUTING -p tcp --dport 1723 -j CT --helper pptp && "
-            "netfilter-persistent save 2>/dev/null && "
-            "echo PPTP_CHANGE_OK"
+            f"iptables -t nat -A PREROUTING -p tcp --dport 1723 -j DNAT --to-destination {backend}:1723 ; "
+            f"iptables -t nat -A PREROUTING -p gre ! -s {backend} -j DNAT --to-destination {backend} ; "
+            "iptables -t raw -A PREROUTING -p tcp --dport 1723 -j CT --helper pptp 2>/dev/null ; "
+            "netfilter-persistent save 2>/dev/null || service iptables save 2>/dev/null ; "
+            # Verify
+            "iptables -t nat -S PREROUTING 2>/dev/null | grep -q '1723' && echo PPTP_CHANGE_OK || echo PPTP_CHANGE_FAIL"
         )
         ok, out = ssh_exec(front_ip, 22, srv["ssh_user"], srv["ssh_pass"], change_cmd)
         if ok and "PPTP_CHANGE_OK" in out:
@@ -8887,7 +8892,7 @@ async def pptp_fwd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE, ip
         # Clear rc.local
         "rm -f /etc/rc.local 2>/dev/null ; "
         # Save iptables
-        "netfilter-persistent save 2>/dev/null && "
+        "netfilter-persistent save 2>/dev/null || service iptables save 2>/dev/null ; "
         "echo PPTP_DEL_OK"
     )
     ok, out = ssh_exec(ip, 22, srv["ssh_user"], srv["ssh_pass"], remove_cmd)
