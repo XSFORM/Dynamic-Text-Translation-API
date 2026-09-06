@@ -4136,6 +4136,8 @@ async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_T
         await gost_rule_handler(update, context); return
     if context.user_data.get('await_gost_getroot') and context.user_data['await_gost_getroot'] != 'pem':
         await gost_getroot_handler(update, context); return
+    if context.user_data.get('await_pptp_fwd_backend'):
+        await pptp_fwd_backend_receive(update, context); return
     # OpenVPN Ext Config text inputs
     if context.user_data.get('await_oec_radd'):
         await oec_remote_add_receive(update, context); return
@@ -5089,6 +5091,29 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await gost_help_send(update, context)
     elif data == 'gost_getroot':
         await gost_getroot_start(update, context)
+    # --- PPTP iptables forward ---
+    elif data == 'pptp_fwd_menu':
+        await pptp_fwd_menu(update, context)
+    elif data == 'pptp_fwd_select_install':
+        await _gost_select_server(update, context, 'pptp_fwd_install',
+            "🔀 <b>Установить PPTP форвард</b>\nВыберите фронт-сервер:")
+    elif data.startswith('pptp_fwd_install:'):
+        await pptp_fwd_install_start(update, context, data[len('pptp_fwd_install:'):])
+    elif data == 'pptp_fwd_select_change':
+        await _gost_select_server(update, context, 'pptp_fwd_change',
+            "🔄 <b>Сменить PPTP бэкенд</b>\nВыберите фронт-сервер:")
+    elif data.startswith('pptp_fwd_change:'):
+        await pptp_fwd_change_start(update, context, data[len('pptp_fwd_change:'):])
+    elif data == 'pptp_fwd_select_remove':
+        await _gost_select_server(update, context, 'pptp_fwd_remove',
+            "🗑️ <b>Удалить PPTP форвард</b>\nВыберите фронт-сервер:")
+    elif data.startswith('pptp_fwd_remove:'):
+        await pptp_fwd_remove(update, context, data[len('pptp_fwd_remove:'):])
+    elif data == 'pptp_fwd_select_status':
+        await _gost_select_server(update, context, 'pptp_fwd_status',
+            "📊 <b>Статус PPTP форварда</b>\nВыберите фронт-сервер:")
+    elif data.startswith('pptp_fwd_status:'):
+        await pptp_fwd_status(update, context, data[len('pptp_fwd_status:'):])
 
     else:
         await safe_edit_text(q, context, "Неизвестная команда.")
@@ -7716,6 +7741,7 @@ async def gost_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("💾 Бэкап", callback_data='gost_select_backup'),
          InlineKeyboardButton("📥 Восстановить", callback_data='gost_select_restore')],
         [InlineKeyboardButton("🚀 Ускорить TCP/UDP", callback_data='gost_select_optimize')],
+        [InlineKeyboardButton("🔀 PPTP форвард (iptables)", callback_data='pptp_fwd_menu')],
         [InlineKeyboardButton("🗑️ Удалить GOST", callback_data='gost_select_uninstall')],
         [InlineKeyboardButton("🔐 Получить Root", callback_data='gost_getroot')],
         [InlineKeyboardButton("❓ Помощь GOST", callback_data='gost_help')],
@@ -8662,6 +8688,258 @@ async def gost_getroot_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             await msg.edit_text(
                 f"❌ Ошибка на {ip}:\n<pre>{escape(out[:2000])}</pre>",
                 parse_mode="HTML")
+
+
+# =====================================================================
+#  PPTP IPTABLES FORWARD (on GOST front servers)
+# =====================================================================
+
+async def pptp_fwd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    kb = [
+        [InlineKeyboardButton("⚙️ Установить PPTP форвард", callback_data='pptp_fwd_select_install')],
+        [InlineKeyboardButton("🔄 Сменить PPTP бэкенд", callback_data='pptp_fwd_select_change')],
+        [InlineKeyboardButton("📊 Статус PPTP форварда", callback_data='pptp_fwd_select_status')],
+        [InlineKeyboardButton("🗑️ Удалить PPTP форвард", callback_data='pptp_fwd_select_remove')],
+        [InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')],
+    ]
+    await safe_edit_text(q, context,
+        "🔀 <b>PPTP форвард (iptables)</b>\n\n"
+        "Перенаправляет TCP:1723 + GRE с фронта на PPTP бэкенд.\n"
+        "Работает вместе с GOST (OpenVPN UDP:443) на одном фронте.",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def pptp_fwd_install_start(update: Update, context: ContextTypes.DEFAULT_TYPE, ip: str):
+    """Ask for backend IP, then install iptables PPTP forward."""
+    q = update.callback_query
+    await q.answer()
+    servers = load_gost_servers()
+    if ip not in servers:
+        await safe_edit_text(q, context, "Сервер не найден.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='pptp_fwd_menu')]]))
+        return
+    context.user_data['await_pptp_fwd_backend'] = {'ip': ip, 'action': 'install'}
+    await safe_edit_text(q, context,
+        f"⚙️ <b>Установить PPTP форвард на {ip}</b>\n\n"
+        "Введите IP адрес <b>PPTP бэкенда</b> (сервер с pptpd):",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("❌ Отмена", callback_data='pptp_fwd_menu')]]))
+
+
+async def pptp_fwd_change_start(update: Update, context: ContextTypes.DEFAULT_TYPE, ip: str):
+    """Ask for new backend IP to change PPTP forward target."""
+    q = update.callback_query
+    await q.answer()
+    servers = load_gost_servers()
+    if ip not in servers:
+        await safe_edit_text(q, context, "Сервер не найден.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='pptp_fwd_menu')]]))
+        return
+    context.user_data['await_pptp_fwd_backend'] = {'ip': ip, 'action': 'change'}
+    await safe_edit_text(q, context,
+        f"🔄 <b>Сменить PPTP бэкенд на {ip}</b>\n\n"
+        "Введите <b>новый IP бэкенда</b>:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("❌ Отмена", callback_data='pptp_fwd_menu')]]))
+
+
+async def pptp_fwd_backend_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle backend IP input for install or change."""
+    data = context.user_data.pop('await_pptp_fwd_backend', None)
+    if not data:
+        return
+    backend = update.message.text.strip()
+    # Basic IP validation
+    import re as _re
+    if not _re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', backend):
+        await update.message.reply_text("❌ Неверный формат IP. Попробуйте снова.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀️ Назад", callback_data='pptp_fwd_menu')]]))
+        return
+
+    front_ip = data['ip']
+    action = data['action']
+    servers = load_gost_servers()
+    srv = servers.get(front_ip)
+    if not srv:
+        await update.message.reply_text("Сервер не найден.")
+        return
+
+    if action == 'install':
+        msg = await update.message.reply_text(
+            f"⏳ Устанавливаю PPTP форвард на <code>{front_ip}</code>\n"
+            f"Бэкенд: <code>{backend}</code>", parse_mode="HTML")
+        install_cmd = (
+            # Enable forwarding
+            "sysctl -w net.ipv4.ip_forward=1 && "
+            "grep -q '^net.ipv4.ip_forward=1' /etc/sysctl.conf || "
+            "echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf ; "
+            # Load kernel modules
+            "modprobe nf_nat_pptp 2>/dev/null ; "
+            "modprobe nf_conntrack_pptp 2>/dev/null ; "
+            "modprobe ip_gre 2>/dev/null ; "
+            # Flush old PPTP rules (if any) to avoid duplicates
+            "iptables -t nat -D PREROUTING -p tcp --dport 1723 -j DNAT --to-destination "
+            f"{backend}:1723 2>/dev/null ; "
+            "iptables -t nat -D PREROUTING -p gre ! -s "
+            f"{backend} -j DNAT --to-destination {backend} 2>/dev/null ; "
+            "iptables -t raw -D PREROUTING -p tcp --dport 1723 -j CT --helper pptp 2>/dev/null ; "
+            # Add fresh rules
+            f"iptables -t nat -A PREROUTING -p tcp --dport 1723 -j DNAT --to-destination {backend}:1723 && "
+            f"iptables -t nat -A PREROUTING -p gre ! -s {backend} -j DNAT --to-destination {backend} && "
+            # Ensure MASQUERADE + FORWARD exist (idempotent via -C check)
+            "iptables -t nat -C POSTROUTING -j MASQUERADE 2>/dev/null || "
+            "iptables -t nat -A POSTROUTING -j MASQUERADE ; "
+            "iptables -C FORWARD -j ACCEPT 2>/dev/null || "
+            "iptables -A FORWARD -j ACCEPT ; "
+            # CT helper (critical for GRE through NAT)
+            "iptables -t raw -A PREROUTING -p tcp --dport 1723 -j CT --helper pptp && "
+            # Persist modules
+            "grep -q nf_nat_pptp /etc/modules 2>/dev/null || echo nf_nat_pptp >> /etc/modules ; "
+            "grep -q nf_conntrack_pptp /etc/modules 2>/dev/null || echo nf_conntrack_pptp >> /etc/modules ; "
+            "grep -q ip_gre /etc/modules 2>/dev/null || echo ip_gre >> /etc/modules ; "
+            # rc.local for CT helper + modules on boot
+            "cat > /etc/rc.local << 'RCEOF'\n"
+            "#!/bin/bash\n"
+            "modprobe nf_nat_pptp\n"
+            "modprobe nf_conntrack_pptp\n"
+            "modprobe ip_gre\n"
+            "iptables -t raw -A PREROUTING -p tcp --dport 1723 -j CT --helper pptp\n"
+            "exit 0\n"
+            "RCEOF\n"
+            "chmod +x /etc/rc.local && "
+            "systemctl enable rc-local 2>/dev/null ; "
+            # Save iptables
+            "apt-get install -y -qq iptables-persistent 2>/dev/null ; "
+            "netfilter-persistent save 2>/dev/null && "
+            "echo PPTP_FWD_OK"
+        )
+        ok, out = ssh_exec(front_ip, 22, srv["ssh_user"], srv["ssh_pass"], install_cmd)
+        if ok and "PPTP_FWD_OK" in out:
+            # Save backend in server config
+            srv["pptp_backend"] = backend
+            save_gost_servers(servers)
+            result = (f"✅ PPTP форвард установлен на <code>{front_ip}</code>\n"
+                      f"Бэкенд: <code>{backend}</code>\n\n"
+                      f"TCP:1723 + GRE → {backend}")
+        else:
+            result = f"❌ Ошибка:\n<pre>{escape(out[:2000])}</pre>"
+        await msg.edit_text(result, parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀️ Назад", callback_data='pptp_fwd_menu')]]))
+
+    elif action == 'change':
+        msg = await update.message.reply_text(
+            f"⏳ Меняю PPTP бэкенд на <code>{front_ip}</code>\n"
+            f"Новый бэкенд: <code>{backend}</code>", parse_mode="HTML")
+        change_cmd = (
+            # Remove old PPTP DNAT rules (flush nat PREROUTING selectively)
+            "iptables -t nat -S PREROUTING 2>/dev/null | grep -E '(--dport 1723|-p gre)' | "
+            "sed 's/^-A/-D/' | while read rule; do iptables -t nat $rule 2>/dev/null; done ; "
+            # Remove old CT helper
+            "iptables -t raw -S PREROUTING 2>/dev/null | grep '1723.*pptp' | "
+            "sed 's/^-A/-D/' | while read rule; do iptables -t raw $rule 2>/dev/null; done ; "
+            # Add new rules
+            f"iptables -t nat -A PREROUTING -p tcp --dport 1723 -j DNAT --to-destination {backend}:1723 && "
+            f"iptables -t nat -A PREROUTING -p gre ! -s {backend} -j DNAT --to-destination {backend} && "
+            "iptables -t raw -A PREROUTING -p tcp --dport 1723 -j CT --helper pptp && "
+            "netfilter-persistent save 2>/dev/null && "
+            "echo PPTP_CHANGE_OK"
+        )
+        ok, out = ssh_exec(front_ip, 22, srv["ssh_user"], srv["ssh_pass"], change_cmd)
+        if ok and "PPTP_CHANGE_OK" in out:
+            srv["pptp_backend"] = backend
+            save_gost_servers(servers)
+            result = (f"✅ PPTP бэкенд изменён на <code>{front_ip}</code>\n"
+                      f"Новый бэкенд: <code>{backend}</code>")
+        else:
+            result = f"❌ Ошибка:\n<pre>{escape(out[:2000])}</pre>"
+        await msg.edit_text(result, parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀️ Назад", callback_data='pptp_fwd_menu')]]))
+
+
+async def pptp_fwd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE, ip: str):
+    """Remove PPTP iptables forward from a server."""
+    q = update.callback_query
+    await q.answer()
+    servers = load_gost_servers()
+    srv = servers.get(ip)
+    if not srv:
+        await safe_edit_text(q, context, "Сервер не найден.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='pptp_fwd_menu')]]))
+        return
+    msg = await safe_edit_text(q, context,
+        f"⏳ Удаляю PPTP форвард с <code>{ip}</code>...", parse_mode="HTML")
+    remove_cmd = (
+        # Remove PPTP DNAT rules
+        "iptables -t nat -S PREROUTING 2>/dev/null | grep -E '(--dport 1723|-p gre)' | "
+        "sed 's/^-A/-D/' | while read rule; do iptables -t nat $rule 2>/dev/null; done ; "
+        # Remove CT helper
+        "iptables -t raw -S PREROUTING 2>/dev/null | grep '1723.*pptp' | "
+        "sed 's/^-A/-D/' | while read rule; do iptables -t raw $rule 2>/dev/null; done ; "
+        # Remove modules from /etc/modules
+        "sed -i '/nf_nat_pptp/d; /nf_conntrack_pptp/d; /ip_gre/d' /etc/modules 2>/dev/null ; "
+        # Clear rc.local
+        "rm -f /etc/rc.local 2>/dev/null ; "
+        # Save iptables
+        "netfilter-persistent save 2>/dev/null && "
+        "echo PPTP_DEL_OK"
+    )
+    ok, out = ssh_exec(ip, 22, srv["ssh_user"], srv["ssh_pass"], remove_cmd)
+    if ok and "PPTP_DEL_OK" in out:
+        srv.pop("pptp_backend", None)
+        save_gost_servers(servers)
+        result = f"✅ PPTP форвард удалён с <code>{ip}</code>"
+    else:
+        result = f"❌ Ошибка:\n<pre>{escape(out[:2000])}</pre>"
+    await safe_edit_text(q, context, result, parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("◀️ Назад", callback_data='pptp_fwd_menu')]]))
+
+
+async def pptp_fwd_status(update: Update, context: ContextTypes.DEFAULT_TYPE, ip: str):
+    """Check PPTP forward status on a server."""
+    q = update.callback_query
+    await q.answer()
+    servers = load_gost_servers()
+    srv = servers.get(ip)
+    if not srv:
+        await safe_edit_text(q, context, "Сервер не найден.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='pptp_fwd_menu')]]))
+        return
+    msg = await safe_edit_text(q, context,
+        f"⏳ Проверяю PPTP форвард на <code>{ip}</code>...", parse_mode="HTML")
+    status_cmd = (
+        "echo '=== NAT PREROUTING ===' ; "
+        "iptables -t nat -L PREROUTING -n -v 2>/dev/null | grep -E '(1723|gre)' ; "
+        "echo '=== RAW PREROUTING ===' ; "
+        "iptables -t raw -L PREROUTING -n -v 2>/dev/null | grep -i pptp ; "
+        "echo '=== MODULES ===' ; "
+        "lsmod 2>/dev/null | grep -E '(pptp|gre)' ; "
+        "echo '=== CONNTRACK ===' ; "
+        "conntrack -C 2>/dev/null || echo 'conntrack N/A' ; "
+        "echo STATUS_OK"
+    )
+    ok, out = ssh_exec(ip, 22, srv["ssh_user"], srv["ssh_pass"], status_cmd)
+    saved_backend = srv.get("pptp_backend", "не задан")
+    if ok and "STATUS_OK" in out:
+        # Check if PPTP rules are present
+        has_rules = "1723" in out and "gre" in out.lower()
+        status_icon = "🟢" if has_rules else "🔴"
+        result = (f"📊 <b>PPTP форвард — {ip}</b>\n"
+                  f"Статус: {status_icon} {'Активен' if has_rules else 'Не настроен'}\n"
+                  f"Бэкенд: <code>{saved_backend}</code>\n\n"
+                  f"<pre>{escape(out[:3000])}</pre>")
+    else:
+        result = f"❌ Ошибка подключения к {ip}:\n<pre>{escape(out[:2000])}</pre>"
+    await safe_edit_text(q, context, result, parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("◀️ Назад", callback_data='pptp_fwd_menu')]]))
 
 
 # =====================================================================
