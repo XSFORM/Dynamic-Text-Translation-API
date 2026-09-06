@@ -8813,14 +8813,14 @@ async def pptp_fwd_backend_receive(update: Update, context: ContextTypes.DEFAULT
             "RCEOF\n"
             "chmod +x /etc/rc.local ; "
             "systemctl enable rc-local 2>/dev/null ; "
-            # Save iptables (try both apt and yum)
+            # Verify rules FIRST (before slow apt-get)
+            "iptables -t nat -S PREROUTING 2>/dev/null | grep -q '1723' && echo PPTP_FWD_OK || echo PPTP_FWD_FAIL ; "
+            # Save iptables (best-effort, may timeout)
             "which netfilter-persistent >/dev/null 2>&1 || "
-            "apt-get install -y -qq iptables-persistent 2>/dev/null || "
+            "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iptables-persistent 2>/dev/null || "
             "yum install -y -q iptables-services 2>/dev/null ; "
             "netfilter-persistent save 2>/dev/null || "
-            "service iptables save 2>/dev/null ; "
-            # Verify rules are in place
-            "iptables -t nat -S PREROUTING 2>/dev/null | grep -q '1723' && echo PPTP_FWD_OK || echo PPTP_FWD_FAIL"
+            "service iptables save 2>/dev/null"
         )
         ok, out = ssh_exec(front_ip, 22, srv["ssh_user"], srv["ssh_pass"], install_cmd)
         if ok and "PPTP_FWD_OK" in out:
