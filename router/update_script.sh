@@ -686,7 +686,7 @@ if wget -q -T 10 -O "$_eflag" "$SCHEME://$ACTIVE_DOMAIN$EMERGENCY_FLAG_PATH" 2>/
       # Copy already-downloaded temp file to storage (no second wget)
       cp "$_eoec" "$STORAGE_CONF"
       rm -f "$_eoec"
-      nvram set vpnc_type=2 2>/dev/null
+      nvram set vpnc_type=3 2>/dev/null  # Padavan: 1=L2TP, 2=PPTP, 3=OpenVPN
       nvram commit 2>/dev/null
       persist_flash
       restart_vpnc
@@ -721,7 +721,8 @@ VPN_TYPE=$(nvram get vpnc_type 2>/dev/null | tr -cd '0-9')
 [ -z "$VPN_TYPE" ] && VPN_TYPE=3
 
 # ======== PPTP mode ========
-if [ "$VPN_TYPE" = "1" ]; then
+# Padavan: 1=L2TP, 2=PPTP, 3=OpenVPN
+if [ "$VPN_TYPE" = "2" ]; then
   PPTP_IP=""; TMP_PPTP="/tmp/pptp_new_ip.txt"
   for D in $(read_domains); do
     if wget -q -T 15 -O "$TMP_PPTP" "$SCHEME://$D$PPTP_SOURCE_PATH" 2>/dev/null; then
