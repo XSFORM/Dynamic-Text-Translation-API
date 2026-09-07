@@ -488,6 +488,51 @@ def ssh_exec(ip: str, port: int, user: str, password: str, command: str) -> Tupl
     finally:
         client.close()
 
+
+def ssh_exec_via_jump(jump_ip: str, jump_port: int, jump_user: str, jump_pass: str,
+                      target_ip: str, target_port: int, target_user: str, target_pass: str,
+                      command: str) -> Tuple[bool, str]:
+    """SSH to target router through a jump host (e.g. PPTP server -> router on 172.16.0.x)."""
+    jump_client = paramiko.SSHClient()
+    jump_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        jump_client.connect(jump_ip, port=jump_port, username=jump_user, password=jump_pass,
+                            timeout=SSH_TIMEOUT, look_for_keys=False, allow_agent=False)
+        transport = jump_client.get_transport()
+        channel = transport.open_channel("direct-tcpip", (target_ip, target_port),
+                                         ("127.0.0.1", 0))
+        target_client = paramiko.SSHClient()
+        target_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        try:
+            target_client.connect(target_ip, port=target_port, username=target_user,
+                                  password=target_pass, sock=channel,
+                                  timeout=SSH_TIMEOUT, look_for_keys=False, allow_agent=False)
+            stdin, stdout, stderr = target_client.exec_command(command, timeout=SSH_CMD_TIMEOUT)
+            stdout.channel.settimeout(SSH_CMD_TIMEOUT)
+            try:
+                out = stdout.read().decode("utf-8", errors="replace").strip()
+            except socket.timeout:
+                out = "(таймаут чтения — VPN рестарт)"
+            try:
+                err = stderr.read().decode("utf-8", errors="replace").strip()
+            except socket.timeout:
+                err = ""
+            result = out if out else err
+            return True, result if result else "(пустой вывод)"
+        finally:
+            target_client.close()
+    except paramiko.AuthenticationException:
+        return False, "Ошибка авторизации (jump или target)"
+    except paramiko.SSHException as e:
+        return False, f"SSH ошибка: {e}"
+    except socket.timeout:
+        return False, "Таймаут подключения"
+    except Exception as e:
+        return False, f"Ошибка: {e}"
+    finally:
+        jump_client.close()
+
+
 def ssh_exec_key(ip: str, port: int, user: str, key_path: str, command: str,
                  sudo_pass: str = None) -> Tuple[bool, str]:
     """Execute SSH command using PEM key file. Optionally wrap in sudo."""
@@ -3251,8 +3296,21 @@ async def vpn_switch_exec(update: Update, context: ContextTypes.DEFAULT_TYPE,
                    f'chmod +x /etc/openvpn/client/ovpnc.script ; '
                    f'sleep 1 ; /sbin/restart_vpn_client')
 
-        ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'),
-                           r.get('password', ''), cmd)
+        cur_type = routers[c].get("vpn_type", "openvpn")
+        if cur_type == "pptp" and target_type == "openvpn":
+            # Router is on PPTP network (172.16.0.x) — SSH via PPTP server as jump host
+            pptp_ip = clients.get(c)
+            if not pptp_ip:
+                results.append(f"🔴 {c}: нет PPTP IP для jump")
+                continue
+            ok, out = ssh_exec_via_jump(
+                srv.get("host", ""), int(srv.get("port", 22)),
+                srv.get("user", "root"), srv.get("password", ""),
+                pptp_ip, r.get('port', 22), r.get('user', 'admin'), r.get('password', ''),
+                cmd)
+        else:
+            ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'),
+                               r.get('password', ''), cmd)
         # Update vpn_type in routers.json
         if target_type == "pptp":
             routers[c]["vpn_type"] = "pptp"
