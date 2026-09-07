@@ -3232,8 +3232,8 @@ async def vpn_switch_exec(update: Update, context: ContextTypes.DEFAULT_TYPE,
                 results.append(f"⚠️ {c}: нет PPTP аккаунта (добавьте в Клиенты)")
                 continue
             # Switch to PPTP: set type, peer, user, pass, restart
-            # Padavan: vpnc_type 1=L2TP, 2=PPTP, 3=OpenVPN
-            cmd = (f'nvram set vpnc_type=2 ; '
+            # Padavan: vpnc_type 0=PPTP, 1=L2TP, 2=OpenVPN
+            cmd = (f'nvram set vpnc_type=0 ; '
                    f'nvram set vpnc_peer="{pptp_ip_text}" ; '
                    f'nvram set vpnc_user="{c}" ; '
                    f'nvram set vpnc_pass="{vpn_pass}" ; '
@@ -3241,8 +3241,8 @@ async def vpn_switch_exec(update: Update, context: ContextTypes.DEFAULT_TYPE,
                    f'sleep 1 ; /sbin/restart_vpn_client')
         else:
             # Switch to OpenVPN: set type, restart
-            # Padavan: vpnc_type 1=L2TP, 2=PPTP, 3=OpenVPN
-            cmd = (f'nvram set vpnc_type=3 ; '
+            # Padavan: vpnc_type 0=PPTP, 1=L2TP, 2=OpenVPN
+            cmd = (f'nvram set vpnc_type=2 ; '
                    f'nvram commit ; '
                    f'sleep 1 ; /sbin/restart_vpn_client')
 
@@ -3416,7 +3416,7 @@ async def emg_apply_one(update: Update, context: ContextTypes.DEFAULT_TYPE, cn: 
         f'wget -q -O /etc/storage/openvpn/client/client.conf '
         f'http://{first_domain}/router/emergency_oec.txt && '
         f'mtd_storage.sh save 2>/dev/null ; '
-        f'nvram set vpnc_type=3 2>/dev/null ; '  # Padavan: 1=L2TP, 2=PPTP, 3=OpenVPN
+        f'nvram set vpnc_type=2 2>/dev/null ; '  # Padavan: 0=PPTP, 1=L2TP, 2=OpenVPN
         f'nvram commit 2>/dev/null ; '
         f'sleep 1 && /sbin/restart_vpn_client && echo EMG_OK'
     )
