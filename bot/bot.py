@@ -303,11 +303,13 @@ def subnet_switch_ip(pool_data: dict, new_ip: str) -> Tuple[bool, str]:
         pool_data.setdefault('used_ips', []).append(new_ip)
     save_subnet_pool(pool_data)
 
-    # 4. Update RR current_vpn_ip.txt so routers auto-switch
+    # 4. Update RR current_vpn_ip.txt + current_pptp_ip.txt so routers auto-switch
     try:
         with open(RR_IP_FILE, "w") as f:
             f.write(new_ip)
-        rr_append_history(f"subnet switch: {old_ip} → {new_ip}")
+        with open(RR_PPTP_IP_FILE, "w") as f:
+            f.write(new_ip)
+        rr_append_history(f"subnet switch: {old_ip} → {new_ip} (OVPN+PPTP)")
     except Exception:
         pass
 
@@ -2202,9 +2204,10 @@ async def rr_set_ip_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     old_ip = rr_read_file(RR_IP_FILE, "")
     rr_write_file(RR_IP_FILE, text + "\n")
-    rr_append_history(f"IP changed: {old_ip} -> {text}")
+    rr_write_file(RR_PPTP_IP_FILE, text + "\n")
+    rr_append_history(f"IP changed: {old_ip} -> {text} (OVPN+PPTP)")
     context.user_data.pop('await_rr_ip', None)
-    await update.message.reply_text(f"✅ IP обновлён: <code>{text}</code>", parse_mode="HTML")
+    await update.message.reply_text(f"✅ IP обновлён: <code>{text}</code> (OVPN+PPTP)", parse_mode="HTML")
 
 # =====================================================================
 #  FORCE IP — принудительная смена IP на роутерах через SSH
@@ -2240,10 +2243,11 @@ async def force_ip_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [[InlineKeyboardButton("❌ Отмена", callback_data="rr_cancel")]]))
         return
     context.user_data.pop('await_force_ip', None)
-    # Save new IP to current_vpn_ip.txt
+    # Save new IP to current_vpn_ip.txt + current_pptp_ip.txt
     old_ip = rr_read_file(RR_IP_FILE, "")
     rr_write_file(RR_IP_FILE, text + "\n")
-    rr_append_history(f"FORCE: {old_ip} -> {text}")
+    rr_write_file(RR_PPTP_IP_FILE, text + "\n")
+    rr_append_history(f"FORCE: {old_ip} -> {text} (OVPN+PPTP)")
     context.user_data['force_ip_new'] = text
     context.user_data['force_ip_old'] = old_ip
     context.user_data['force_ip_selected'] = set()
@@ -2971,7 +2975,6 @@ async def pptp_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ip = read_pptp_ip() or "(не задан)"
     clients = load_pptp_clients()
     kb = [
-        [InlineKeyboardButton("✏️ Сменить IP", callback_data='pptp_set_ip')],
         [InlineKeyboardButton(f"👥 Клиенты ({len(clients)})", callback_data='pptp_clients'),
          InlineKeyboardButton("🔀 Переключить", callback_data='vpn_switch')],
         [InlineKeyboardButton("⚙️ Сервер PPTP", callback_data='pptp_server')],
@@ -2979,8 +2982,9 @@ async def pptp_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     await safe_edit_text(q, context,
         f"🔗 <b>PPTP</b>\n\n"
-        f"IP: <code>{ip}</code>\n"
-        f"Домены: общие с OpenVPN",
+        f"IP: <code>{ip}</code> (общий с OVPN)\n"
+        f"Домены: общие с OpenVPN\n"
+        f"<i>IP меняется через Авто IP или Сменить IP в RR</i>",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
 async def pptp_set_ip_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7756,10 +7760,11 @@ async def auto_ip_replace_receive(update: Update, context: ContextTypes.DEFAULT_
         await update.message.reply_text(f"IP {old_ip} не найден в пуле.")
         return
     save_ip_pool(pool)
-    # Update current IP file if the replaced IP was active
+    # Update current IP files if the replaced IP was active
     current = rr_read_file(RR_IP_FILE, "").strip()
     if current == old_ip:
         rr_write_file(RR_IP_FILE, new_ip)
+        rr_write_file(RR_PPTP_IP_FILE, new_ip)
     label = entry.get("label", "")
     name = f" ({label})" if label else ""
     await update.message.reply_text(
