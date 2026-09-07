@@ -2979,17 +2979,25 @@ async def pptp_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     ip = read_pptp_ip() or "(не задан)"
     clients = load_pptp_clients()
-    kb = [
+    pptp_synced = auto_ip_state.get("pptp", False)
+    kb = []
+    if not pptp_synced:
+        kb.append([InlineKeyboardButton("✏️ Сменить IP", callback_data='pptp_set_ip')])
+    kb.extend([
         [InlineKeyboardButton(f"👥 Клиенты ({len(clients)})", callback_data='pptp_clients'),
          InlineKeyboardButton("🔀 Переключить", callback_data='vpn_switch')],
         [InlineKeyboardButton("⚙️ Сервер PPTP", callback_data='pptp_server')],
         [InlineKeyboardButton("🏠 Меню", callback_data='home')],
-    ]
+    ])
+    if pptp_synced:
+        note = "<i>IP синхронизирован с OVPN (Авто IP)</i>"
+    else:
+        note = "<i>IP отдельный от OVPN (Авто IP PPTP выкл)</i>"
     await safe_edit_text(q, context,
         f"🔗 <b>PPTP</b>\n\n"
-        f"IP: <code>{ip}</code> (общий с OVPN)\n"
+        f"IP: <code>{ip}</code>\n"
         f"Домены: общие с OpenVPN\n"
-        f"<i>IP меняется через Авто IP или Сменить IP в RR</i>",
+        f"{note}",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
 async def pptp_set_ip_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
