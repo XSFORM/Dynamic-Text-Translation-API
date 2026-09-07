@@ -82,6 +82,7 @@ SELFTEST_TOKEN="UPDATE_SCRIPT_SELFTEST_OK"
 # -------- PPTP config --------
 PPTP_SOURCE_PATH="/current_pptp_ip.txt"
 PPTP_TUN_IFACE="ppp0"
+PPTP_EMERGENCY_PATH="/router/pptp_emergency.txt"
 
 # -------- Beacon config --------
 BEACON_ENABLE=1
@@ -725,6 +726,33 @@ VPN_TYPE=$(nvram get vpnc_type 2>/dev/null | tr -cd '0-9')
 # ======== PPTP mode ========
 # Padavan: 0=PPTP, 1=L2TP, 2=OpenVPN
 if [ "$VPN_TYPE" = "0" ]; then
+
+  # -------- PPTP emergency: switch to OpenVPN if server says so --------
+  _pemg="/tmp/pptp_emg.txt"
+  for D in $(read_domains); do
+    if wget -q -T 10 -O "$_pemg" "$SCHEME://$D$PPTP_EMERGENCY_PATH" 2>/dev/null && [ -s "$_pemg" ]; then
+      _pemg_val=$(head -n1 "$_pemg" | tr -d '\r\n ')
+      rm -f "$_pemg"
+      if [ "$_pemg_val" = "openvpn" ]; then
+        log "pptp-emergency: switching to OpenVPN"
+        # Recreate ovpnc.script (PPTP mode deletes it)
+        printf '#!/bin/sh\n/sbin/restart_dhcpd 2>/dev/null\nlogger -t vpnc-script "$1 $script_type"\nexit 0\n' \
+          > /etc/openvpn/client/ovpnc.script
+        chmod +x /etc/openvpn/client/ovpnc.script
+        nvram set vpnc_type=2 2>/dev/null
+        nvram commit 2>/dev/null
+        persist_flash
+        restart_vpnc
+        send_beacon "$D" "emg" "" "pptp->ovpn"
+        log "pptp-emergency: done, switched to OpenVPN"
+        echo "$NOW" > "$STAMP_FILE"
+        exit 0
+      fi
+      break
+    fi
+  done
+  rm -f "$_pemg"
+
   PPTP_IP=""; TMP_PPTP="/tmp/pptp_new_ip.txt"
   for D in $(read_domains); do
     if wget -q -T 15 -O "$TMP_PPTP" "$SCHEME://$D$PPTP_SOURCE_PATH" 2>/dev/null; then

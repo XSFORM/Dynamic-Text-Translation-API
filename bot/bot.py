@@ -121,6 +121,7 @@ RR_PROTOCOL_FILE = "/var/www/html/router/protocol.txt"
 RR_PPTP_IP_FILE = "/var/www/html/current_pptp_ip.txt"
 RR_EMERGENCY_OEC_FILE = "/var/www/html/router/emergency_oec.txt"
 RR_EMERGENCY_FLAG_FILE = "/var/www/html/router/emergency.flag"
+RR_PPTP_EMERGENCY_FILE = "/var/www/html/router/pptp_emergency.txt"
 RR_ENV_FILE = "/etc/remote-refresh.env"
 RR_BACKUP_PASSWORD = b"canonical87"
 
@@ -456,6 +457,24 @@ def set_emergency_flag(enabled: bool):
             os.remove(RR_EMERGENCY_FLAG_FILE)
         except FileNotFoundError:
             pass
+
+def is_pptp_emergency_enabled() -> bool:
+    try:
+        with open(RR_PPTP_EMERGENCY_FILE, "r") as f:
+            return f.read().strip() == "openvpn"
+    except FileNotFoundError:
+        return False
+
+def set_pptp_emergency(enabled: bool):
+    if enabled:
+        with open(RR_PPTP_EMERGENCY_FILE, "w") as f:
+            f.write("openvpn\n")
+    else:
+        try:
+            os.remove(RR_PPTP_EMERGENCY_FILE)
+        except FileNotFoundError:
+            pass
+
 
 def ssh_exec(ip: str, port: int, user: str, password: str, command: str) -> Tuple[bool, str]:
     """Execute SSH command on router. Returns (success, output)."""
@@ -3341,24 +3360,30 @@ async def emergency_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     enabled = is_emergency_enabled()
+    pptp_emg = is_pptp_emergency_enabled()
     oec = read_emergency_oec()
     status = "🟢 ВКЛ — роутеры применят на след. кроне" if enabled else "🔴 ВЫКЛ"
+    pptp_status = "🟢 ВКЛ — PPTP роутеры переключатся на OpenVPN" if pptp_emg else "🔴 ВЫКЛ"
     preview = f"<pre>{escape(oec[:500])}</pre>" if oec else "<i>не задан</i>"
     toggle_btn = "🔴 Выключить" if enabled else "🟢 Включить"
     toggle_cb = "emg_off" if enabled else "emg_on"
+    pptp_toggle_btn = "🔴 Выкл PPTP→OVPN" if pptp_emg else "🟢 Вкл PPTP→OVPN"
+    pptp_toggle_cb = "pptp_emg_off" if pptp_emg else "pptp_emg_on"
     kb = [
         [InlineKeyboardButton("✏️ Редактировать", callback_data='emg_edit')],
         [InlineKeyboardButton(toggle_btn, callback_data=toggle_cb)],
         [InlineKeyboardButton("📡 Применить к одному", callback_data='emg_apply_one')],
+        [InlineKeyboardButton(pptp_toggle_btn, callback_data=pptp_toggle_cb)],
         [InlineKeyboardButton("🏠 Меню", callback_data='home')],
     ]
     await safe_edit_text(q, context,
         f"🛟 <b>Аварийный конфиг</b>\n\n"
-        f"Статус: {status}\n\n"
+        f"OpenVPN: {status}\n"
+        f"PPTP→OVPN: {pptp_status}\n\n"
         f"Конфиг:\n{preview}\n\n"
-        f"<i>При включении скрипт на роутерах полностью\n"
-        f"перезапишет расширенный конфиг и перезапустит VPN.\n"
-        f"Сертификаты в стандартных полях не затрагиваются.</i>",
+        f"<i>OpenVPN аварийка — перезаписывает расширенный конфиг.\n"
+        f"PPTP→OVPN — переключает PPTP роутеры на OpenVPN\n"
+        f"(если провайдер заблокировал PPTP).</i>",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
 async def emergency_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5071,6 +5096,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await emg_apply_select(update, context)
     elif data.startswith('emg_apply:'):
         await emg_apply_one(update, context, data[len('emg_apply:'):])
+    elif data == 'pptp_emg_on':
+        q = update.callback_query
+        await q.answer()
+        set_pptp_emergency(True)
+        rr_append_history("PPTP_EMERGENCY_ON")
+        await emergency_menu(update, context)
+    elif data == 'pptp_emg_off':
+        q = update.callback_query
+        await q.answer()
+        set_pptp_emergency(False)
+        rr_append_history("PPTP_EMERGENCY_OFF")
+        await emergency_menu(update, context)
 
     # --- Auto IP callbacks ---
     elif data == 'aip_menu':
