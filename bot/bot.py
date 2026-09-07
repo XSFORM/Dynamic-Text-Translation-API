@@ -3029,7 +3029,7 @@ async def pptp_cl_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [[InlineKeyboardButton("◀ Назад", callback_data='pptp_clients')]]))
         return
     kb = [[InlineKeyboardButton(cn, callback_data=f'pptp_cl_add1:{cn}')]
-          for cn in available[:20]]
+          for cn in available]
     kb.append([InlineKeyboardButton("◀ Назад", callback_data='pptp_clients')])
     await safe_edit_text(q, context,
         "➕ <b>Добавить PPTP клиента</b>\n\nВыберите роутер:",
@@ -3115,7 +3115,7 @@ async def pptp_cl_del_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [[InlineKeyboardButton("◀ Назад", callback_data='pptp_clients')]]))
         return
     kb = [[InlineKeyboardButton(f"🗑 {cn} ({ip})", callback_data=f'pptp_cl_rm:{cn}')]
-          for cn, ip in sorted(clients.items(), key=lambda x: x[1])][:20]
+          for cn, ip in sorted(clients.items(), key=lambda x: x[1])]
     kb.append([InlineKeyboardButton("◀ Назад", callback_data='pptp_clients')])
     await safe_edit_text(q, context,
         "🗑 <b>Удалить PPTP клиента</b>",
@@ -3180,7 +3180,7 @@ async def vpn_switch_select(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                 [[InlineKeyboardButton("◀ Назад", callback_data='vpn_switch')]]))
         return
     kb = [[InlineKeyboardButton(cn, callback_data=f'vpn_sw_{target_type}:{cn}')]
-          for cn in items[:20]]
+          for cn in items]
     kb.append([InlineKeyboardButton("🔄 ВСЕ", callback_data=f'vpn_sw_{target_type}:__all__')])
     kb.append([InlineKeyboardButton("◀ Назад", callback_data='vpn_switch')])
     label = "PPTP" if target_type == "pptp" else "OpenVPN"
