@@ -4261,16 +4261,26 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         clients, online_names, tunnel_ips = parse_openvpn_status()
         files = get_ovpn_files()
         files = sorted(files, key=lambda x: _natural_key(x[:-5]))
+        routers = load_routers()
+        pptp_clients = load_pptp_clients()
         lines = ["<b>Статус всех ключей:</b>"]
         cnt_online = 0
         cnt_offline = 0
         cnt_disabled = 0
+        cnt_pptp = 0
         for f in files:
             name = f[:-5]
+            r = routers.get(name, {})
+            is_pptp = r.get("vpn_type") == "pptp"
             if is_client_ccd_disabled(name):
                 st = "⛔"
                 cnt_disabled += 1
                 lines.append(f"{st} {name}")
+            elif is_pptp:
+                # PPTP router — not in OpenVPN status.log
+                pptp_ip = pptp_clients.get(name, "")
+                cnt_pptp += 1
+                lines.append(f"🟡 {name}  <code>{pptp_ip}</code> [PPTP]")
             elif name in online_names:
                 st = "🟢"
                 cnt_online += 1
@@ -4284,10 +4294,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 cnt_offline += 1
                 lines.append(f"{st} {name}")
         lines.append("")
-        lines.append(f"🟢 Онлайн: <b>{cnt_online}</b>")
+        lines.append(f"🟢 OpenVPN: <b>{cnt_online}</b>")
+        if cnt_pptp:
+            lines.append(f"🟡 PPTP: <b>{cnt_pptp}</b>")
         lines.append(f"🔴 Оффлайн: <b>{cnt_offline}</b>")
         lines.append(f"⛔ Отключены: <b>{cnt_disabled}</b>")
-        lines.append(f"📊 Всего: <b>{cnt_online + cnt_offline + cnt_disabled}</b>")
+        lines.append(f"📊 Всего: <b>{cnt_online + cnt_pptp + cnt_offline + cnt_disabled}</b>")
         text = "\n".join(lines)
         msgs = split_message(text)
         await safe_edit_text(q, context, msgs[0], parse_mode="HTML",
