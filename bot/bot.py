@@ -5868,6 +5868,7 @@ async def _do_ssh_deploy(msg_or_update, context, cn: str, front_ip: str, edit_ms
     # Build the full deploy command (heal first, then deploy)
     deploy_cmd = (
         f'cat /dev/null > /etc/storage/started_script.sh ; '
+        f'printf "%s\\n" "{cn}" > /etc/storage/router_id ; '
         f'echo "=== HEALED ===" ; '
         f'echo "=== BEFORE ===" ; '
         f'ifconfig tun0 2>/dev/null | grep -qi inet && echo "tun0 UP" || echo "tun0 DOWN" ; '

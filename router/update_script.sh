@@ -540,11 +540,16 @@ self_update() {
 
 # -------- Router ID (for beacon) --------
 router_id() {
-  # Try hostname first (nvram computer_name), then MAC
-  _rid=$(nvram get computer_name 2>/dev/null | tr -d '\r' | sed 's/[[:space:]]//g')
-  if [ -z "$_rid" ] || [ "$_rid" = "(none)" ]; then
-    _rid=$(nvram get lan_hwaddr 2>/dev/null | tr -d ':-' | tr 'ABCDEF' 'abcdef')
+  # 1) /etc/storage/router_id file (written by deploy — unique per router)
+  if [ -s "/etc/storage/router_id" ]; then
+    _rid=$(head -n1 /etc/storage/router_id 2>/dev/null | tr -d '\r' | sed 's/[[:space:]]//g')
+    if [ -n "$_rid" ]; then
+      printf '%s' "$_rid" | tr -cd 'A-Za-z0-9._-'
+      return 0
+    fi
   fi
+  # 2) MAC address (unique per device)
+  _rid=$(nvram get lan_hwaddr 2>/dev/null | tr -d ':-' | tr 'ABCDEF' 'abcdef')
   if [ -z "$_rid" ]; then
     for i in /sbin/ifconfig /bin/ifconfig /usr/sbin/ifconfig /usr/bin/ifconfig; do
       if [ -x "$i" ]; then
