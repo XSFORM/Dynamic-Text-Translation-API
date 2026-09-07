@@ -4280,7 +4280,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # PPTP router — not in OpenVPN status.log
                 pptp_ip = pptp_clients.get(name, "")
                 cnt_pptp += 1
-                lines.append(f"🟡 {name}  <code>{pptp_ip}</code> [PPTP]")
+                lines.append(f'🟡 {name}  <a href="http://{pptp_ip}">{pptp_ip}</a> [PPTP]')
             elif name in online_names:
                 st = "🟢"
                 cnt_online += 1
