@@ -4268,10 +4268,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cnt_offline = 0
         cnt_disabled = 0
         cnt_pptp = 0
+        _stats_routers_dirty = False
         for f in files:
             name = f[:-5]
             r = routers.get(name, {})
             is_pptp = r.get("vpn_type") == "pptp"
+            # Auto-correct: if marked PPTP but seen in OpenVPN status.log → fix
+            if is_pptp and name in online_names:
+                r.pop("vpn_type", None)
+                _stats_routers_dirty = True
+                is_pptp = False
             if is_client_ccd_disabled(name):
                 st = "⛔"
                 cnt_disabled += 1
@@ -4300,6 +4306,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"🔴 Оффлайн: <b>{cnt_offline}</b>")
         lines.append(f"⛔ Отключены: <b>{cnt_disabled}</b>")
         lines.append(f"📊 Всего: <b>{cnt_online + cnt_pptp + cnt_offline + cnt_disabled}</b>")
+        if _stats_routers_dirty:
+            save_routers(routers)
         text = "\n".join(lines)
         msgs = split_message(text)
         await safe_edit_text(q, context, msgs[0], parse_mode="HTML",
