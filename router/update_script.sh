@@ -288,8 +288,10 @@ update_cache_from_server() {
 
 # -------- PPTP helpers --------
 pptp_tunnel_up() {
-  iface_has_inet "$PPTP_TUN_IFACE" && return 0
+  # Must exclude PPPoE WAN interface (also ppp*) to avoid false positive
+  local _wan_if=$(nvram get wan0_ifname_t 2>/dev/null | tr -d '\r')
   for _i in $(ifconfig 2>/dev/null | grep -o '^ppp[0-9]*'); do
+    [ "$_i" = "$_wan_if" ] && continue   # skip PPPoE WAN
     iface_has_inet "$_i" && return 0
   done
   return 1
