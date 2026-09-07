@@ -2613,15 +2613,24 @@ async def beacon_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         r_icon = {"ok": "✅", "fix": "🔧", "err": "❌"}.get(b["r"], "❓")
         uptime = format_uptime(b["up"])
         lines.append(
-            f"{tun_icon} <b>{b['id']}</b>  v{b['v']}  {r_icon}\n"
+            f"{tun_icon} <b>{escape(b['id'])}</b>  v{b['v']}  {r_icon}\n"
             f"    IP: <code>{b['ip']}:{b['port']}</code>  up: {uptime}\n"
             f"    ⏱ {b['ts']}"
         )
     kb = [[InlineKeyboardButton("🔄 Обновить", callback_data='beacon_status')],
           [InlineKeyboardButton("🏠 Меню", callback_data='home')]]
     text = "\n".join(lines)
-    if len(text) > 4000:
-        text = text[:4000] + "\n..."
+    if len(text) > 3900:
+        # Too long for Telegram message — send as file
+        plain = text.replace("<b>", "").replace("</b>", "").replace("<code>", "").replace("</code>", "")
+        doc_bytes = plain.encode("utf-8")
+        await context.bot.send_document(
+            chat_id=q.message.chat_id,
+            document=doc_bytes,
+            filename="beacon_status.txt",
+            caption=f"📡 Маяк — {len(beacons)} роутеров",
+            reply_markup=InlineKeyboardMarkup(kb))
+        return
     await safe_edit_text(q, context, text, parse_mode="HTML",
                          reply_markup=InlineKeyboardMarkup(kb))
 
