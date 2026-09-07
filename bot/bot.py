@@ -7492,11 +7492,11 @@ async def auto_ip_monitor(app):
             if auto_ip_fail_count < AUTO_IP_FAIL_THRESHOLD:
                 continue
 
-            # --- IP blocked, find replacement ---
+            # --- IP blocked, find replacement (next in order, wrap around) ---
             replaced = False
-            for entry in pool:
-                if entry["ip"] == current_ip:
-                    continue
+            cur_idx = next((i for i, e in enumerate(pool) if e["ip"] == current_ip), -1)
+            ordered = pool[cur_idx + 1:] + pool[:cur_idx]  # start after current, wrap
+            for entry in ordered:
                 # Check if replacement is alive
                 alt_ok = await asyncio.to_thread(
                     ping_via_ssh, entry["ip"],
