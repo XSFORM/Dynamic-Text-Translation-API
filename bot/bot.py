@@ -136,23 +136,29 @@ AUTO_IP_FAIL_THRESHOLD = 3                  # consecutive ping fails before swit
 AUTO_IP_CHECK_INTERVAL = 60                 # seconds between checks
 auto_ip_fail_count = 0
 
-def _load_auto_ip_state() -> bool:
+def _load_auto_ip_state() -> dict:
+    """Returns {"ovpn": bool, "pptp": bool}."""
     if os.path.exists(AUTO_IP_STATE_FILE):
         try:
             with open(AUTO_IP_STATE_FILE) as f:
-                return json.load(f).get("enabled", False)
+                d = json.load(f)
+                # Migration: old format {"enabled": bool} → new
+                if "enabled" in d and "ovpn" not in d:
+                    return {"ovpn": d["enabled"], "pptp": False}
+                return {"ovpn": d.get("ovpn", False), "pptp": d.get("pptp", False)}
         except Exception:
             pass
-    return False
+    return {"ovpn": False, "pptp": False}
 
-def _save_auto_ip_state(enabled: bool):
+def _save_auto_ip_state(state: dict):
     try:
         with open(AUTO_IP_STATE_FILE, "w") as f:
-            json.dump({"enabled": enabled}, f)
+            json.dump(state, f)
     except Exception:
         pass
 
-auto_ip_enabled = _load_auto_ip_state()
+auto_ip_state = _load_auto_ip_state()
+auto_ip_enabled = auto_ip_state["ovpn"] or auto_ip_state["pptp"]  # compat
 
 def load_ip_pool() -> list:
     if os.path.exists(AUTO_IP_POOL_FILE):
@@ -5121,6 +5127,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # --- Auto IP callbacks ---
     elif data == 'aip_menu':
         await auto_ip_menu(update, context)
+    elif data == 'aip_toggle_ovpn':
+        await auto_ip_toggle(update, context, "ovpn")
+    elif data == 'aip_toggle_pptp':
+        await auto_ip_toggle(update, context, "pptp")
     elif data == 'aip_toggle':
         await auto_ip_toggle(update, context)
     elif data == 'aip_add':
@@ -7429,11 +7439,11 @@ async def cmd_backup_restore_apply(update: Update, context: ContextTypes.DEFAULT
 async def auto_ip_monitor(app):
     """Background task: every 60s, ping TM probe from current GOST server.
     After 5 consecutive failures — switch to next available IP from pool."""
-    global auto_ip_enabled, auto_ip_fail_count
+    global auto_ip_enabled, auto_ip_fail_count, auto_ip_state
     while True:
         try:
             await asyncio.sleep(AUTO_IP_CHECK_INTERVAL)
-            if not auto_ip_enabled:
+            if not auto_ip_state.get("ovpn") and not auto_ip_state.get("pptp"):
                 continue
 
             pool = load_ip_pool()
@@ -7492,8 +7502,14 @@ async def auto_ip_monitor(app):
                 if alt_ok:
                     old_ip = current_ip
                     new_ip = entry["ip"]
-                    rr_write_file(RR_IP_FILE, new_ip + "\n")
-                    rr_append_history(f"AUTO: {old_ip} -> {new_ip} (blocked)")
+                    changed = []
+                    if auto_ip_state.get("ovpn"):
+                        rr_write_file(RR_IP_FILE, new_ip + "\n")
+                        changed.append("OVPN")
+                    if auto_ip_state.get("pptp"):
+                        rr_write_file(RR_PPTP_IP_FILE, new_ip + "\n")
+                        changed.append("PPTP")
+                    rr_append_history(f"AUTO: {old_ip} -> {new_ip} ({'+'.join(changed)}, blocked)")
                     auto_ip_fail_count = 0
                     replaced = True
                     label = entry.get("label", new_ip)
@@ -7503,6 +7519,7 @@ async def auto_ip_monitor(app):
                             f"🔄 <b>Авто-замена IP</b>\n"
                             f"❌ Заблокирован: <code>{old_ip}</code>\n"
                             f"✅ Новый IP: <code>{new_ip}</code> ({label})\n"
+                            f"Обновлено: {', '.join(changed)}\n"
                             f"Роутеры подхватят через RR.",
                             parse_mode="HTML"
                         )
@@ -7645,9 +7662,17 @@ async def auto_ip_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     pool = load_ip_pool()
     current_ip = rr_read_file(RR_IP_FILE, "").strip()
-    status = "\U0001f7e2 ON" if auto_ip_enabled else "\U0001f534 OFF"
+    pptp_ip = rr_read_file(RR_PPTP_IP_FILE, "").strip()
 
-    lines = [f"<b>\U0001f504 Авто IP</b>  [{status}]", f"Текущий IP: <code>{current_ip}</code>", ""]
+    ovpn_st = "🟢" if auto_ip_state["ovpn"] else "🔴"
+    pptp_st = "🟢" if auto_ip_state["pptp"] else "🔴"
+    lines = [
+        f"<b>🔄 Авто IP</b>",
+        f"OVPN: {ovpn_st}  PPTP: {pptp_st}",
+        f"OpenVPN IP: <code>{current_ip}</code>",
+        f"PPTP IP: <code>{pptp_ip}</code>",
+        "",
+    ]
     if pool:
         for i, entry in enumerate(pool, 1):
             marker = " ◀️" if entry["ip"] == current_ip else ""
@@ -7656,9 +7681,11 @@ async def auto_ip_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         lines.append("Пул пуст.")
 
-    toggle_text = "\U0001f534 Выключить" if auto_ip_enabled else "\U0001f7e2 Включить"
+    ovpn_btn = "🔴 OVPN выкл" if auto_ip_state["ovpn"] else "🟢 OVPN вкл"
+    pptp_btn = "🔴 PPTP выкл" if auto_ip_state["pptp"] else "🟢 PPTP вкл"
     kb = [
-        [InlineKeyboardButton(toggle_text, callback_data='aip_toggle')],
+        [InlineKeyboardButton(ovpn_btn, callback_data='aip_toggle_ovpn'),
+         InlineKeyboardButton(pptp_btn, callback_data='aip_toggle_pptp')],
         [InlineKeyboardButton("➕ Добавить IP", callback_data='aip_add'),
          InlineKeyboardButton("\U0001f5d1 Удалить IP", callback_data='aip_remove')],
         [InlineKeyboardButton("↕️ Порядок", callback_data='aip_reorder'),
@@ -7765,22 +7792,21 @@ async def auto_ip_ping_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = [[InlineKeyboardButton("◀️ Назад", callback_data='aip_menu')]]
     await q.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
-async def auto_ip_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global auto_ip_enabled
+async def auto_ip_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE, mode: str = "ovpn"):
+    global auto_ip_enabled, auto_ip_state
     q = update.callback_query
     await q.answer()
     pool = load_ip_pool()
-    if not pool and not auto_ip_enabled:
+    if not pool and not auto_ip_state.get(mode, False):
         await safe_edit_text(q, context, "Пул пуст. Сначала добавьте IP.",
                              reply_markup=InlineKeyboardMarkup(
                                  [[InlineKeyboardButton("◀️ Назад", callback_data='aip_menu')]]))
         return
-    auto_ip_enabled = not auto_ip_enabled
-    _save_auto_ip_state(auto_ip_enabled)
-    status = "\U0001f7e2 ON" if auto_ip_enabled else "\U0001f534 OFF"
-    await safe_edit_text(q, context, f"Авто IP: <b>{status}</b>", parse_mode="HTML",
-                         reply_markup=InlineKeyboardMarkup(
-                             [[InlineKeyboardButton("◀️ Назад", callback_data='aip_menu')]]))
+    auto_ip_state[mode] = not auto_ip_state[mode]
+    auto_ip_enabled = auto_ip_state["ovpn"] or auto_ip_state["pptp"]
+    _save_auto_ip_state(auto_ip_state)
+    # Go back to menu to show updated state
+    await auto_ip_menu(update, context)
 
 async def auto_ip_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
