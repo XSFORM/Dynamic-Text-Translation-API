@@ -3240,10 +3240,15 @@ async def vpn_switch_exec(update: Update, context: ContextTypes.DEFAULT_TYPE,
                    f'nvram commit ; '
                    f'sleep 1 ; /sbin/restart_vpn_client')
         else:
-            # Switch to OpenVPN: set type, restart
+            # Switch to OpenVPN: set type, recreate ovpnc.script (PPTP deletes it), restart
             # Padavan: vpnc_type 0=PPTP, 1=L2TP, 2=OpenVPN
             cmd = (f'nvram set vpnc_type=2 ; '
                    f'nvram commit ; '
+                   # ovpnc.script is deleted when PPTP mode runs; OpenVPN needs it for up/down
+                   f'printf \'#!/bin/sh\\n/sbin/restart_dhcpd 2>/dev/null\\n'
+                   f'logger -t vpnc-script "$1 $script_type"\\nexit 0\\n\' '
+                   f'> /etc/openvpn/client/ovpnc.script ; '
+                   f'chmod +x /etc/openvpn/client/ovpnc.script ; '
                    f'sleep 1 ; /sbin/restart_vpn_client')
 
         ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'),
