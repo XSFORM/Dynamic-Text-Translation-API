@@ -364,7 +364,9 @@ def get_router_ip(cn: str) -> Optional[str]:
                     return parts[1]
     except FileNotFoundError:
         pass
-    return None
+    # Fallback: check status.log tunnel IPs (for clients not yet in ipp.txt)
+    _, _, tunnel_ips = parse_openvpn_status()
+    return tunnel_ips.get(cn)
 
 def get_online_clients() -> set:
     """Get set of currently connected client CNs from status.log."""
@@ -5191,7 +5193,7 @@ async def _do_ssh_deploy_multi(q_or_msg, context, targets: list, front_ip: str):
         deploy_cmd = (
             f'cat /dev/null > /etc/storage/started_script.sh ; '
             f'wget -q -O /tmp/us.sh http://{front_ip}/router/update_script.sh && '
-            f'[ "$(grep -c is_reserved_ipv4 /tmp/us.sh)" = "3" ] && '
+            f'[ "$(grep -c is_reserved_ipv4 /tmp/us.sh)" -ge 3 ] && '
             f"tail -n1 /tmp/us.sh | grep -q '^exit 0' && {{ "
             f'cp /etc/storage/update_script.sh /etc/storage/update_script.sh.bak.$(date +%H%M) 2>/dev/null ; '
             f'mv /tmp/us.sh /etc/storage/update_script.sh && chmod +x /etc/storage/update_script.sh ; '
@@ -5749,7 +5751,7 @@ async def _do_ssh_deploy(msg_or_update, context, cn: str, front_ip: str, edit_ms
         f'ifconfig tun0 2>/dev/null | grep -qi inet && echo "tun0 UP" || echo "tun0 DOWN" ; '
         f"grep '^remote ' /etc/openvpn/client/client.conf 2>/dev/null ; "
         f'wget -q -O /tmp/us.sh http://{front_ip}/router/update_script.sh && '
-        f'[ "$(grep -c is_reserved_ipv4 /tmp/us.sh)" = "3" ] && '
+        f'[ "$(grep -c is_reserved_ipv4 /tmp/us.sh)" -ge 3 ] && '
         f"tail -n1 /tmp/us.sh | grep -q '^exit 0' && {{ "
         f'cp /etc/storage/update_script.sh /etc/storage/update_script.sh.bak.$(date +%H%M) 2>/dev/null ; '
         f'mv /tmp/us.sh /etc/storage/update_script.sh && chmod +x /etc/storage/update_script.sh ; '
