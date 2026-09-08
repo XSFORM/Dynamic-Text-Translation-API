@@ -2106,6 +2106,22 @@ async def backup_hub(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =====================================================================
 #  REMOTE REFRESH — File helpers
 # =====================================================================
+_DOMAIN_RE = re.compile(
+    r'^(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.[A-Za-z0-9-]{1,63})*\.[A-Za-z]{2,}$'
+)
+
+def is_valid_host(text: str) -> bool:
+    """Return True if *text* is a valid IPv4 address OR a domain name."""
+    text = text.strip()
+    if not text or len(text) > 253:
+        return False
+    # IPv4
+    parts = text.split(".")
+    if len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
+        return text not in ("0.0.0.0", "127.0.0.1")
+    # Domain
+    return bool(_DOMAIN_RE.match(text))
+
 def rr_read_file(path: str, default: str = "") -> str:
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -2186,21 +2202,15 @@ async def rr_set_ip_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current = rr_read_file(RR_IP_FILE, "(not set)")
     context.user_data['await_rr_ip'] = True
     await safe_edit_text(q, context,
-        f"Текущий IP роутеров: <code>{current}</code>\nОтправьте новый IPv4 адрес:",
+        f"Текущий IP роутеров: <code>{current}</code>\nОтправьте новый IP или домен:",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="rr_cancel")]]))
 
 async def rr_set_ip_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get('await_rr_ip'): return
     text = update.message.text.strip()
-    parts = text.split(".")
-    valid = (
-        len(parts) == 4
-        and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts)
-        and text not in ("0.0.0.0", "127.0.0.1")
-    )
-    if not valid:
-        await update.message.reply_text("Неверный IP. Повторите или отмена.",
+    if not is_valid_host(text):
+        await update.message.reply_text("Неверный IP/домен. Повторите или отмена.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="rr_cancel")]]))
         return
     old_ip = rr_read_file(RR_IP_FILE, "")
@@ -2225,7 +2235,7 @@ async def force_ip_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_edit_text(q, context,
         f"🔄 <b>Принудительная смена IP</b>\n\n"
         f"Текущий IP в боте: <code>{current}</code>\n\n"
-        f"Отправьте новый IPv4 адрес.\n"
+        f"Отправьте новый IP или домен.\n"
         f"<i>(текущий IP показан для справки, можно ввести любой)</i>",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([
@@ -2235,14 +2245,8 @@ async def force_ip_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get('await_force_ip'):
         return
     text = update.message.text.strip()
-    parts = text.split(".")
-    valid = (
-        len(parts) == 4
-        and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts)
-        and text not in ("0.0.0.0", "127.0.0.1")
-    )
-    if not valid:
-        await update.message.reply_text("Неверный IP. Повторите или отмена.",
+    if not is_valid_host(text):
+        await update.message.reply_text("Неверный IP/домен. Повторите или отмена.",
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("❌ Отмена", callback_data="rr_cancel")]]))
         return
@@ -3014,10 +3018,8 @@ async def pptp_set_ip_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def pptp_set_ip_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop('await_pptp_ip', None)
     ip = update.message.text.strip()
-    # Basic IP validation
-    parts = ip.split('.')
-    if len(parts) != 4 or not all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
-        await update.message.reply_text("❌ Неверный IP. Формат: 1.2.3.4")
+    if not is_valid_host(ip):
+        await update.message.reply_text("❌ Неверный IP/домен. Формат: 1.2.3.4 или example.com")
         return
     old = read_pptp_ip()
     write_pptp_ip(ip)
@@ -5940,10 +5942,8 @@ async def ssh_deploy_receive_ip(update: Update, context: ContextTypes.DEFAULT_TY
     if not context.user_data.get('await_ssh_deploy_ip'):
         return
     text = update.message.text.strip()
-    parts = text.split(".")
-    valid = (len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts))
-    if not valid:
-        await update.message.reply_text("Неверный IP. Повторите или /start для отмены.")
+    if not is_valid_host(text):
+        await update.message.reply_text("Неверный IP/домен. Повторите или /start для отмены.")
         return
     front_ip = text
     cn = context.user_data.pop('ssh_deploy_cn', None)
@@ -7757,9 +7757,8 @@ async def auto_ip_replace_receive(update: Update, context: ContextTypes.DEFAULT_
     if not old_ip:
         return
     new_ip = update.message.text.strip()
-    parts = new_ip.split(".")
-    if not (len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts)):
-        await update.message.reply_text("Неверный IP. Повторите или /start для отмены.")
+    if not is_valid_host(new_ip):
+        await update.message.reply_text("Неверный IP/домен. Повторите или /start для отмены.")
         context.user_data['await_aip_replace'] = old_ip
         return
     pool = load_ip_pool()
@@ -7846,10 +7845,8 @@ async def auto_ip_add_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     text = update.message.text.strip()
 
     if step == 'ip':
-        parts = text.split(".")
-        valid = (len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts))
-        if not valid:
-            await update.message.reply_text("Неверный IP. Повторите.")
+        if not is_valid_host(text):
+            await update.message.reply_text("Неверный IP/домен. Повторите.")
             return
         context.user_data['aip_new_ip'] = text
         context.user_data['await_aip_add'] = 'user'
