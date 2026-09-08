@@ -69,7 +69,7 @@ USE_INTERVAL=0
 SHOW_FETCH=0
 
 # -------- Self-update config --------
-SELF_VERSION=6
+SELF_VERSION=7
 VERSION_PATH="/router/version.txt"
 SCRIPT_PATH="/router/update_script.sh"
 SELF_FILE="/etc/storage/update_script.sh"
@@ -115,7 +115,7 @@ clean_line() {
   BOM=$(printf '\357\273\277')
   case "$line" in $BOM*) line=${line#"$BOM"} ;; esac
   line=$(printf '%s' "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-  line=$(printf '%s' "$line" | tr -cd '0123456789.:')
+  line=$(printf '%s' "$line" | tr -cd 'A-Za-z0-9._:-')
   printf '%s' "$line"
 }
 
@@ -150,6 +150,19 @@ is_reserved_ipv4() {            # return 0 = reserved/local IP -> REJECT
   esac
   [ "$o1" -ge 224 ] 2>/dev/null && return 0
   return 1
+}
+
+is_valid_domain() {
+  # Simple domain check: letters/digits/hyphens + dots, 2+ char TLD
+  echo "$1" | grep -qE '^[A-Za-z0-9]([A-Za-z0-9-]{0,62}\.)+[A-Za-z]{2,}$'
+}
+
+is_valid_host() {
+  # Accept valid IPv4 (non-reserved) OR valid domain name
+  if is_valid_ipv4 "$1" && ! is_reserved_ipv4 "$1"; then
+    return 0
+  fi
+  is_valid_domain "$1"
 }
 
 iface_has_inet() {
@@ -633,11 +646,11 @@ for D in $(read_domains); do
     [ -z "$RAW_CLEAN" ] && continue
     NEW_IP="$RAW_CLEAN"
     echo "$NEW_IP" | grep -q ':' && NEW_IP=$(echo "$NEW_IP" | cut -d: -f1)
-    if is_valid_ipv4 "$NEW_IP" && ! is_reserved_ipv4 "$NEW_IP"; then
+    if is_valid_host "$NEW_IP"; then
       [ "$SHOW_FETCH" = "1" ] && log "fetch ok $URL -> $NEW_IP"
       ACTIVE_DOMAIN="$D"; SUCCESS=1; break
     else
-      [ "$SHOW_FETCH" = "1" ] && log "reject ip from $D ($NEW_IP) -> try next domain"
+      [ "$SHOW_FETCH" = "1" ] && log "reject host from $D ($NEW_IP) -> try next domain"
       continue
     fi
   fi
@@ -766,7 +779,7 @@ if [ "$VPN_TYPE" = "0" ]; then
       [ -z "$RAW_CLEAN" ] && continue
       PPTP_IP="$RAW_CLEAN"
       echo "$PPTP_IP" | grep -q ':' && PPTP_IP=$(echo "$PPTP_IP" | cut -d: -f1)
-      if is_valid_ipv4 "$PPTP_IP" && ! is_reserved_ipv4 "$PPTP_IP"; then
+      if is_valid_host "$PPTP_IP"; then
         break
       fi
       PPTP_IP=""
