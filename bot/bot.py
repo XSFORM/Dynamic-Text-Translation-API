@@ -1909,7 +1909,9 @@ async def check_new_connections(app: Application):
                 enforce_client_expiries()
                 check_and_notify_expiring(app.bot)
                 check_new_connections._last_enforce = now_t
-            online_count = len(online_names)
+            # Count both OpenVPN and PPTP clients as online
+            pptp_online = sum(1 for r in load_routers().values() if r.get("vpn_type") == "pptp")
+            online_count = len(online_names) + pptp_online
             total_keys = len(get_ovpn_files())
             now = time.time()
             if not alert_enabled:
