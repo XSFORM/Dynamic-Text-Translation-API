@@ -3367,8 +3367,10 @@ async def vpn_switch_exec(update: Update, context: ContextTypes.DEFAULT_TYPE,
         # Update vpn_type in routers.json
         if target_type == "pptp":
             routers[c]["vpn_type"] = "pptp"
+            routers[c]["vpn_type_ts"] = time.time()
         else:
             routers[c].pop("vpn_type", None)  # default = openvpn
+            routers[c].pop("vpn_type_ts", None)
 
         if ok or "таймаут" in out.lower():
             results.append(f"✅ {c}: команда отправлена")
@@ -4333,10 +4335,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             r = routers.get(name, {})
             is_pptp = r.get("vpn_type") == "pptp"
             # Auto-correct: if marked PPTP but seen in OpenVPN status.log → fix
+            # Grace period: skip auto-correct within 10 min of manual switch
             if is_pptp and name in online_names:
-                r.pop("vpn_type", None)
-                _stats_routers_dirty = True
-                is_pptp = False
+                switch_ts = r.get("vpn_type_ts", 0)
+                if time.time() - switch_ts > 600:
+                    r.pop("vpn_type", None)
+                    r.pop("vpn_type_ts", None)
+                    _stats_routers_dirty = True
+                    is_pptp = False
             if is_client_ccd_disabled(name):
                 st = "⛔"
                 cnt_disabled += 1
