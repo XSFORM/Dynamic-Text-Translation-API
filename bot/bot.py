@@ -2166,11 +2166,12 @@ def rr_get_hmac_key() -> bytes:
     return bytes.fromhex(key_hex)
 
 def rr_write_hmac(path: str) -> None:
-    """Write HMAC-SHA256 signature for a file using the master key."""
+    """Write HMAC-SHA256 signature for a file using the master key.
+    Uses hex key string as HMAC key (same as openssl dgst -sha256 -hmac)."""
     try:
-        key = rr_get_hmac_key()
+        key_hex = rr_get_hmac_key().hex()
         with open(path, "rb") as f:
-            digest = _hmac_mod.new(key, f.read(), hashlib.sha256).hexdigest()
+            digest = _hmac_mod.new(key_hex.encode("ascii"), f.read(), hashlib.sha256).hexdigest()
         rr_write_file(path + ".hmac", digest + "\n")
     except OSError as exc:
         logger.warning("hmac write failed for %s: %s", path, exc)
