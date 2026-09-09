@@ -3007,7 +3007,7 @@ async def hmac_key_deploy(update: Update, context: ContextTypes.DEFAULT_TYPE,
         await q.answer()
     key_hex = rr_get_hmac_key().hex()
     routers = load_routers()
-    srv = load_server_config()
+    srv = load_pptp_server()
     pptp_clients = load_pptp_clients()
     if targets == '__all__':
         cns = sorted(routers.keys(), key=_natural_key)
@@ -3075,7 +3075,7 @@ async def hmac_key_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     await safe_edit_text(q, context, "🔍 Проверяю ключи...")
     routers = load_routers()
-    srv = load_server_config()
+    srv = load_pptp_server()
     pptp_clients = load_pptp_clients()
     has_key = []
     no_key = []
