@@ -4874,9 +4874,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     os.makedirs(os.path.dirname(_ws_dst), exist_ok=True)
                     shutil.copy2(_ws_src, _ws_dst)
                     rr_write_hmac(_ws_dst)
+                # version.txt is managed by the bot at runtime — do NOT
+                # overwrite from git (git has a stale copy).  Only seed it
+                # if the webroot file doesn't exist yet.
                 _vt_src = "/opt/remote_refresh/router/version.txt"
                 _vt_dst = "/var/www/html/router/version.txt"
-                if os.path.isfile(_vt_src):
+                if os.path.isfile(_vt_src) and not os.path.isfile(_vt_dst):
                     shutil.copy2(_vt_src, _vt_dst)
                     rr_write_hmac(_vt_dst)
                 _bc_src = "/opt/remote_refresh/router/beacon.txt"
