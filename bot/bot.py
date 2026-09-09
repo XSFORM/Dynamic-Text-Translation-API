@@ -2988,7 +2988,18 @@ async def hmac_key_deploy(update: Update, context: ContextTypes.DEFAULT_TYPE,
     else:
         cns = [targets]
     results = []
-    for cn in cns:
+    total_cns = len(cns)
+    for idx, cn in enumerate(cns, 1):
+        # Progress update every 5 routers
+        if q and (idx % 5 == 1 or idx == total_cns):
+            pct = int(idx / total_cns * 100)
+            bar_fill = pct // 10
+            bar = "▓" * bar_fill + "░" * (10 - bar_fill)
+            try:
+                await safe_edit_text(q, context,
+                    f"🔑 Деплой ключей... {idx}/{total_cns}\n{bar} {pct}%")
+            except Exception:
+                pass
         r = routers.get(cn, {})
         ip = get_router_ip(cn)
         if not ip:
@@ -3039,7 +3050,19 @@ async def hmac_key_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     has_key = []
     no_key = []
     errors = []
-    for cn in sorted(routers.keys(), key=_natural_key):
+    all_cns = sorted(routers.keys(), key=_natural_key)
+    total = len(all_cns)
+    for idx, cn in enumerate(all_cns, 1):
+        # Progress update every 5 routers
+        if idx % 5 == 1 or idx == total:
+            pct = int(idx / total * 100)
+            bar_fill = pct // 10
+            bar = "▓" * bar_fill + "░" * (10 - bar_fill)
+            try:
+                await safe_edit_text(q, context,
+                    f"🔍 Проверяю ключи... {idx}/{total}\n{bar} {pct}%")
+            except Exception:
+                pass
         r = routers.get(cn, {})
         ip = get_router_ip(cn)
         if not ip:
