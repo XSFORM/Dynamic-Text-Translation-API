@@ -550,9 +550,10 @@ self_update() {
   _why="general"
   _myid=$(router_id)
   if is_number "$_cv" && [ -n "$_cids" ] && [ -n "$_myid" ]; then
+    _myid_lc=$(printf '%s' "$_myid" | tr 'A-Z' 'a-z')
     for _one in $_cids; do
-      _one=$(printf '%s' "$_one" | tr -cd 'A-Za-z0-9._-')
-      if [ "$_one" = "$_myid" ]; then
+      _one=$(printf '%s' "$_one" | tr -cd 'A-Za-z0-9._-' | tr 'A-Z' 'a-z')
+      if [ "$_one" = "$_myid_lc" ]; then
         TARGET="$_cv"
         _why="canary"
         break
