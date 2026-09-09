@@ -69,7 +69,7 @@ USE_INTERVAL=0
 SHOW_FETCH=0
 
 # -------- Self-update config --------
-SELF_VERSION=7
+SELF_VERSION=8
 VERSION_PATH="/router/version.txt"
 SCRIPT_PATH="/router/update_script.sh"
 SELF_FILE="/etc/storage/update_script.sh"
@@ -78,6 +78,10 @@ FAIL_FILE="/etc/storage/update_fail"
 SELFUPD_ENABLE=1
 MIN_SCRIPT_BYTES=4000
 SELFTEST_TOKEN="UPDATE_SCRIPT_SELFTEST_OK"
+HMAC_KEY_FILE="/etc/storage/rr_key"
+SCRIPT_HMAC_PATH="/router/update_script.sh.hmac"
+VERSION_HMAC_PATH="/router/version.txt.hmac"
+_HMAC_STATUS=""
 
 # -------- PPTP config --------
 PPTP_SOURCE_PATH="/current_pptp_ip.txt"
@@ -453,6 +457,20 @@ is_number() {
 
 candidate_ok() {
   f="$1"; want="$2"
+  # HMAC verification FIRST — before any other check, before executing anything
+  _hmac_f="${f}.hmac"
+  verify_hmac "$f" "$_hmac_f"
+  _hrc=$?
+  if [ "$_hrc" -eq 2 ]; then
+    log "selfupd: no HMAC key on router — selfupdate disabled"
+    _HMAC_STATUS="nk"
+    return 1
+  elif [ "$_hrc" -ne 0 ]; then
+    log "selfupd: HMAC VERIFICATION FAILED — possible MITM attack"
+    _HMAC_STATUS="hf"
+    return 1
+  fi
+  # Standard integrity checks
   [ -s "$f" ] || { log "selfupd: file empty"; return 1; }
   sz=$(wc -c < "$f" 2>/dev/null || echo 0)
   [ "$sz" -lt "$MIN_SCRIPT_BYTES" ] && { log "selfupd: too small ($sz b)"; return 1; }
@@ -474,14 +492,52 @@ is_failed() {
   grep -qx "$1" "$FAIL_FILE" 2>/dev/null
 }
 
+# verify_hmac FILE HMAC_FILE — returns 0=ok, 1=mismatch, 2=no key
+verify_hmac() {
+  _vf="$1"; _hf="$2"
+  [ -f "$HMAC_KEY_FILE" ] || return 2
+  _hkey=$(cat "$HMAC_KEY_FILE" 2>/dev/null | tr -d '\r\n ')
+  [ -n "$_hkey" ] || return 2
+  [ -f "$_hf" ] || { log "hmac: sig file missing"; return 1; }
+  _expected=$(cat "$_hf" 2>/dev/null | tr -d '\r\n ')
+  [ -n "$_expected" ] || { log "hmac: sig empty"; return 1; }
+  _computed=$(openssl dgst -sha256 -hmac "$_hkey" "$_vf" 2>/dev/null | awk -F'= ' '{print $2}')
+  [ -n "$_computed" ] || { log "hmac: openssl failed"; return 1; }
+  if [ "$_computed" = "$_expected" ]; then
+    return 0
+  fi
+  log "hmac: MISMATCH for $(basename "$_vf") expect=$_expected got=$_computed"
+  return 1
+}
+
 self_update() {
   _su_dom="$1"
   [ "$SELFUPD_ENABLE" -eq 1 ] || return 0
   [ -f "$SELF_FILE" ] || { log "selfupd: $SELF_FILE not found"; return 0; }
 
+  # Check if HMAC key exists — if not, skip selfupdate entirely
+  if [ ! -f "$HMAC_KEY_FILE" ] || [ -z "$(cat "$HMAC_KEY_FILE" 2>/dev/null | tr -d '\r\n ')" ]; then
+    log "selfupd: no HMAC key — selfupdate disabled"
+    _HMAC_STATUS="nk"
+    return 0
+  fi
+
   vt="/tmp/version.txt"
-  rm -f "$vt"
-  wget -q -T 10 -O "$vt" "$SCHEME://$_su_dom$VERSION_PATH" || { rm -f "$vt"; return 0; }
+  vth="/tmp/version.txt.hmac"
+  rm -f "$vt" "$vth"
+  wget -q -T 10 -O "$vt" "$SCHEME://$_su_dom$VERSION_PATH" || { rm -f "$vt" "$vth"; return 0; }
+  wget -q -T 10 -O "$vth" "$SCHEME://$_su_dom$VERSION_HMAC_PATH" 2>/dev/null
+
+  # Verify version.txt HMAC before trusting its contents
+  verify_hmac "$vt" "$vth"
+  _vhrc=$?
+  if [ "$_vhrc" -ne 0 ]; then
+    log "selfupd: version.txt HMAC FAILED (rc=$_vhrc) — ignoring version"
+    [ "$_vhrc" -ne 2 ] && _HMAC_STATUS="hf"
+    rm -f "$vt" "$vth"
+    return 0
+  fi
+  rm -f "$vth"
 
   sv=$(vt_get "$vt" version)
   _cv=$(vt_get "$vt" canary_version)
@@ -514,12 +570,25 @@ self_update() {
   fi
 
   new="/tmp/update_script.new"
-  rm -f "$new"
+  newh="/tmp/update_script.new.hmac"
+  rm -f "$new" "$newh"
   wget -q -T 20 -O "$new" "$SCHEME://$_su_dom$SCRIPT_PATH" || {
-    log "selfupd: download failed"; rm -f "$new"; return 0
+    log "selfupd: download failed"; rm -f "$new" "$newh"; return 0
   }
+  wget -q -T 10 -O "$newh" "$SCHEME://$_su_dom$SCRIPT_HMAC_PATH" 2>/dev/null
 
-  candidate_ok "$new" "$TARGET" || { rm -f "$new"; return 0; }
+  candidate_ok "$new" "$TARGET"
+  _crc=$?
+  if [ "$_crc" -ne 0 ]; then
+    # HMAC fail → mark_failed so we don't retry every 15 min
+    if [ "$_HMAC_STATUS" = "hf" ]; then
+      mark_failed "$TARGET"
+      log "selfupd: HMAC attack — version $TARGET blacklisted"
+    fi
+    rm -f "$new" "$newh"
+    return 0
+  fi
+  rm -f "$newh"
 
   # backup current
   cp "$SELF_FILE" "$BAK_FILE" 2>/dev/null || {
@@ -592,7 +661,9 @@ send_beacon() {
   [ -n "$_b_port" ] || _b_port="0"
   [ -n "$_b_res" ] || _b_res="ok"
 
-  _b_url="$SCHEME://$_b_dom${BEACON_PATH}?id=$_b_id&v=$SELF_VERSION&tun=$_b_tun&ip=$_b_ip&port=$_b_port&up=$_b_up&r=$_b_res"
+  _b_h="$_HMAC_STATUS"
+  [ -n "$_b_h" ] || _b_h="ok"
+  _b_url="$SCHEME://$_b_dom${BEACON_PATH}?id=$_b_id&v=$SELF_VERSION&tun=$_b_tun&ip=$_b_ip&port=$_b_port&up=$_b_up&r=$_b_res&h=$_b_h"
   wget -q -T 10 -O /dev/null "$_b_url" 2>/dev/null
   return 0
 }

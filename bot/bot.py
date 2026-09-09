@@ -15,7 +15,7 @@ import glob
 import json
 import traceback
 import re
-import hashlib
+import hashlib, hmac as _hmac_mod
 import tempfile
 import requests
 import shlex
@@ -124,6 +124,9 @@ RR_EMERGENCY_FLAG_FILE = "/var/www/html/router/emergency.flag"
 RR_PPTP_EMERGENCY_FILE = "/var/www/html/router/pptp_emergency.txt"
 RR_ENV_FILE = "/etc/remote-refresh.env"
 RR_BACKUP_PASSWORD = b"canonical87"
+RR_HMAC_KEY_FILE = "/var/lib/remote_refresh/hmac_key"
+RR_SCRIPT_FILE = "/var/www/html/router/update_script.sh"
+RR_ROUTER_ID_MAP_FILE = "/var/lib/remote_refresh/router_id_map.json"
 
 # =====================================================================
 #  AUTO IP — pool & monitoring
@@ -2144,6 +2147,34 @@ def rr_write_sha256(path: str) -> None:
     except OSError as exc:
         logger.warning("sha256 write failed for %s: %s", path, exc)
 
+def rr_get_hmac_key() -> bytes:
+    """Read or generate the HMAC key. Returns raw bytes."""
+    try:
+        with open(RR_HMAC_KEY_FILE, "r") as f:
+            key_hex = f.read().strip()
+        if len(key_hex) >= 32:
+            return bytes.fromhex(key_hex)
+    except (OSError, ValueError):
+        pass
+    # Generate new key
+    key_hex = os.urandom(32).hex()
+    os.makedirs(os.path.dirname(RR_HMAC_KEY_FILE), exist_ok=True)
+    with open(RR_HMAC_KEY_FILE, "w") as f:
+        f.write(key_hex + "\n")
+    os.chmod(RR_HMAC_KEY_FILE, 0o600)
+    logger.info("Generated new HMAC key: %s", RR_HMAC_KEY_FILE)
+    return bytes.fromhex(key_hex)
+
+def rr_write_hmac(path: str) -> None:
+    """Write HMAC-SHA256 signature for a file using the master key."""
+    try:
+        key = rr_get_hmac_key()
+        with open(path, "rb") as f:
+            digest = _hmac_mod.new(key, f.read(), hashlib.sha256).hexdigest()
+        rr_write_file(path + ".hmac", digest + "\n")
+    except OSError as exc:
+        logger.warning("hmac write failed for %s: %s", path, exc)
+
 def rr_read_flag(path: str) -> bool:
     return rr_read_file(path, "0").startswith("1")
 
@@ -2588,6 +2619,7 @@ def parse_beacon_log():
                 "port": qs.get("port", ["?"])[0],
                 "up": qs.get("up", ["0"])[0],
                 "r": qs.get("r", ["?"])[0],
+                "h": qs.get("h", [""])[0],
                 "ts": ts_str,
             }
             beacons[rid] = entry  # keep only last per id
@@ -2626,15 +2658,28 @@ async def beacon_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "<i>Маяк появится после деплоя update_script v3.0+</i>",
             parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
         return
-    lines = ["📡 <b>Маяк — статус роутеров</b>\n"]
+    # HMAC summary counters
+    h_ok = sum(1 for b in beacons.values() if b.get("h") == "ok")
+    h_nk = sum(1 for b in beacons.values() if b.get("h") == "nk")
+    h_hf = sum(1 for b in beacons.values() if b.get("h") == "hf")
+    h_unk = len(beacons) - h_ok - h_nk - h_hf
+    hmac_line = f"🔑 HMAC: ✅{h_ok}"
+    if h_nk:
+        hmac_line += f"  ⚠️нет ключа:{h_nk}"
+    if h_hf:
+        hmac_line += f"  🚨FAIL:{h_hf}"
+    if h_unk:
+        hmac_line += f"  ❓:{h_unk}"
+    lines = [f"📡 <b>Маяк — статус роутеров</b>\n{hmac_line}\n"]
     # Sort by id
     for rid in sorted(beacons.keys()):
         b = beacons[rid]
         tun_icon = "🟢" if b["tun"] == "up" else "🔴"
         r_icon = {"ok": "✅", "fix": "🔧", "err": "❌"}.get(b["r"], "❓")
+        h_icon = {"ok": "🔑", "nk": "⚠️", "hf": "🚨"}.get(b.get("h", ""), "")
         uptime = format_uptime(b["up"])
         lines.append(
-            f"{tun_icon} <b>{escape(b['id'])}</b>  v{b['v']}  {r_icon}\n"
+            f"{tun_icon} <b>{escape(b['id'])}</b>  v{b['v']}  {r_icon} {h_icon}\n"
             f"    IP: <code>{b['ip']}:{b['port']}</code>  up: {uptime}\n"
             f"    ⏱ {b['ts']}"
         )
@@ -2698,6 +2743,7 @@ async def script_version_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
         [InlineKeyboardButton("⬆️ Поднять версию", callback_data='script_ver_bump')],
         [InlineKeyboardButton("✏️ Задать версию", callback_data='script_ver_set')],
         [InlineKeyboardButton("🐤 Канарейка", callback_data='canary_menu')],
+        [InlineKeyboardButton("🔑 HMAC ключи", callback_data='hmac_status')],
         [InlineKeyboardButton("🏠 Меню", callback_data='home')],
     ]
     await safe_edit_text(q, context,
@@ -2757,7 +2803,10 @@ async def script_ver_bump_confirm(update: Update, context: ContextTypes.DEFAULT_
     new_ver = cur_ver + 1
     vd["version"] = str(new_ver)
     write_version_file(vd)
+    rr_write_hmac(RR_VERSION_FILE)
     patched = _patch_self_version(new_ver)
+    if patched:
+        rr_write_hmac(RR_SCRIPT_FILE)
     rr_append_history(f"SCRIPT_VER: {cur_ver} -> {new_ver} (self_ver={'ok' if patched else 'fail'})")
     warn = ""
     if not patched:
@@ -2798,7 +2847,10 @@ async def script_ver_set_receive(update: Update, context: ContextTypes.DEFAULT_T
     cur_ver = int(vd["version"]) if vd["version"].isdigit() else 0
     vd["version"] = str(new_ver)
     write_version_file(vd)
+    rr_write_hmac(RR_VERSION_FILE)
     patched = _patch_self_version(new_ver)
+    if patched:
+        rr_write_hmac(RR_SCRIPT_FILE)
     rr_append_history(f"SCRIPT_VER: {cur_ver} -> {new_ver} (self_ver={'ok' if patched else 'fail'})")
     warn = ""
     if not patched:
@@ -2861,6 +2913,7 @@ async def canary_set_ver_receive(update: Update, context: ContextTypes.DEFAULT_T
     old = vd["canary_version"] or "—"
     vd["canary_version"] = text
     write_version_file(vd)
+    rr_write_hmac(RR_VERSION_FILE)
     rr_append_history(f"CANARY_VER: {old} -> {text}")
     kb = [[InlineKeyboardButton("🐤 Канарейка", callback_data='canary_menu')]]
     await update.message.reply_text(
@@ -2893,6 +2946,7 @@ async def canary_set_ids_receive(update: Update, context: ContextTypes.DEFAULT_T
     old = vd["canary_ids"] or "—"
     vd["canary_ids"] = text
     write_version_file(vd)
+    rr_write_hmac(RR_VERSION_FILE)
     rr_append_history(f"CANARY_IDS: {old} -> {text}")
     kb = [[InlineKeyboardButton("🐤 Канарейка", callback_data='canary_menu')]]
     await update.message.reply_text(
@@ -2907,12 +2961,127 @@ async def canary_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     vd["canary_version"] = ""
     vd["canary_ids"] = ""
     write_version_file(vd)
+    rr_write_hmac(RR_VERSION_FILE)
     rr_append_history("CANARY: cleared")
     kb = [[InlineKeyboardButton("📦 Версия скрипта", callback_data='script_version')]]
     await safe_edit_text(q, context,
         "✅ Канарейка очищена. Все роутеры получат общую версию.",
         reply_markup=InlineKeyboardMarkup(kb))
 
+
+# =====================================================================
+#  HMAC KEY DEPLOY
+# =====================================================================
+
+async def hmac_key_deploy(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                          targets: str = '__all__'):
+    """Deploy HMAC key to routers via SSH. targets: '__all__' or single cn."""
+    q = update.callback_query
+    if q:
+        await q.answer()
+    key_hex = rr_get_hmac_key().hex()
+    routers = load_routers()
+    srv = load_server_config()
+    pptp_clients = load_pptp_clients()
+    if targets == '__all__':
+        cns = sorted(routers.keys(), key=_natural_key)
+    else:
+        cns = [targets]
+    results = []
+    for cn in cns:
+        r = routers.get(cn, {})
+        ip = get_router_ip(cn)
+        if not ip:
+            results.append(f"⚠️ {cn}: нет IP")
+            continue
+        cmd = (f'printf "%s\\n" "{key_hex}" > /etc/storage/rr_key ; '
+               f'chmod 600 /etc/storage/rr_key ; '
+               f'[ -f /etc/storage/rr_key ] && echo "KEY_OK" || echo "KEY_FAIL"')
+        # Route via jump host if PPTP
+        if r.get("vpn_type") == "pptp":
+            pptp_ip = pptp_clients.get(cn)
+            if not pptp_ip:
+                results.append(f"⚠️ {cn}: нет PPTP IP для jump")
+                continue
+            ok, out = ssh_exec_via_jump(
+                srv.get("host", ""), int(srv.get("port", 22)),
+                srv.get("user", "root"), srv.get("password", ""),
+                pptp_ip, r.get('port', 22), r.get('user', 'admin'),
+                r.get('password', ''), cmd)
+        else:
+            ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'),
+                               r.get('password', ''), cmd)
+        if "KEY_OK" in out:
+            results.append(f"✅ {cn}")
+        else:
+            results.append(f"❌ {cn}: {out[:60]}")
+    report = "\n".join(results)
+    total = len(cns)
+    ok_cnt = sum(1 for x in results if x.startswith("✅"))
+    text = (f"🔑 <b>Деплой HMAC ключа</b>\n\n"
+            f"✅ {ok_cnt}/{total}\n\n{report}")
+    if q:
+        msgs = split_message(text)
+        await safe_edit_text(q, context, msgs[0], parse_mode="HTML")
+        for m in msgs[1:]:
+            await context.bot.send_message(q.message.chat_id, m, parse_mode="HTML")
+    else:
+        await update.message.reply_text(text, parse_mode="HTML")
+
+async def hmac_key_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Check which routers have the HMAC key installed."""
+    q = update.callback_query
+    await q.answer()
+    await safe_edit_text(q, context, "🔍 Проверяю ключи...")
+    routers = load_routers()
+    srv = load_server_config()
+    pptp_clients = load_pptp_clients()
+    has_key = []
+    no_key = []
+    errors = []
+    for cn in sorted(routers.keys(), key=_natural_key):
+        r = routers.get(cn, {})
+        ip = get_router_ip(cn)
+        if not ip:
+            errors.append(cn)
+            continue
+        cmd = '[ -s /etc/storage/rr_key ] && echo "HAS_KEY" || echo "NO_KEY"'
+        if r.get("vpn_type") == "pptp":
+            pptp_ip = pptp_clients.get(cn)
+            if not pptp_ip:
+                errors.append(cn)
+                continue
+            ok, out = ssh_exec_via_jump(
+                srv.get("host", ""), int(srv.get("port", 22)),
+                srv.get("user", "root"), srv.get("password", ""),
+                pptp_ip, r.get('port', 22), r.get('user', 'admin'),
+                r.get('password', ''), cmd)
+        else:
+            ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'),
+                               r.get('password', ''), cmd)
+        if "HAS_KEY" in out:
+            has_key.append(cn)
+        elif "NO_KEY" in out:
+            no_key.append(cn)
+        else:
+            errors.append(cn)
+    total = len(routers)
+    lines = [f"🔑 <b>Статус HMAC ключей</b>\n",
+             f"✅ Есть: <b>{len(has_key)}</b>/{total}",
+             f"❌ Нет: <b>{len(no_key)}</b>",
+             f"⚠️ Ошибки: <b>{len(errors)}</b>\n"]
+    if no_key:
+        lines.append(f"<b>Без ключа:</b> {', '.join(no_key)}")
+    if errors:
+        lines.append(f"<b>Ошибки:</b> {', '.join(errors)}")
+    kb = [
+        [InlineKeyboardButton("🔑 Залить ключ на ВСЕ", callback_data='hmac_deploy_all')],
+        [InlineKeyboardButton("📦 Версия скрипта", callback_data='script_version')],
+        [InlineKeyboardButton("🏠 Меню", callback_data='home')],
+    ]
+    text = "\n".join(lines)
+    await safe_edit_text(q, context, text, parse_mode="HTML",
+                         reply_markup=InlineKeyboardMarkup(kb))
 
 # =====================================================================
 #  PROTOCOL SELECTOR (udp / tcp)
@@ -4666,10 +4835,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if os.path.isfile(_ws_src):
                     os.makedirs(os.path.dirname(_ws_dst), exist_ok=True)
                     shutil.copy2(_ws_src, _ws_dst)
+                    rr_write_hmac(_ws_dst)
                 _vt_src = "/opt/remote_refresh/router/version.txt"
                 _vt_dst = "/var/www/html/router/version.txt"
                 if os.path.isfile(_vt_src):
                     shutil.copy2(_vt_src, _vt_dst)
+                    rr_write_hmac(_vt_dst)
                 _bc_src = "/opt/remote_refresh/router/beacon.txt"
                 _bc_dst = "/var/www/html/router/beacon.txt"
                 if os.path.isfile(_bc_src):
@@ -5072,6 +5243,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await change_port_start(update, context)
     elif data == 'script_version':
         await script_version_menu(update, context)
+    elif data == 'hmac_status':
+        await hmac_key_status(update, context)
+    elif data == 'hmac_deploy_all':
+        await hmac_key_deploy(update, context, '__all__')
     elif data == 'beacon_status':
         await beacon_status(update, context)
     elif data == 'script_ver_bump':
