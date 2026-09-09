@@ -531,7 +531,7 @@ def ssh_exec_via_jump(jump_ip: str, jump_port: int, jump_user: str, jump_pass: s
                             timeout=SSH_TIMEOUT, look_for_keys=False, allow_agent=False)
         transport = jump_client.get_transport()
         channel = transport.open_channel("direct-tcpip", (target_ip, target_port),
-                                         ("127.0.0.1", 0))
+                                         ("127.0.0.1", 0), timeout=SSH_TIMEOUT)
         target_client = paramiko.SSHClient()
         target_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         try:
@@ -2973,6 +2973,32 @@ async def canary_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #  HMAC KEY DEPLOY
 # =====================================================================
 
+def _hmac_deploy_one(cn, key_hex, routers, srv, pptp_clients):
+    """Synchronous: deploy HMAC key to one router. Returns (cn, result_str)."""
+    r = routers.get(cn, {})
+    ip = get_router_ip(cn)
+    if not ip:
+        return cn, f"⚠️ {cn}: нет IP"
+    cmd = (f'printf "%s\\n" "{key_hex}" > /etc/storage/rr_key ; '
+           f'chmod 600 /etc/storage/rr_key ; '
+           f'[ -f /etc/storage/rr_key ] && echo "KEY_OK" || echo "KEY_FAIL"')
+    if r.get("vpn_type") == "pptp":
+        pptp_ip = pptp_clients.get(cn)
+        if not pptp_ip:
+            return cn, f"⚠️ {cn}: нет PPTP IP для jump"
+        ok, out = ssh_exec_via_jump(
+            srv.get("host", ""), int(srv.get("port", 22)),
+            srv.get("user", "root"), srv.get("password", ""),
+            pptp_ip, r.get('port', 22), r.get('user', 'admin'),
+            r.get('password', ''), cmd)
+    else:
+        ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'),
+                           r.get('password', ''), cmd)
+    if "KEY_OK" in out:
+        return cn, f"✅ {cn}"
+    return cn, f"❌ {cn}: {out[:60]}"
+
+
 async def hmac_key_deploy(update: Update, context: ContextTypes.DEFAULT_TYPE,
                           targets: str = '__all__'):
     """Deploy HMAC key to routers via SSH. targets: '__all__' or single cn."""
@@ -2989,9 +3015,10 @@ async def hmac_key_deploy(update: Update, context: ContextTypes.DEFAULT_TYPE,
         cns = [targets]
     results = []
     total_cns = len(cns)
+    loop = asyncio.get_event_loop()
     for idx, cn in enumerate(cns, 1):
-        # Progress update every 5 routers
-        if q and (idx % 5 == 1 or idx == total_cns):
+        # Progress update every 3 routers
+        if q and (idx % 3 == 1 or idx == total_cns):
             pct = int(idx / total_cns * 100)
             bar_fill = pct // 10
             bar = "▓" * bar_fill + "░" * (10 - bar_fill)
@@ -3000,32 +3027,9 @@ async def hmac_key_deploy(update: Update, context: ContextTypes.DEFAULT_TYPE,
                     f"🔑 Деплой ключей... {idx}/{total_cns}\n{bar} {pct}%")
             except Exception:
                 pass
-        r = routers.get(cn, {})
-        ip = get_router_ip(cn)
-        if not ip:
-            results.append(f"⚠️ {cn}: нет IP")
-            continue
-        cmd = (f'printf "%s\\n" "{key_hex}" > /etc/storage/rr_key ; '
-               f'chmod 600 /etc/storage/rr_key ; '
-               f'[ -f /etc/storage/rr_key ] && echo "KEY_OK" || echo "KEY_FAIL"')
-        # Route via jump host if PPTP
-        if r.get("vpn_type") == "pptp":
-            pptp_ip = pptp_clients.get(cn)
-            if not pptp_ip:
-                results.append(f"⚠️ {cn}: нет PPTP IP для jump")
-                continue
-            ok, out = ssh_exec_via_jump(
-                srv.get("host", ""), int(srv.get("port", 22)),
-                srv.get("user", "root"), srv.get("password", ""),
-                pptp_ip, r.get('port', 22), r.get('user', 'admin'),
-                r.get('password', ''), cmd)
-        else:
-            ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'),
-                               r.get('password', ''), cmd)
-        if "KEY_OK" in out:
-            results.append(f"✅ {cn}")
-        else:
-            results.append(f"❌ {cn}: {out[:60]}")
+        _cn, result = await loop.run_in_executor(
+            None, _hmac_deploy_one, cn, key_hex, routers, srv, pptp_clients)
+        results.append(result)
     report = "\n".join(results)
     total = len(cns)
     ok_cnt = sum(1 for x in results if x.startswith("✅"))
@@ -3038,6 +3042,32 @@ async def hmac_key_deploy(update: Update, context: ContextTypes.DEFAULT_TYPE,
             await context.bot.send_message(q.message.chat_id, m, parse_mode="HTML")
     else:
         await update.message.reply_text(text, parse_mode="HTML")
+
+def _hmac_check_one(cn, routers, srv, pptp_clients):
+    """Synchronous: check one router for HMAC key. Returns (cn, 'has'|'no'|'err')."""
+    r = routers.get(cn, {})
+    ip = get_router_ip(cn)
+    if not ip:
+        return cn, "err"
+    cmd = '[ -s /etc/storage/rr_key ] && echo "HAS_KEY" || echo "NO_KEY"'
+    if r.get("vpn_type") == "pptp":
+        pptp_ip = pptp_clients.get(cn)
+        if not pptp_ip:
+            return cn, "err"
+        ok, out = ssh_exec_via_jump(
+            srv.get("host", ""), int(srv.get("port", 22)),
+            srv.get("user", "root"), srv.get("password", ""),
+            pptp_ip, r.get('port', 22), r.get('user', 'admin'),
+            r.get('password', ''), cmd)
+    else:
+        ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'),
+                           r.get('password', ''), cmd)
+    if "HAS_KEY" in out:
+        return cn, "has"
+    elif "NO_KEY" in out:
+        return cn, "no"
+    return cn, "err"
+
 
 async def hmac_key_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Check which routers have the HMAC key installed."""
@@ -3052,9 +3082,10 @@ async def hmac_key_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     errors = []
     all_cns = sorted(routers.keys(), key=_natural_key)
     total = len(all_cns)
+    loop = asyncio.get_event_loop()
     for idx, cn in enumerate(all_cns, 1):
-        # Progress update every 5 routers
-        if idx % 5 == 1 or idx == total:
+        # Progress update every 3 routers
+        if idx % 3 == 1 or idx == total:
             pct = int(idx / total * 100)
             bar_fill = pct // 10
             bar = "▓" * bar_fill + "░" * (10 - bar_fill)
@@ -3063,28 +3094,11 @@ async def hmac_key_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"🔍 Проверяю ключи... {idx}/{total}\n{bar} {pct}%")
             except Exception:
                 pass
-        r = routers.get(cn, {})
-        ip = get_router_ip(cn)
-        if not ip:
-            errors.append(cn)
-            continue
-        cmd = '[ -s /etc/storage/rr_key ] && echo "HAS_KEY" || echo "NO_KEY"'
-        if r.get("vpn_type") == "pptp":
-            pptp_ip = pptp_clients.get(cn)
-            if not pptp_ip:
-                errors.append(cn)
-                continue
-            ok, out = ssh_exec_via_jump(
-                srv.get("host", ""), int(srv.get("port", 22)),
-                srv.get("user", "root"), srv.get("password", ""),
-                pptp_ip, r.get('port', 22), r.get('user', 'admin'),
-                r.get('password', ''), cmd)
-        else:
-            ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'),
-                               r.get('password', ''), cmd)
-        if "HAS_KEY" in out:
+        _cn, status = await loop.run_in_executor(
+            None, _hmac_check_one, cn, routers, srv, pptp_clients)
+        if status == "has":
             has_key.append(cn)
-        elif "NO_KEY" in out:
+        elif status == "no":
             no_key.append(cn)
         else:
             errors.append(cn)
