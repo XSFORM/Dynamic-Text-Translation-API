@@ -336,8 +336,8 @@ PPTP_CLIENTS_FILE = "/root/monitor_bot/pptp_clients.json"
 PPTP_IP_START = 10          # 172.16.0.10
 PPTP_IP_PREFIX = "172.16.0"
 IPP_FILE = "/etc/openvpn/ipp.txt"
-SSH_TIMEOUT = 10
-SSH_CMD_TIMEOUT = 15
+SSH_TIMEOUT = 20
+SSH_CMD_TIMEOUT = 30
 
 def load_routers() -> Dict:
     try:
@@ -7882,13 +7882,19 @@ async def domain_monitor(app):
             time_str = now_tm.strftime("%H:%M")
 
             results = []  # (cn, ok_resolve, output)
+            ssh_fails = 0
             found_ok = False
             for cn, ip, r in test_routers:
                 ok, out = await asyncio.to_thread(
                     ssh_exec, ip, r.get('port', 22),
                     r.get('user', 'admin'), r.get('password', ''), cmd
                 )
-                if ok and not _domain_check_blocked(out, domain):
+                if not ok:
+                    # SSH failed (timeout/unreachable) — not a domain block
+                    results.append((cn, False, f"(SSH недоступен)"))
+                    ssh_fails += 1
+                    continue
+                if not _domain_check_blocked(out, domain):
                     results.append((cn, True, out))
                     found_ok = True
                     break  # one OK is enough
@@ -7896,6 +7902,12 @@ async def domain_monitor(app):
                     results.append((cn, False, out))
 
             prev = domain_monitor_last_status.get(domain)
+
+            # If ALL routers had SSH failures, skip — can't tell anything about domain
+            if ssh_fails == len(results) and not found_ok:
+                print(f"[domain_mon] {domain} — all {ssh_fails} routers SSH unreachable, skip")
+                continue
+
             domain_monitor_last_status[domain] = found_ok
 
             if found_ok:
