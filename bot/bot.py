@@ -4270,6 +4270,18 @@ def get_main_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 # =====================================================================
+#  AWAIT STATE MANAGEMENT
+# =====================================================================
+def _clear_awaits(context, keep: str = None):
+    """Clear all await_* states from user_data except `keep`.
+    Prevents stale awaits from capturing unrelated input."""
+    to_del = [k for k in list(context.user_data.keys())
+              if k.startswith('await_') and k != keep]
+    for k in to_del:
+        del context.user_data[k]
+
+
+# =====================================================================
 #  UNIVERSAL TEXT HANDLER
 # =====================================================================
 async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4518,9 +4530,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     data = q.data
 
-    # Clear stale await flags when user clicks any button (prevents cross-menu writes)
-    if data not in ('ovpn_view_server_conf', 'ovpn_view_client_template', 'ovpn_edit_cancel'):
-        context.user_data.pop('await_ovpn_edit', None)
+    # --- Clear stale await_* flags on button press (prevents cross-menu input capture) ---
+    # Callbacks that are part of an ongoing multi-step input flow — do NOT clear:
+    _keep_await_cbs = {
+        'ovpn_view_server_conf', 'ovpn_view_client_template', 'ovpn_edit_cancel',
+        'pptp_fwd_add_more_ovpn', 'pptp_fwd_apply',  # PPTP fwd multi-rule flow
+        'gost_rule_more', 'gost_rule_done',            # GOST multi-rule flow
+    }
+    if data not in _keep_await_cbs:
+        _clear_awaits(context)
     print("DEBUG callback_data:", data)
 
     # --- OpenVPN callbacks ---
