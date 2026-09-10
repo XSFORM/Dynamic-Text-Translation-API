@@ -5479,6 +5479,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await gost_getroot_start(update, context)
     # --- PPTP iptables forward ---
     elif data == 'pptp_fwd_menu':
+        context.user_data.pop('await_pptp_fwd_backend', None)
         await pptp_fwd_menu(update, context)
     elif data == 'pptp_fwd_select_install':
         await _gost_select_server(update, context, 'pptp_fwd_install',
@@ -5500,6 +5501,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📊 <b>Статус PPTP форварда</b>\nВыберите фронт-сервер:")
     elif data.startswith('pptp_fwd_status:'):
         await pptp_fwd_status(update, context, data[len('pptp_fwd_status:'):])
+    elif data == 'pptp_fwd_add_more_ovpn':
+        d = context.user_data.get('await_pptp_fwd_backend')
+        if d:
+            d['step'] = 'ovpn'
+            await safe_edit_text(q, context,
+                "Введите правило DNAT в формате:\n"
+                "<code>IP ПОРТ ПРОТОКОЛ</code>\n"
+                "Например: <code>5.22.215.20 444 udp</code>",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("❌ Отмена", callback_data='pptp_fwd_menu')]]))
+    elif data == 'pptp_fwd_apply':
+        await pptp_fwd_apply_rules(update, context)
 
     else:
         await safe_edit_text(q, context, "Неизвестная команда.")
@@ -9163,8 +9177,8 @@ async def pptp_fwd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     await safe_edit_text(q, context,
         "🔀 <b>PPTP форвард (iptables)</b>\n\n"
-        "Перенаправляет TCP:1723 + GRE с фронта на PPTP бэкенд.\n"
-        "Работает вместе с GOST (OpenVPN UDP:443) на одном фронте.",
+        "Перенаправляет TCP:1723 + GRE на PPTP бэкенд.\n"
+        "Можно добавить несколько DNAT правил (OpenVPN, и т.д.).",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
 
@@ -9177,10 +9191,10 @@ async def pptp_fwd_install_start(update: Update, context: ContextTypes.DEFAULT_T
         await safe_edit_text(q, context, "Сервер не найден.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='pptp_fwd_menu')]]))
         return
-    context.user_data['await_pptp_fwd_backend'] = {'ip': ip, 'action': 'install', 'step': 'pptp'}
+    context.user_data['await_pptp_fwd_backend'] = {'ip': ip, 'action': 'install', 'step': 'pptp', 'ovpn_rules': []}
     await safe_edit_text(q, context,
         f"⚙️ <b>Установить форвард на {ip}</b>\n\n"
-        "Шаг 1/2: Введите IP адрес <b>PPTP бэкенда</b> (сервер с pptpd):",
+        "Введите IP адрес <b>PPTP бэкенда</b> (сервер с pptpd):",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(
             [[InlineKeyboardButton("❌ Отмена", callback_data='pptp_fwd_menu')]]))
@@ -9195,103 +9209,149 @@ async def pptp_fwd_change_start(update: Update, context: ContextTypes.DEFAULT_TY
         await safe_edit_text(q, context, "Сервер не найден.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='pptp_fwd_menu')]]))
         return
-    context.user_data['await_pptp_fwd_backend'] = {'ip': ip, 'action': 'change', 'step': 'pptp'}
+    context.user_data['await_pptp_fwd_backend'] = {'ip': ip, 'action': 'change', 'step': 'pptp', 'ovpn_rules': []}
     await safe_edit_text(q, context,
         f"🔄 <b>Сменить бэкенды на {ip}</b>\n\n"
-        "Шаг 1/2: Введите <b>новый IP PPTP бэкенда</b>:",
+        "Введите <b>новый IP PPTP бэкенда</b>:",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(
             [[InlineKeyboardButton("❌ Отмена", callback_data='pptp_fwd_menu')]]))
 
 
 async def pptp_fwd_backend_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle backend IP input for install or change."""
+    """Handle backend IP input for install or change.
+    Steps: 'pptp' → 'ovpn' (loop) → apply via callback."""
     data = context.user_data.get('await_pptp_fwd_backend')
     if not data:
         return
-    backend = update.message.text.strip()
-    # Basic IP validation
-    import re as _re
-    if not _re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', backend):
-        await update.message.reply_text("❌ Неверный формат IP. Попробуйте снова.",
-            reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("◀️ Назад", callback_data='pptp_fwd_menu')]]))
-        return
-
-    # Two-step install: first PPTP backend, then OpenVPN backend
+    text = update.message.text.strip()
     step = data.get('step', '')
+    import re as _re
+
     if step == 'pptp':
-        data['pptp_backend'] = backend
+        if not _re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', text):
+            await update.message.reply_text("❌ Неверный формат IP. Попробуйте снова.",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("◀️ Назад", callback_data='pptp_fwd_menu')]]))
+            return
+        data['pptp_backend'] = text
+        data['ovpn_rules'] = []
         data['step'] = 'ovpn'
         await update.message.reply_text(
-            f"✅ PPTP бэкенд: <code>{backend}</code>\n\n"
-            "Шаг 2/2: Введите IP адрес <b>OpenVPN бэкенда</b>\n"
-            "(или тот же IP если оба сервиса на одном сервере):",
+            f"✅ PPTP бэкенд: <code>{text}</code>\n\n"
+            "Введите правило DNAT в формате:\n"
+            "<code>IP ПОРТ ПРОТОКОЛ</code>\n"
+            "Например: <code>95.141.35.71 443 udp</code>",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("❌ Отмена", callback_data='pptp_fwd_menu')]]))
         return
-    elif step == 'ovpn':
-        data['ovpn_backend'] = backend
-        backend = data['pptp_backend']  # restore for install logic
 
-    context.user_data.pop('await_pptp_fwd_backend', None)
+    elif step == 'ovpn':
+        parts = text.split()
+        if len(parts) != 3:
+            await update.message.reply_text(
+                "❌ Формат: <code>IP ПОРТ ПРОТОКОЛ</code>\n"
+                "Например: <code>95.141.35.71 443 udp</code>",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("❌ Отмена", callback_data='pptp_fwd_menu')]]))
+            return
+        r_ip, r_port, r_proto = parts[0], parts[1], parts[2].lower()
+        if not _re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', r_ip):
+            await update.message.reply_text("❌ Неверный IP. Попробуйте снова.")
+            return
+        if not r_port.isdigit() or not (1 <= int(r_port) <= 65535):
+            await update.message.reply_text("❌ Порт должен быть 1-65535.")
+            return
+        if r_proto not in ('tcp', 'udp'):
+            await update.message.reply_text("❌ Протокол: tcp или udp.")
+            return
+        data['ovpn_rules'].append({'ip': r_ip, 'port': r_port, 'proto': r_proto})
+        rules_text = "\n".join(
+            f"  {i+1}. {r['proto'].upper()} :{r['port']} → {r['ip']}:{r['port']}"
+            for i, r in enumerate(data['ovpn_rules']))
+        await update.message.reply_text(
+            f"✅ Правило добавлено!\n\n"
+            f"<b>Правила DNAT:</b>\n<code>{rules_text}</code>\n\n"
+            f"Добавить ещё правило?",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Добавить ещё", callback_data='pptp_fwd_add_more_ovpn')],
+                [InlineKeyboardButton("✅ Применить", callback_data='pptp_fwd_apply')],
+                [InlineKeyboardButton("❌ Отмена", callback_data='pptp_fwd_menu')],
+            ]))
+        return
+
+
+async def pptp_fwd_apply_rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Apply collected PPTP + OpenVPN DNAT rules to the front server."""
+    q = update.callback_query
+    await q.answer()
+    data = context.user_data.pop('await_pptp_fwd_backend', None)
+    if not data:
+        await safe_edit_text(q, context, "❌ Нет данных для применения.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀️ Назад", callback_data='pptp_fwd_menu')]]))
+        return
     front_ip = data['ip']
     action = data['action']
+    backend = data.get('pptp_backend', '')
+    ovpn_rules = data.get('ovpn_rules', [])
     servers = load_gost_servers()
     srv = servers.get(front_ip)
     if not srv:
-        await update.message.reply_text("Сервер не найден.")
+        await safe_edit_text(q, context, "Сервер не найден.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀️ Назад", callback_data='pptp_fwd_menu')]]))
         return
 
-    ovpn_backend = data.get('ovpn_backend', '')
+    # Build DNAT lines for all OpenVPN/custom rules
+    ovpn_flush = ""
+    ovpn_add = ""
+    for r in ovpn_rules:
+        ovpn_flush += (
+            f"iptables -t nat -D PREROUTING -p {r['proto']} --dport {r['port']} "
+            f"-j DNAT --to-destination {r['ip']}:{r['port']} 2>/dev/null ; "
+        )
+        ovpn_add += (
+            f"iptables -t nat -A PREROUTING -p {r['proto']} --dport {r['port']} "
+            f"-j DNAT --to-destination {r['ip']}:{r['port']} ; "
+        )
+
+    rules_display = "\n".join(
+        f"  {r['proto'].upper()} :{r['port']} → {r['ip']}:{r['port']}"
+        for r in ovpn_rules)
 
     if action == 'install':
-        ovpn_line = ""
-        if ovpn_backend:
-            ovpn_line = (
-                # Flush old OpenVPN UDP rule
-                f"iptables -t nat -D PREROUTING -p udp --dport 443 -j DNAT --to-destination {ovpn_backend}:443 2>/dev/null ; "
-                # Add OpenVPN UDP:443 forward
-                f"iptables -t nat -A PREROUTING -p udp --dport 443 -j DNAT --to-destination {ovpn_backend}:443 ; "
-            )
-        msg = await update.message.reply_text(
+        msg = await safe_edit_text(q, context,
             f"⏳ Устанавливаю форвард на <code>{front_ip}</code>\n"
             f"PPTP бэкенд: <code>{backend}</code>\n"
-            + (f"OpenVPN бэкенд: <code>{ovpn_backend}</code>" if ovpn_backend else ""),
+            + (f"Правила DNAT:\n<code>{rules_display}</code>" if ovpn_rules else ""),
             parse_mode="HTML")
         install_cmd = (
-            # Enable forwarding
             "sysctl -w net.ipv4.ip_forward=1 > /dev/null 2>&1 ; "
             "grep -q 'net.ipv4.ip_forward=1' /etc/sysctl.conf 2>/dev/null || "
             "echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf ; "
-            # Load kernel modules
             "modprobe nf_nat_pptp 2>/dev/null ; "
             "modprobe nf_conntrack_pptp 2>/dev/null ; "
             "modprobe ip_gre 2>/dev/null ; "
-            # Flush old PPTP rules (if any) to avoid duplicates
             "iptables -t nat -D PREROUTING -p tcp --dport 1723 -j DNAT --to-destination "
             f"{backend}:1723 2>/dev/null ; "
             "iptables -t nat -D PREROUTING -p gre ! -s "
             f"{backend} -j DNAT --to-destination {backend} 2>/dev/null ; "
             "iptables -t raw -D PREROUTING -p tcp --dport 1723 -j CT --helper pptp 2>/dev/null ; "
-            # Add PPTP rules
             f"iptables -t nat -A PREROUTING -p tcp --dport 1723 -j DNAT --to-destination {backend}:1723 ; "
             f"iptables -t nat -A PREROUTING -p gre ! -s {backend} -j DNAT --to-destination {backend} ; "
-            # Add OpenVPN UDP:443 rule (if specified)
-            + ovpn_line +
-            # Ensure MASQUERADE + FORWARD exist
+            + ovpn_flush + ovpn_add +
             "iptables -t nat -C POSTROUTING -j MASQUERADE 2>/dev/null || "
             "iptables -t nat -A POSTROUTING -j MASQUERADE ; "
             "iptables -C FORWARD -j ACCEPT 2>/dev/null || "
             "iptables -A FORWARD -j ACCEPT ; "
-            # CT helper (critical for GRE through NAT)
             "iptables -t raw -A PREROUTING -p tcp --dport 1723 -j CT --helper pptp 2>/dev/null ; "
-            # Persist modules
             "grep -q nf_nat_pptp /etc/modules 2>/dev/null || echo nf_nat_pptp >> /etc/modules ; "
             "grep -q nf_conntrack_pptp /etc/modules 2>/dev/null || echo nf_conntrack_pptp >> /etc/modules ; "
             "grep -q ip_gre /etc/modules 2>/dev/null || echo ip_gre >> /etc/modules ; "
-            # rc.local for CT helper + modules on boot
             "cat > /etc/rc.local << 'RCEOF'\n"
             "#!/bin/bash\n"
             "modprobe nf_nat_pptp\n"
@@ -9302,9 +9362,7 @@ async def pptp_fwd_backend_receive(update: Update, context: ContextTypes.DEFAULT
             "RCEOF\n"
             "chmod +x /etc/rc.local ; "
             "systemctl enable rc-local 2>/dev/null ; "
-            # Verify rules FIRST (before slow apt-get)
             "iptables -t nat -S PREROUTING 2>/dev/null | grep -q '1723' && echo PPTP_FWD_OK || echo PPTP_FWD_FAIL ; "
-            # Save iptables (best-effort, may timeout)
             "which netfilter-persistent >/dev/null 2>&1 || "
             "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iptables-persistent 2>/dev/null || "
             "yum install -y -q iptables-services 2>/dev/null ; "
@@ -9313,64 +9371,58 @@ async def pptp_fwd_backend_receive(update: Update, context: ContextTypes.DEFAULT
         )
         ok, out = ssh_exec(front_ip, 22, srv["ssh_user"], srv["ssh_pass"], install_cmd)
         if ok and "PPTP_FWD_OK" in out:
-            # Save backends in server config
             srv["pptp_backend"] = backend
-            if ovpn_backend:
-                srv["ovpn_backend"] = ovpn_backend
+            if ovpn_rules:
+                srv["ovpn_rules"] = ovpn_rules
+                srv["ovpn_backend"] = ovpn_rules[0]['ip']
             save_gost_servers(servers)
             result = (f"✅ Форвард установлен на <code>{front_ip}</code>\n\n"
                       f"PPTP (TCP:1723+GRE) → <code>{backend}</code>\n"
-                      + (f"OpenVPN (UDP:443) → <code>{ovpn_backend}</code>" if ovpn_backend else ""))
+                      + ("\n".join(f"DNAT {r['proto'].upper()} :{r['port']} → <code>{r['ip']}:{r['port']}</code>"
+                         for r in ovpn_rules) if ovpn_rules else ""))
         else:
             result = f"❌ Ошибка:\n<pre>{escape(out[:2000])}</pre>"
-        await msg.edit_text(result, parse_mode="HTML",
+        await safe_edit_text(q, context, result, parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("◀️ Назад", callback_data='pptp_fwd_menu')]]))
 
     elif action == 'change':
-        ovpn_change = ""
-        if ovpn_backend:
-            ovpn_change = (
-                # Remove old OpenVPN rule
-                "iptables -t nat -S PREROUTING 2>/dev/null | grep 'udp.*443' | "
-                "sed 's/^-A/-D/' | while read rule; do iptables -t nat $rule 2>/dev/null; done ; "
-                # Add new OpenVPN rule
-                f"iptables -t nat -A PREROUTING -p udp --dport 443 -j DNAT --to-destination {ovpn_backend}:443 ; "
-            )
-        msg = await update.message.reply_text(
+        # Remove ALL old non-PPTP DNAT rules then re-add
+        ovpn_change_flush = (
+            "iptables -t nat -S PREROUTING 2>/dev/null | grep -vE '(--dport 1723|-p gre)' | "
+            "grep '^-A' | sed 's/^-A/-D/' | while read rule; do iptables -t nat $rule 2>/dev/null; done ; "
+        )
+        msg = await safe_edit_text(q, context,
             f"⏳ Меняю бэкенды на <code>{front_ip}</code>\n"
             f"PPTP: <code>{backend}</code>\n"
-            + (f"OpenVPN: <code>{ovpn_backend}</code>" if ovpn_backend else ""),
+            + (f"Правила DNAT:\n<code>{rules_display}</code>" if ovpn_rules else ""),
             parse_mode="HTML")
         change_cmd = (
-            # Remove old PPTP DNAT rules
             "iptables -t nat -S PREROUTING 2>/dev/null | grep -E '(--dport 1723|-p gre)' | "
             "sed 's/^-A/-D/' | while read rule; do iptables -t nat $rule 2>/dev/null; done ; "
-            # Remove old CT helper
             "iptables -t raw -S PREROUTING 2>/dev/null | grep '1723.*pptp' | "
             "sed 's/^-A/-D/' | while read rule; do iptables -t raw $rule 2>/dev/null; done ; "
-            # Add new PPTP rules
             f"iptables -t nat -A PREROUTING -p tcp --dport 1723 -j DNAT --to-destination {backend}:1723 ; "
             f"iptables -t nat -A PREROUTING -p gre ! -s {backend} -j DNAT --to-destination {backend} ; "
             "iptables -t raw -A PREROUTING -p tcp --dport 1723 -j CT --helper pptp 2>/dev/null ; "
-            # OpenVPN change (if specified)
-            + ovpn_change +
+            + ovpn_change_flush + ovpn_add +
             "netfilter-persistent save 2>/dev/null || service iptables save 2>/dev/null ; "
-            # Verify
             "iptables -t nat -S PREROUTING 2>/dev/null | grep -q '1723' && echo PPTP_CHANGE_OK || echo PPTP_CHANGE_FAIL"
         )
         ok, out = ssh_exec(front_ip, 22, srv["ssh_user"], srv["ssh_pass"], change_cmd)
         if ok and "PPTP_CHANGE_OK" in out:
             srv["pptp_backend"] = backend
-            if ovpn_backend:
-                srv["ovpn_backend"] = ovpn_backend
+            if ovpn_rules:
+                srv["ovpn_rules"] = ovpn_rules
+                srv["ovpn_backend"] = ovpn_rules[0]['ip']
             save_gost_servers(servers)
             result = (f"✅ Бэкенды изменены на <code>{front_ip}</code>\n"
                       f"PPTP: <code>{backend}</code>\n"
-                      + (f"OpenVPN: <code>{ovpn_backend}</code>" if ovpn_backend else ""))
+                      + ("\n".join(f"DNAT {r['proto'].upper()} :{r['port']} → <code>{r['ip']}:{r['port']}</code>"
+                         for r in ovpn_rules) if ovpn_rules else ""))
         else:
             result = f"❌ Ошибка:\n<pre>{escape(out[:2000])}</pre>"
-        await msg.edit_text(result, parse_mode="HTML",
+        await safe_edit_text(q, context, result, parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("◀️ Назад", callback_data='pptp_fwd_menu')]]))
 
