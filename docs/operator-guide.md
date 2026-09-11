@@ -39,7 +39,7 @@ cd /opt/remote_refresh
 sudo bash scripts/install.sh
 ```
 
-Пароль установщика: `canonical87`
+Пароль установщика: задаётся при первой установке (спросит при запуске)
 
 Установщик спросит:
 1. Чистая установка или восстановление из бэкапа
@@ -132,7 +132,7 @@ reboot
 | Тип | Формат | Содержимое | Пароль |
 |-----|--------|------------|--------|
 | OpenVPN | .tar.gz | /etc/openvpn, /etc/iptables, /root (ключи, .ovpn, трафик) | нет |
-| Remote Refresh | .zip (AES) | domain_list.txt, current_vpn_ip.txt, history.log, scan flags | canonical87 |
+| Remote Refresh | .zip (AES) | domain_list.txt, current_vpn_ip.txt, history.log, scan flags | из config.py |
 
 ### Что НЕ входит в бэкапы
 

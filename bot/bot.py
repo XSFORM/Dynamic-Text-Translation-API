@@ -37,6 +37,10 @@ from telegram.ext import (
 )
 
 from config import TOKEN, ADMIN_ID
+try:
+    from config import BACKUP_PASSWORD
+except ImportError:
+    BACKUP_PASSWORD = None
 from backup_restore import (
     create_backup as br_create_backup,
     apply_restore,
@@ -123,7 +127,8 @@ RR_EMERGENCY_OEC_FILE = "/var/www/html/router/emergency_oec.txt"
 RR_EMERGENCY_FLAG_FILE = "/var/www/html/router/emergency.flag"
 RR_PPTP_EMERGENCY_FILE = "/var/www/html/router/pptp_emergency.txt"
 RR_ENV_FILE = "/etc/remote-refresh.env"
-RR_BACKUP_PASSWORD = b"canonical87"
+_OLD_BACKUP_PASSWORD = b"canonical87"  # fallback for old archives
+RR_BACKUP_PASSWORD = BACKUP_PASSWORD.encode() if BACKUP_PASSWORD else _OLD_BACKUP_PASSWORD
 RR_HMAC_KEY_FILE = "/var/lib/remote_refresh/hmac_key"
 RR_SCRIPT_FILE = "/var/www/html/router/update_script.sh"
 RR_ROUTER_ID_MAP_FILE = "/var/lib/remote_refresh/router_id_map.json"
@@ -2799,7 +2804,7 @@ def read_version_file():
 
 
 def write_version_file(data: dict):
-    """Write version.txt preserving all fields."""
+    """Write version.txt preserving all fields + auto-regenerate HMAC."""
     with open(RR_VERSION_FILE, "w") as f:
         f.write(f"version={data.get('version', '1')}\n")
         cv = data.get('canary_version', '')
@@ -2808,6 +2813,11 @@ def write_version_file(data: dict):
             f.write(f"canary_version={cv}\n")
         if ci:
             f.write(f"canary_ids={ci}\n")
+    # Always regenerate HMAC after writing version.txt
+    try:
+        rr_write_hmac(RR_VERSION_FILE)
+    except Exception:
+        pass  # key may not be set yet during initial setup
 
 
 async def script_version_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2855,7 +2865,7 @@ async def script_ver_bump(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
 def _patch_self_version(new_ver: int) -> bool:
-    """Update SELF_VERSION=N in the webroot update_script.sh."""
+    """Update SELF_VERSION=N in the webroot update_script.sh + auto-regenerate HMAC."""
     script = "/var/www/html/router/update_script.sh"
     try:
         with open(script, "r") as f:
@@ -2869,6 +2879,10 @@ def _patch_self_version(new_ver: int) -> bool:
         if patched:
             with open(script, "w") as f:
                 f.writelines(lines)
+            try:
+                rr_write_hmac(RR_SCRIPT_FILE)
+            except Exception:
+                pass
         return patched
     except Exception:
         return False
@@ -2882,10 +2896,7 @@ async def script_ver_bump_confirm(update: Update, context: ContextTypes.DEFAULT_
     new_ver = cur_ver + 1
     vd["version"] = str(new_ver)
     write_version_file(vd)
-    rr_write_hmac(RR_VERSION_FILE)
     patched = _patch_self_version(new_ver)
-    if patched:
-        rr_write_hmac(RR_SCRIPT_FILE)
     rr_append_history(f"SCRIPT_VER: {cur_ver} -> {new_ver} (self_ver={'ok' if patched else 'fail'})")
     warn = ""
     if not patched:
@@ -2926,10 +2937,7 @@ async def script_ver_set_receive(update: Update, context: ContextTypes.DEFAULT_T
     cur_ver = int(vd["version"]) if vd["version"].isdigit() else 0
     vd["version"] = str(new_ver)
     write_version_file(vd)
-    rr_write_hmac(RR_VERSION_FILE)
     patched = _patch_self_version(new_ver)
-    if patched:
-        rr_write_hmac(RR_SCRIPT_FILE)
     rr_append_history(f"SCRIPT_VER: {cur_ver} -> {new_ver} (self_ver={'ok' if patched else 'fail'})")
     warn = ""
     if not patched:
@@ -3004,7 +3012,6 @@ async def canary_set_ver_receive(update: Update, context: ContextTypes.DEFAULT_T
     old = vd["canary_version"] or "—"
     vd["canary_version"] = text
     write_version_file(vd)
-    rr_write_hmac(RR_VERSION_FILE)
     rr_append_history(f"CANARY_VER: {old} -> {text}")
     kb = [[InlineKeyboardButton("🐤 Канарейка", callback_data='canary_menu')]]
     await update.message.reply_text(
@@ -3057,7 +3064,6 @@ async def canary_set_ids_receive(update: Update, context: ContextTypes.DEFAULT_T
             ids_for_file.append(anon)    # anon hex (for re-deployed routers)
     vd["canary_ids"] = " ".join(ids_for_file)
     write_version_file(vd)
-    rr_write_hmac(RR_VERSION_FILE)
     rr_append_history(f"CANARY_IDS: {old} -> {vd['canary_ids']} ({text})")
     kb = [[InlineKeyboardButton("🐤 Канарейка", callback_data='canary_menu')]]
     await update.message.reply_text(
@@ -3072,7 +3078,6 @@ async def canary_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     vd["canary_version"] = ""
     vd["canary_ids"] = ""
     write_version_file(vd)
-    rr_write_hmac(RR_VERSION_FILE)
     rr_append_history("CANARY: cleared")
     kb = [[InlineKeyboardButton("📦 Версия скрипта", callback_data='script_version')]]
     await safe_edit_text(q, context,
@@ -6439,9 +6444,21 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await tg_file.download_to_drive(tmp_path)
 
             restore_dir = tempfile.mkdtemp()
-            with pyzipper.AESZipFile(tmp_path, 'r') as zf:
-                zf.setpassword(RR_BACKUP_PASSWORD)
-                zf.extractall(restore_dir)
+            try:
+                with pyzipper.AESZipFile(tmp_path, 'r') as zf:
+                    zf.setpassword(RR_BACKUP_PASSWORD)
+                    zf.extractall(restore_dir)
+            except RuntimeError:
+                # Wrong password — try legacy password for old archives
+                if RR_BACKUP_PASSWORD != _OLD_BACKUP_PASSWORD:
+                    shutil.rmtree(restore_dir, ignore_errors=True)
+                    restore_dir = tempfile.mkdtemp()
+                    with pyzipper.AESZipFile(tmp_path, 'r') as zf:
+                        zf.setpassword(_OLD_BACKUP_PASSWORD)
+                        zf.extractall(restore_dir)
+                    await update.message.reply_text("⚠️ Архив расшифрован старым паролем.")
+                else:
+                    raise
 
             restored = []
             mapping = {
@@ -6463,9 +6480,11 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     shutil.copy2(src, dest_path)
                     restored.append(arcname)
 
-            # nerate sha256 for domain_list
+            # Regenerate checksums/signatures for restored files
             if "domain_list.txt" in restored:
                 rr_write_sha256(RR_DOMAIN_LIST_FILE)
+            if "version.txt" in restored:
+                rr_write_hmac(RR_VERSION_FILE)
 
             shutil.rmtree(restore_dir, ignore_errors=True)
             result = ", ".join(restored) if restored else "ничего"

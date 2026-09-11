@@ -3,7 +3,7 @@
 # Runs install_core.sh after password verification.
 set -euo pipefail
 
-EXPECTED_HASH="a0f3a1eb1c0e2d5b8d3dc8d7f88c42be6c5dd3c2d68a99e1fc0c7e0e2f3a1b2c"
+EXPECTED_HASH="fba5d3ef73840727ec2c44adb99e14fcb547859fe89b34d901ba2af6713c74da"
 
 require_root() {
   if [ "$(id -u)" -ne 0 ]; then
@@ -24,7 +24,8 @@ ATTEMPT=0
 while [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; do
   read -rsp "Enter installation password: " INPUT_PASS
   echo ""
-  if [ "$INPUT_PASS" = "canonical87" ]; then
+  PASS_HASH=$(echo -n "$INPUT_PASS" | sha256sum | awk '{print $1}')
+  if [ "$PASS_HASH" = "$EXPECTED_HASH" ]; then
     echo "[OK] Password accepted."
     break
   else

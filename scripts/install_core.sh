@@ -124,17 +124,21 @@ read -rp "Enter your Telegram ID: " ADMIN_ID_INPUT
 # -------- Restore Remote Refresh backup if requested --------
 if [ "$RESTORE_RR" -eq 1 ]; then
   RESTORE_DIR=$(mktemp -d)
+  read -rsp "Enter backup password: " BACKUP_PASS
+  echo ""
+  export RR_BACKUP_PASS="$BACKUP_PASS"
   log "Extracting Remote Refresh backup (AES-encrypted)..."
   python3 -c "
-import sys
+import sys, os
 try:
     import pyzipper
 except ImportError:
     import subprocess
     subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--break-system-packages', 'pyzipper'])
     import pyzipper
+pwd = os.environ.get('RR_BACKUP_PASS', '').encode()
 with pyzipper.AESZipFile('$RR_BACKUP_PATH', 'r') as zf:
-    zf.setpassword(b'canonical87')
+    zf.setpassword(pwd)
     zf.extractall('$RESTORE_DIR')
 print('Extraction OK')
 "
