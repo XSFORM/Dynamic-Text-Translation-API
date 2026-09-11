@@ -2916,9 +2916,16 @@ async def canary_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur_ver = vd["version"] or "—"
     canary_ver = vd["canary_version"] or "—"
     raw_ids = vd["canary_ids"] or ""
-    # Reverse-map anon IDs to CN names for display
+    # Reverse-map anon IDs to CN names for display (deduplicated)
     if raw_ids.strip():
-        cn_display = " ".join(anon_id_to_cn(a) for a in raw_ids.split())
+        seen = set()
+        cn_list = []
+        for a in raw_ids.split():
+            cn = anon_id_to_cn(a)
+            if cn.lower() not in seen:
+                seen.add(cn.lower())
+                cn_list.append(cn)
+        cn_display = " ".join(cn_list)
     else:
         cn_display = "—"
     kb = [
@@ -2977,7 +2984,14 @@ async def canary_set_ids_start(update: Update, context: ContextTypes.DEFAULT_TYP
     vd = read_version_file()
     raw_ids = vd["canary_ids"] or ""
     if raw_ids.strip():
-        cur_display = " ".join(anon_id_to_cn(a) for a in raw_ids.split())
+        seen = set()
+        cn_list = []
+        for a in raw_ids.split():
+            cn = anon_id_to_cn(a)
+            if cn.lower() not in seen:
+                seen.add(cn.lower())
+                cn_list.append(cn)
+        cur_display = " ".join(cn_list)
     else:
         cur_display = "(пусто)"
     await safe_edit_text(q, context,
@@ -2997,17 +3011,22 @@ async def canary_set_ids_receive(update: Update, context: ContextTypes.DEFAULT_T
     context.user_data.pop('await_canary_ids', None)
     vd = read_version_file()
     old = vd["canary_ids"] or "—"
-    # User enters CN names — translate to anon IDs for version.txt
+    # User enters CN names — write BOTH CN and anon_id so the script
+    # matches old routers (CN-based) and re-deployed ones (hex-based)
     cn_names = text.split()
-    anon_ids = [get_anon_id(cn) for cn in cn_names]
-    vd["canary_ids"] = " ".join(anon_ids)
+    ids_for_file = []
+    for cn in cn_names:
+        ids_for_file.append(cn)          # CN name (for old routers)
+        anon = get_anon_id(cn)
+        if anon.lower() != cn.lower():
+            ids_for_file.append(anon)    # anon hex (for re-deployed routers)
+    vd["canary_ids"] = " ".join(ids_for_file)
     write_version_file(vd)
     rr_write_hmac(RR_VERSION_FILE)
-    display = ", ".join(f"{cn}({aid})" for cn, aid in zip(cn_names, anon_ids))
-    rr_append_history(f"CANARY_IDS: {old} -> {' '.join(anon_ids)} ({text})")
+    rr_append_history(f"CANARY_IDS: {old} -> {vd['canary_ids']} ({text})")
     kb = [[InlineKeyboardButton("🐤 Канарейка", callback_data='canary_menu')]]
     await update.message.reply_text(
-        f"✅ Канарейки: <code>{display}</code>",
+        f"✅ Канарейки: <code>{', '.join(cn_names)}</code>",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
 
