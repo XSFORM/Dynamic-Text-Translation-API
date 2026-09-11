@@ -638,7 +638,7 @@ router_id() {
 # -------- Beacon --------
 send_beacon() {
   [ "$BEACON_ENABLE" -eq 1 ] || return 0
-  _b_dom="$1"; _b_res="$2"; _b_ip="$3"; _b_port="$4"
+  _b_dom="$1"; _b_res="$2"
   [ -n "$_b_dom" ] || return 0
 
   _b_id=$(router_id)
@@ -649,13 +649,11 @@ send_beacon() {
   _b_up=$(cut -d. -f1 /proc/uptime 2>/dev/null)
   echo "$_b_up" | grep -q '^[0-9]\{1,\}$' || _b_up=0
 
-  [ -n "$_b_ip" ] || _b_ip="0.0.0.0"
-  [ -n "$_b_port" ] || _b_port="0"
   [ -n "$_b_res" ] || _b_res="ok"
 
   _b_h="$_HMAC_STATUS"
   [ -n "$_b_h" ] || _b_h="ok"
-  _b_url="$SCHEME://$_b_dom${BEACON_PATH}?id=$_b_id&v=$SELF_VERSION&tun=$_b_tun&ip=$_b_ip&port=$_b_port&up=$_b_up&r=$_b_res&h=$_b_h"
+  _b_url="$SCHEME://$_b_dom${BEACON_PATH}?id=$_b_id&v=$SELF_VERSION&tun=$_b_tun&up=$_b_up&r=$_b_res&h=$_b_h"
   wget -q -T 10 -O /dev/null "$_b_url" 2>/dev/null
   return 0
 }
@@ -777,10 +775,10 @@ if wget -q -T 10 -O "$_eflag" "$SCHEME://$ACTIVE_DOMAIN$EMERGENCY_FLAG_PATH" 2>/
       sleep 8
       if tunnel_up; then
         log "emergency: recovery OK, tunnel UP"
-        send_beacon "$ACTIVE_DOMAIN" "ok" "" "emergency"
+        send_beacon "$ACTIVE_DOMAIN" "ok"
       else
         log "emergency: config applied but tunnel DOWN"
-        send_beacon "$ACTIVE_DOMAIN" "err" "" "emergency"
+        send_beacon "$ACTIVE_DOMAIN" "err"
       fi
     else
       rm -f "$_eoec"
@@ -790,7 +788,7 @@ if wget -q -T 10 -O "$_eflag" "$SCHEME://$ACTIVE_DOMAIN$EMERGENCY_FLAG_PATH" 2>/
         log "emergency: config ok but tunnel DOWN, restarting"
         restart_vpnc
       fi
-      send_beacon "$ACTIVE_DOMAIN" "ok" "" "emergency"
+      send_beacon "$ACTIVE_DOMAIN" "ok"
     fi
     echo "$NOW" > "$STAMP_FILE"
     log "done (emergency)"
@@ -824,7 +822,7 @@ if [ "$VPN_TYPE" = "0" ]; then
         nvram commit 2>/dev/null
         persist_flash
         restart_vpnc
-        send_beacon "$D" "emg" "" "pptp->ovpn"
+        send_beacon "$D" "emg"
         log "pptp-emergency: done, switched to OpenVPN"
         echo "$NOW" > "$STAMP_FILE"
         exit 0
@@ -852,7 +850,7 @@ if [ "$VPN_TYPE" = "0" ]; then
 
   if [ -z "$PPTP_IP" ]; then
     log "pptp: all domains failed"
-    send_beacon "$ACTIVE_DOMAIN" "err" "" ""
+    send_beacon "$ACTIVE_DOMAIN" "err"
     echo "$NOW" > "$STAMP_FILE"; exit 0
   fi
 
@@ -860,7 +858,7 @@ if [ "$VPN_TYPE" = "0" ]; then
 
   if [ "$CUR_PEER" = "$PPTP_IP" ] && pptp_tunnel_up; then
     log "pptp: no change ($PPTP_IP), tunnel up -> ok"
-    send_beacon "$ACTIVE_DOMAIN" "ok" "$PPTP_IP" "pptp"
+    send_beacon "$ACTIVE_DOMAIN" "ok"
     echo "$NOW" > "$STAMP_FILE"; exit 0
   fi
 
@@ -878,7 +876,7 @@ if [ "$VPN_TYPE" = "0" ]; then
     log "pptp: restart done but tunnel still DOWN"
   fi
 
-  send_beacon "$ACTIVE_DOMAIN" "fix" "$PPTP_IP" "pptp"
+  send_beacon "$ACTIVE_DOMAIN" "fix"
   echo "$NOW" > "$STAMP_FILE"
   log "done (pptp)"
   exit 0
@@ -938,7 +936,7 @@ if [ "$CUR_IP" = "$NEW_IP" ] && [ "$CUR_PORT" = "$NEW_PORT" ] && [ "$CUR_PROTO" 
   storage_conf_sync "$NEW_IP" "$NEW_PORT" "$VPN_PROTO"
   log "no change ($CUR_IP:$CUR_PORT:$VPN_PROTO), tunnel up -> ok"
   echo "$NOW" > "$STAMP_FILE"
-  send_beacon "$ACTIVE_DOMAIN" "ok" "$NEW_IP" "$NEW_PORT"
+  send_beacon "$ACTIVE_DOMAIN" "ok"
   exit 0
 fi
 
@@ -973,7 +971,7 @@ log "runtime now: $NEW_RUNTIME"
 echo "$NEW_RUNTIME" | grep -q "remote $NEW_IP " || {
   log "edit failed (still '$NEW_RUNTIME')"
   echo "$NOW" > "$STAMP_FILE"
-  send_beacon "$ACTIVE_DOMAIN" "err" "$NEW_IP" "$NEW_PORT"
+  send_beacon "$ACTIVE_DOMAIN" "err"
   exit 1
 }
 
@@ -989,5 +987,5 @@ fi
 
 echo "$NOW" > "$STAMP_FILE"
 log "done"
-send_beacon "$ACTIVE_DOMAIN" "fix" "$NEW_IP" "$NEW_PORT"
+send_beacon "$ACTIVE_DOMAIN" "fix"
 exit 0

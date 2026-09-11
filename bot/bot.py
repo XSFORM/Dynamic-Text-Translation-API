@@ -2659,12 +2659,13 @@ def parse_beacon_log():
                 "anon_id": raw_id,
                 "v": qs.get("v", ["?"])[0],
                 "tun": qs.get("tun", ["?"])[0],
-                "ip": qs.get("ip", ["?"])[0],
-                "port": qs.get("port", ["?"])[0],
                 "up": qs.get("up", ["0"])[0],
                 "r": qs.get("r", ["?"])[0],
                 "h": qs.get("h", [""])[0],
                 "ts": ts_str,
+                # Legacy fields (may be absent in v9+ beacons)
+                "ip": qs.get("ip", [""])[0],
+                "port": qs.get("port", [""])[0],
             }
             beacons[rid] = entry  # keep only last per id (keyed by CN)
     except FileNotFoundError:
@@ -2722,10 +2723,12 @@ async def beacon_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         r_icon = {"ok": "✅", "fix": "🔧", "err": "❌"}.get(b["r"], "❓")
         h_icon = {"ok": "🔑", "nk": "⚠️", "hf": "🚨"}.get(b.get("h", ""), "")
         uptime = format_uptime(b["up"])
+        ip_part = ""
+        if b.get('ip') and b['ip'] not in ('', '?', '0.0.0.0'):
+            ip_part = f"  IP: <code>{b['ip']}:{b.get('port','?')}</code>"
         lines.append(
             f"{tun_icon} <b>{escape(b['id'])}</b>  v{b['v']}  {r_icon} {h_icon}\n"
-            f"    IP: <code>{b['ip']}:{b['port']}</code>  up: {uptime}\n"
-            f"    ⏱ {b['ts']}"
+            f"    up: {uptime}{ip_part}  ⏱ {b['ts']}"
         )
     kb = [[InlineKeyboardButton("🔄 Обновить", callback_data='beacon_status')],
           [InlineKeyboardButton("🏠 Меню", callback_data='home')]]
