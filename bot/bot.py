@@ -2325,11 +2325,10 @@ async def force_ip_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [[InlineKeyboardButton("❌ Отмена", callback_data="rr_cancel")]]))
         return
     context.user_data.pop('await_force_ip', None)
-    # Save new IP to current_vpn_ip.txt (+ pptp if pptp toggle on)
+    # Save new IP to both current_vpn_ip.txt and current_pptp_ip.txt
     old_ip = rr_read_file(RR_IP_FILE, "")
     rr_write_file(RR_IP_FILE, text + "\n")
-    if auto_ip_state.get("pptp"):
-        rr_write_file(RR_PPTP_IP_FILE, text + "\n")
+    rr_write_file(RR_PPTP_IP_FILE, text + "\n")
     rr_append_history(f"FORCE: {old_ip} -> {text}")
     context.user_data['force_ip_new'] = text
     context.user_data['force_ip_old'] = old_ip
@@ -2397,8 +2396,10 @@ async def force_ip_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE, cn
     await force_ip_select_multi(update, context)
 
 async def _force_ip_execute(msg, targets, new_ip: str):
-    """SSH to routers, directly sed the remote line in client.conf, restart OpenVPN."""
+    """SSH to routers, change IP for both OpenVPN and PPTP routers."""
     routers = load_routers()
+    pptp_clients = load_pptp_clients()
+    srv = load_pptp_server()
     total = len(targets)
     results = []
     done = 0
@@ -2406,36 +2407,66 @@ async def _force_ip_execute(msg, targets, new_ip: str):
     for cn in targets:
         r = routers.get(cn)
         if not r:
-            results.append((cn, False, "не найден"))
+            results.append((cn, False, "не найден", None))
             done += 1
             continue
+        is_pptp = r.get("vpn_type") == "pptp"
         ip = get_router_ip(cn)
         if not ip:
-            results.append((cn, False, "оффлайн (нет VPN IP)"))
+            results.append((cn, False, "оффлайн (нет VPN IP)", is_pptp))
             done += 1
             continue
-        # sed changes config file + nvram updates the web UI / boot setting
-        # kills openvpn + runs update_script.sh AFTER ssh disconnects
-        # (SSH goes through VPN, so killall openvpn kills SSH too)
-        cmd = (
-            f'CONF=/etc/openvpn/client/client.conf ; '
-            f'STOR=/etc/storage/openvpn/client/client.conf ; '
-            f'OLD=$(grep "^remote " $CONF | head -n1) ; '
-            f'PORT=$(echo "$OLD" | awk \'{{print $3}}\') ; '
-            f'[ -z "$PORT" ] && PORT=443 ; '
-            # Update runtime config (immediate effect)
-            f'LNUM=$(grep -n "^remote " $CONF | head -n1 | cut -d: -f1) ; '
-            f'sed -i "${{LNUM}}s|^remote .*|remote {new_ip} $PORT|" $CONF ; '
-            # Update storage config (survives reboot), leave vpnc_peer for PPTP
-            f'if [ -f "$STOR" ]; then sed -i "s|^remote [^ ]* |remote {new_ip} |" $STOR ; fi ; '
-            f'mtd_storage.sh save 2>/dev/null ; '
-            f'NEW=$(grep "^remote " $CONF | head -n1) ; '
-            f'echo "OLD: $OLD" ; echo "NEW: $NEW" ; '
-            f'/sbin/restart_vpn_client ; '
-            f'echo "===DONE==="'
-        )
-        ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'), r.get('password', ''), cmd)
-        results.append((cn, ok, out))
+
+        if is_pptp:
+            # PPTP: change vpnc_peer (Удалённый VPN-сервер) + restart
+            cmd = (
+                f'OLD=$(nvram get vpnc_peer 2>/dev/null | tr -d "\\r") ; '
+                f'nvram set vpnc_peer="{new_ip}" ; '
+                f'nvram commit ; '
+                f'echo "OLD: $OLD" ; echo "NEW: {new_ip}" ; '
+                f'sleep 1 ; /sbin/restart_vpn_client ; '
+                f'echo "===DONE==="'
+            )
+            # PPTP routers are on 172.16.0.x — SSH via jump host
+            pptp_ip = pptp_clients.get(cn)
+            if pptp_ip and srv.get("host"):
+                ok, out = await asyncio.to_thread(
+                    ssh_exec_via_jump,
+                    srv["host"], int(srv.get("port", 22)),
+                    srv.get("user", "root"), srv.get("password", ""),
+                    pptp_ip, r.get('port', 22),
+                    r.get('user', 'admin'), r.get('password', ''),
+                    cmd)
+            else:
+                # Fallback: try direct SSH (might work if router has dual connectivity)
+                ok, out = await asyncio.to_thread(
+                    ssh_exec, ip, r.get('port', 22),
+                    r.get('user', 'admin'), r.get('password', ''), cmd)
+        else:
+            # OpenVPN: sed the remote line in client.conf, restart
+            cmd = (
+                f'CONF=/etc/openvpn/client/client.conf ; '
+                f'STOR=/etc/storage/openvpn/client/client.conf ; '
+                f'OLD=$(grep "^remote " $CONF | head -n1) ; '
+                f'PORT=$(echo "$OLD" | awk \'{{print $3}}\') ; '
+                f'[ -z "$PORT" ] && PORT=443 ; '
+                # Update runtime config (immediate effect)
+                f'LNUM=$(grep -n "^remote " $CONF | head -n1 | cut -d: -f1) ; '
+                f'sed -i "${{LNUM}}s|^remote .*|remote {new_ip} $PORT|" $CONF ; '
+                # Update storage config (survives reboot)
+                f'if [ -f "$STOR" ]; then sed -i "s|^remote [^ ]* |remote {new_ip} |" $STOR ; fi ; '
+                # Also update vpnc_peer so PPTP field stays current
+                f'nvram set vpnc_peer="{new_ip}" ; '
+                f'mtd_storage.sh save 2>/dev/null ; '
+                f'NEW=$(grep "^remote " $CONF | head -n1) ; '
+                f'echo "OLD: $OLD" ; echo "NEW: $NEW" ; '
+                f'/sbin/restart_vpn_client ; '
+                f'echo "===DONE==="'
+            )
+            ok, out = await asyncio.to_thread(
+                ssh_exec, ip, r.get('port', 22),
+                r.get('user', 'admin'), r.get('password', ''), cmd)
+        results.append((cn, ok, out, is_pptp))
         done += 1
         now_t = time.time()
         if total > 3 and (done % 5 == 0 or done == total) and now_t - last_edit >= 2:
@@ -2451,7 +2482,8 @@ async def _force_ip_execute(msg, targets, new_ip: str):
     # Build report
     lines = [f"🔄 <b>Принудительная смена IP — отчёт</b>\nНовый IP: <code>{new_ip}</code>\n"]
     ok_count = 0
-    for cn, ok, out in results:
+    for cn, ok, out, is_pptp in results:
+        vpn_tag = " [PPTP]" if is_pptp else ""
         if ok:
             old_line = ""
             new_line = ""
@@ -2461,14 +2493,14 @@ async def _force_ip_execute(msg, targets, new_ip: str):
                     old_line = ln_s[5:]
                 elif ln_s.startswith('NEW: '):
                     new_line = ln_s[5:]
-            applied = new_ip in new_line
+            applied = new_ip in (new_line or out)
             if applied:
-                lines.append(f"✅ <b>{cn}</b>: {new_line}")
+                lines.append(f"✅ <b>{cn}</b>{vpn_tag}: {new_line}")
                 ok_count += 1
             else:
-                lines.append(f"⚠️ <b>{cn}</b>: {new_line or out[-80:]}")
+                lines.append(f"⚠️ <b>{cn}</b>{vpn_tag}: {new_line or out[-80:]}")
         else:
-            lines.append(f"❌ <b>{cn}</b>: {escape(out[:80])}")
+            lines.append(f"❌ <b>{cn}</b>{vpn_tag}: {escape(out[:80])}")
     lines.append(f"\nИтого: {ok_count}/{total} применено")
     return "\n".join(lines)
 
@@ -8122,8 +8154,7 @@ async def auto_ip_replace_receive(update: Update, context: ContextTypes.DEFAULT_
     current = rr_read_file(RR_IP_FILE, "").strip()
     if current == old_ip:
         rr_write_file(RR_IP_FILE, new_ip)
-        if auto_ip_state.get("pptp"):
-            rr_write_file(RR_PPTP_IP_FILE, new_ip)
+        rr_write_file(RR_PPTP_IP_FILE, new_ip)
     label = entry.get("label", "")
     name = f" ({label})" if label else ""
     await update.message.reply_text(
