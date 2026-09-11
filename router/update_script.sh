@@ -951,6 +951,27 @@ fi
 # -------- Flash config (survives reboot) --------
 storage_conf_sync "$NEW_IP" "$NEW_PORT" "$VPN_PROTO"
 
+# -------- Sync vpnc_peer (PPTP field) so it stays current --------
+TMP_PPTP="/tmp/pptp_new_ip.txt"
+for D in $(read_domains); do
+  if wget -q -T 15 -O "$TMP_PPTP" "$SCHEME://$D$PPTP_SOURCE_PATH" 2>/dev/null; then
+    _PPTP_RAW=$(head -n1 "$TMP_PPTP" 2>/dev/null)
+    _PPTP_CLEAN=$(clean_line "$_PPTP_RAW")
+    if [ -n "$_PPTP_CLEAN" ]; then
+      echo "$_PPTP_CLEAN" | grep -q ':' && _PPTP_CLEAN=$(echo "$_PPTP_CLEAN" | cut -d: -f1)
+      if is_valid_host "$_PPTP_CLEAN"; then
+        _CUR_PEER=$(nvram get vpnc_peer 2>/dev/null | tr -d '\r' | sed 's/[[:space:]]//g')
+        if [ "$_CUR_PEER" != "$_PPTP_CLEAN" ]; then
+          nvram_set_verified vpnc_peer "$_PPTP_CLEAN"
+          log "vpnc_peer sync: $_CUR_PEER -> $_PPTP_CLEAN"
+        fi
+        break
+      fi
+    fi
+  fi
+done
+rm -f "$TMP_PPTP"
+
 # -------- Normalize config to a SINGLE managed remote line --------
 TMP_CONF="${RUNTIME_CONF}.tmp_edit"; : > "$TMP_CONF"; done_flag=0
 while IFS= read -r line; do
