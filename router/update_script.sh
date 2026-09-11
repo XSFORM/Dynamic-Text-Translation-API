@@ -623,7 +623,7 @@ self_update() {
 
 # -------- Router ID (for beacon) --------
 router_id() {
-  # 1) /etc/storage/router_id file (written by deploy — unique per router)
+  # Anonymous ID from /etc/storage/router_id (deployed by bot)
   if [ -s "/etc/storage/router_id" ]; then
     _rid=$(head -n1 /etc/storage/router_id 2>/dev/null | tr -d '\r' | sed 's/[[:space:]]//g')
     if [ -n "$_rid" ]; then
@@ -631,17 +631,8 @@ router_id() {
       return 0
     fi
   fi
-  # 2) MAC address (unique per device)
-  _rid=$(nvram get lan_hwaddr 2>/dev/null | tr -d ':-' | tr 'ABCDEF' 'abcdef')
-  if [ -z "$_rid" ]; then
-    for i in /sbin/ifconfig /bin/ifconfig /usr/sbin/ifconfig /usr/bin/ifconfig; do
-      if [ -x "$i" ]; then
-        _rid=$("$i" br0 2>/dev/null | grep -o '[0-9A-Fa-f:]\{17\}' | head -n1 | tr -d ':-' | tr 'ABCDEF' 'abcdef')
-        break
-      fi
-    done
-  fi
-  printf '%s' "$_rid" | tr -cd 'A-Za-z0-9._-'
+  # No ID file — return empty (beacon will use "unknown")
+  printf ''
 }
 
 # -------- Beacon --------

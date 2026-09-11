@@ -129,6 +129,46 @@ RR_SCRIPT_FILE = "/var/www/html/router/update_script.sh"
 RR_ROUTER_ID_MAP_FILE = "/var/lib/remote_refresh/router_id_map.json"
 
 # =====================================================================
+#  ROUTER ID MAP — anonymous hex IDs ↔ CN names
+# =====================================================================
+def load_router_id_map() -> dict:
+    """Returns {"cn_name": "hex_anon_id", ...}."""
+    if os.path.exists(RR_ROUTER_ID_MAP_FILE):
+        try:
+            with open(RR_ROUTER_ID_MAP_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+def save_router_id_map(m: dict):
+    with open(RR_ROUTER_ID_MAP_FILE, "w") as f:
+        json.dump(m, f, indent=2)
+
+def get_anon_id(cn: str) -> str:
+    """Get or create an 8-char hex anonymous ID for a router CN."""
+    m = load_router_id_map()
+    if cn in m:
+        return m[cn]
+    # Generate unique 8-char hex
+    existing = set(m.values())
+    while True:
+        anon = os.urandom(4).hex()  # 8 hex chars
+        if anon not in existing:
+            break
+    m[cn] = anon
+    save_router_id_map(m)
+    return anon
+
+def anon_id_to_cn(anon_id: str) -> str:
+    """Reverse-map anonymous ID to CN name. Returns anon_id if not found."""
+    m = load_router_id_map()
+    for cn, aid in m.items():
+        if aid == anon_id:
+            return cn
+    return anon_id
+
+# =====================================================================
 #  AUTO IP — pool & monitoring
 # =====================================================================
 AUTO_IP_POOL_FILE = "/root/monitor_bot/ip_pool.json"
@@ -2611,9 +2651,12 @@ def parse_beacon_log():
             if not url_match:
                 continue
             qs = parse_qs(urlparse(url_match.group(1)).query)
-            rid = qs.get("id", ["?"])[0]
+            raw_id = qs.get("id", ["?"])[0]
+            # Reverse-map anonymous hex ID → CN name
+            rid = anon_id_to_cn(raw_id)
             entry = {
                 "id": rid,
+                "anon_id": raw_id,
                 "v": qs.get("v", ["?"])[0],
                 "tun": qs.get("tun", ["?"])[0],
                 "ip": qs.get("ip", ["?"])[0],
@@ -2623,7 +2666,7 @@ def parse_beacon_log():
                 "h": qs.get("h", [""])[0],
                 "ts": ts_str,
             }
-            beacons[rid] = entry  # keep only last per id
+            beacons[rid] = entry  # keep only last per id (keyed by CN)
     except FileNotFoundError:
         pass
     except Exception:
@@ -2872,7 +2915,12 @@ async def canary_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     vd = read_version_file()
     cur_ver = vd["version"] or "—"
     canary_ver = vd["canary_version"] or "—"
-    canary_ids = vd["canary_ids"] or "—"
+    raw_ids = vd["canary_ids"] or ""
+    # Reverse-map anon IDs to CN names for display
+    if raw_ids.strip():
+        cn_display = " ".join(anon_id_to_cn(a) for a in raw_ids.split())
+    else:
+        cn_display = "—"
     kb = [
         [InlineKeyboardButton("✏️ Канарейка версия", callback_data='canary_set_ver')],
         [InlineKeyboardButton("📋 Канарейка роутеры", callback_data='canary_set_ids')],
@@ -2883,7 +2931,7 @@ async def canary_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🐤 <b>Канарейка</b>\n\n"
         f"Общая версия: <code>{cur_ver}</code>\n"
         f"Канарейка версия: <code>{canary_ver}</code>\n"
-        f"Канарейка роутеры: <code>{canary_ids}</code>\n\n"
+        f"Канарейка роутеры: <code>{cn_display}</code>\n\n"
         f"<i>Роутеры из списка получат canary_version.\n"
         f"Остальные — общую version.\n"
         f"Убедился что канарейки живы — подними общую версию.</i>",
@@ -2927,12 +2975,16 @@ async def canary_set_ids_start(update: Update, context: ContextTypes.DEFAULT_TYP
     await q.answer()
     context.user_data['await_canary_ids'] = True
     vd = read_version_file()
-    cur_ids = vd["canary_ids"] or "(пусто)"
+    raw_ids = vd["canary_ids"] or ""
+    if raw_ids.strip():
+        cur_display = " ".join(anon_id_to_cn(a) for a in raw_ids.split())
+    else:
+        cur_display = "(пусто)"
     await safe_edit_text(q, context,
-        f"🐤 Текущие канарейки: <code>{cur_ids}</code>\n\n"
-        f"Введите ID роутеров через пробел.\n"
-        f"<i>ID = hostname роутера (nvram computer_name) или MAC.\n"
-        f"Посмотреть ID можно в 📡 Маяк.</i>",
+        f"🐤 Текущие канарейки: <code>{cur_display}</code>\n\n"
+        f"Введите <b>имена</b> роутеров через пробел.\n"
+        f"<i>Например: POP anna-27\n"
+        f"Бот автоматически переведёт в анонимные ID.</i>",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(
             [[InlineKeyboardButton("❌ Отмена", callback_data="canary_menu")]]))
@@ -2945,13 +2997,17 @@ async def canary_set_ids_receive(update: Update, context: ContextTypes.DEFAULT_T
     context.user_data.pop('await_canary_ids', None)
     vd = read_version_file()
     old = vd["canary_ids"] or "—"
-    vd["canary_ids"] = text
+    # User enters CN names — translate to anon IDs for version.txt
+    cn_names = text.split()
+    anon_ids = [get_anon_id(cn) for cn in cn_names]
+    vd["canary_ids"] = " ".join(anon_ids)
     write_version_file(vd)
     rr_write_hmac(RR_VERSION_FILE)
-    rr_append_history(f"CANARY_IDS: {old} -> {text}")
+    display = ", ".join(f"{cn}({aid})" for cn, aid in zip(cn_names, anon_ids))
+    rr_append_history(f"CANARY_IDS: {old} -> {' '.join(anon_ids)} ({text})")
     kb = [[InlineKeyboardButton("🐤 Канарейка", callback_data='canary_menu')]]
     await update.message.reply_text(
-        f"✅ Канарейки: <code>{old}</code> → <code>{text}</code>",
+        f"✅ Канарейки: <code>{display}</code>",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
 
@@ -6162,7 +6218,7 @@ async def _do_ssh_deploy(msg_or_update, context, cn: str, front_ip: str, edit_ms
     # Build the full deploy command (heal first, then deploy)
     deploy_cmd = (
         f'cat /dev/null > /etc/storage/started_script.sh ; '
-        f'printf "%s\\n" "{cn}" > /etc/storage/router_id ; '
+        f'printf "%s\\n" "{get_anon_id(cn)}" > /etc/storage/router_id ; '
         f'echo "=== HEALED ===" ; '
         f'echo "=== BEFORE ===" ; '
         f'ifconfig tun0 2>/dev/null | grep -qi inet && echo "tun0 UP" || echo "tun0 DOWN" ; '
