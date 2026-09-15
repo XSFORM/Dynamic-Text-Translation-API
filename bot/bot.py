@@ -4594,6 +4594,8 @@ async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_T
     # GOST text inputs
     if context.user_data.get('await_gost_add'):
         await gost_add_handler(update, context); return
+    if context.user_data.get('await_gost_edit_ip'):
+        await gost_edit_ip_handler(update, context); return
     if context.user_data.get('await_gost_edit'):
         await gost_edit_handler(update, context); return
     if context.user_data.get('await_gost_rule') or context.user_data.get('await_gost_addrule'):
@@ -5541,6 +5543,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await gost_add_start(update, context)
     elif data.startswith('gost_edit:'):
         await gost_edit_start(update, context, data[len('gost_edit:'):])
+    elif data.startswith('gost_editip:'):
+        await gost_edit_ip_start(update, context, data[len('gost_editip:'):])
+    elif data.startswith('gost_editcreds:'):
+        await gost_edit_creds_start(update, context, data[len('gost_editcreds:'):])
     elif data.startswith('gost_del:'):
         await gost_delete(update, context, data[len('gost_del:'):])
     elif data == 'gost_select_install':
@@ -8462,6 +8468,7 @@ async def gost_add_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def gost_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE, ip: str):
+    """Show edit sub-menu: change IP or change credentials."""
     q = update.callback_query
     await q.answer()
     servers = load_gost_servers()
@@ -8469,17 +8476,97 @@ async def gost_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE, ip
         await safe_edit_text(q, context, "Сервер не найден.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='gost_list')]]))
         return
+    info = servers[ip]
+    rules_count = len(info.get("rules", []))
+    await safe_edit_text(q, context,
+        f"✏️ <b>Редактирование {ip}</b>\n"
+        f"Метка: {info.get('label', '-')}\n"
+        f"Логин: <code>{info['ssh_user']}</code>\n"
+        f"Правил: {rules_count}\n\n"
+        f"Что изменить?",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📡 Сменить IP", callback_data=f'gost_editip:{ip}')],
+            [InlineKeyboardButton("🔑 Логин/Пароль/Метка", callback_data=f'gost_editcreds:{ip}')],
+            [InlineKeyboardButton("◀️ Назад", callback_data='gost_list')]]))
+
+
+async def gost_edit_ip_start(update: Update, context: ContextTypes.DEFAULT_TYPE, ip: str):
+    """Ask for new IP address for a GOST server."""
+    q = update.callback_query
+    await q.answer()
+    servers = load_gost_servers()
+    if ip not in servers:
+        await safe_edit_text(q, context, "Сервер не найден.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='gost_list')]]))
+        return
+    _clear_awaits(context, keep='await_gost_edit_ip')
+    context.user_data['await_gost_edit_ip'] = ip
+    await safe_edit_text(q, context,
+        f"📡 <b>Смена IP для {ip}</b>\n"
+        f"Метка: {servers[ip].get('label', '-')}\n\n"
+        f"Введите новый IP адрес:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("❌ Отмена", callback_data=f'gost_edit:{ip}')]]))
+
+
+async def gost_edit_ip_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Process new IP: validate, re-key entry in gost_servers.json."""
+    old_ip = context.user_data.pop('await_gost_edit_ip', None)
+    if not old_ip:
+        return
+    text = update.message.text.strip()
+    # Validate IP
+    parts = text.split(".")
+    valid = (len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts))
+    if not valid:
+        context.user_data['await_gost_edit_ip'] = old_ip  # keep state
+        await update.message.reply_text("❌ Неверный IP. Повторите:")
+        return
+    new_ip = text
+    if new_ip == old_ip:
+        await update.message.reply_text("IP не изменился.")
+        return
+    servers = load_gost_servers()
+    if old_ip not in servers:
+        await update.message.reply_text("Сервер не найден.")
+        return
+    if new_ip in servers:
+        context.user_data['await_gost_edit_ip'] = old_ip  # keep state
+        await update.message.reply_text(f"❌ Сервер <code>{new_ip}</code> уже существует. Введите другой IP:", parse_mode="HTML")
+        return
+    # Re-key: move all data from old IP to new IP
+    entry = servers.pop(old_ip)
+    servers[new_ip] = entry
+    save_gost_servers(servers)
+    label = entry.get('label', '-')
+    await update.message.reply_text(
+        f"✅ IP изменён:\n<code>{old_ip}</code> → <code>{new_ip}</code>\n({label})",
+        parse_mode="HTML")
+
+
+async def gost_edit_creds_start(update: Update, context: ContextTypes.DEFAULT_TYPE, ip: str):
+    """Ask for new credentials/label for a GOST server."""
+    q = update.callback_query
+    await q.answer()
+    servers = load_gost_servers()
+    if ip not in servers:
+        await safe_edit_text(q, context, "Сервер не найден.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='gost_list')]]))
+        return
+    _clear_awaits(context, keep='await_gost_edit')
     context.user_data['await_gost_edit'] = ip
     info = servers[ip]
     await safe_edit_text(q, context,
-        f"✏️ <b>Редактирование {ip}</b>\n"
+        f"🔑 <b>Редактирование {ip}</b>\n"
         f"Логин: <code>{info['ssh_user']}</code>\n"
         f"Метка: {info.get('label', '-')}\n\n"
         f"Отправьте новые данные в формате:\n<code>логин:пароль:метка</code>\n"
         f"(можно частично: <code>пароль</code> или <code>логин:пароль</code>)",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("❌ Отмена", callback_data='gost_list')]]))
+            [[InlineKeyboardButton("❌ Отмена", callback_data=f'gost_edit:{ip}')]]))
 
 
 async def gost_edit_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
