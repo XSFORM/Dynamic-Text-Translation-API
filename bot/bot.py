@@ -58,12 +58,6 @@ logger = logging.getLogger(__name__)
 #  OPENVPN SECTION — Constants / Globals
 # =====================================================================
 BOT_VERSION = "HYBRID OVPN+RR v2.4"
-UPDATE_SOURCE_URL = "https://raw.githubusercontent.com/XSFORM/update_bot/main/openvpn_monitor_bot.py"
-SIMPLE_UPDATE_CMD = (
-    "curl -L -o /root/monitor_bot/openvpn_monitor_bot.py "
-    f"{UPDATE_SOURCE_URL} && systemctl restart vpn_bot.service"
-)
-
 TELEGRAPH_TOKEN_FILE = "/root/monitor_bot/telegraph_token.txt"
 TELEGRAPH_SHORT_NAME = "vpn-bot"
 TELEGRAPH_AUTHOR = "VPN Bot"
@@ -833,37 +827,6 @@ def disconnect_client_sessions(client_name: str) -> bool:
         except Exception as e:
             print(f"[mgmt] unix kill failed {client_name}: {e}")
     return False
-
-# =====================================================================
-#  OPENVPN — Update helpers
-# =====================================================================
-async def show_update_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-    await update.message.reply_text(
-        f"<b>Команда обновления:</b>\n<code>{SIMPLE_UPDATE_CMD}</code>",
-        parse_mode="HTML"
-    )
-
-async def send_simple_update_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    if q.from_user.id != ADMIN_ID:
-        await q.answer("Нет доступа", show_alert=True); return
-    await q.answer()
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("📋 Копия", callback_data="copy_update_cmd")]])
-    await context.bot.send_message(
-        chat_id=q.message.chat_id,
-        text=f"<b>Команда обновления (версия {BOT_VERSION}):</b>\n<code>{SIMPLE_UPDATE_CMD}</code>",
-        parse_mode="HTML",
-        reply_markup=kb
-    )
-
-async def resend_update_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    if q.from_user.id != ADMIN_ID:
-        await q.answer("Нет доступа", show_alert=True); return
-    await q.answer("Отправлено")
-    await context.bot.send_message(chat_id=q.message.chat_id, text=f"<code>{SIMPLE_UPDATE_CMD}</code>", parse_mode="HTML")
 
 # =====================================================================
 #  OPENVPN — Helpers
@@ -4339,8 +4302,7 @@ def get_main_keyboard():
         [InlineKeyboardButton("──── OPENVPN ────", callback_data='noop')],
         [InlineKeyboardButton("📊 Статистика", callback_data='stats'),
          InlineKeyboardButton("🛣️ Тунель", callback_data='send_ipp')],
-        [InlineKeyboardButton("📶 Трафик", callback_data='traffic'),
-         InlineKeyboardButton("🔗 Обновление", callback_data='update_info')],
+        [InlineKeyboardButton("📶 Трафик", callback_data='traffic')],
         [InlineKeyboardButton("🧹 Очистить трафик", callback_data='traffic_clear'),
          InlineKeyboardButton("🌐 Обновить адрес", callback_data='update_remote')],
         [InlineKeyboardButton("⏳ Сроки ключей", callback_data='keys_expiry'),
@@ -4799,11 +4761,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await bulk_disable_confirm(update, context)
     elif data == 'cancel_bulk_disable':
         await bulk_disable_cancel(update, context)
-
-    elif data == 'update_info':
-        await send_simple_update_command(update, context)
-    elif data == 'copy_update_cmd':
-        await resend_update_command(update, context)
 
     elif data == 'keys_expiry':
         await view_keys_expiry_handler(update, context)
@@ -9769,7 +9726,6 @@ def main():
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("clients", clients_command))
     app.add_handler(CommandHandler("traffic", traffic_command))
-    app.add_handler(CommandHandler("show_update_cmd", show_update_cmd))
     app.add_handler(CommandHandler("backup_now", cmd_backup_now))
     app.add_handler(CommandHandler("backup_list", cmd_backup_list))
     app.add_handler(CommandHandler("backup_restore", cmd_backup_restore))
