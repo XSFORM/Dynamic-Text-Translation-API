@@ -1062,8 +1062,19 @@ def load_gost_servers() -> Dict:
         return {}
 
 def save_gost_servers(data: Dict):
-    with open(GOST_SERVERS_FILE, "w") as f:
+    tmp = GOST_SERVERS_FILE + ".tmp"
+    bak = GOST_SERVERS_FILE + ".bak"
+    with open(tmp, "w") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    # verify written file is valid JSON
+    with open(tmp, "r") as f:
+        json.load(f)
+    # backup current file
+    if os.path.exists(GOST_SERVERS_FILE):
+        shutil.copy2(GOST_SERVERS_FILE, bak)
+    os.replace(tmp, GOST_SERVERS_FILE)
 
 # =====================================================================
 #  NATURAL SORT
