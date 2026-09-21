@@ -1022,8 +1022,10 @@ async def rtunnel_deploy_one(update: Update, context: ContextTypes.DEFAULT_TYPE,
         # Kill any existing tunnel and start fresh
         "killall -q tunnel.sh 2>/dev/null; "
         "pkill -f 'ssh.*-R.*0.0.0.0:.*:127.0.0.1:80' 2>/dev/null; "
-        "sh /etc/storage/tunnel.sh & "
-        "echo TUNNEL_DEPLOY_OK"
+        # Print OK BEFORE starting tunnel (so SSH read doesn't hang)
+        "echo TUNNEL_DEPLOY_OK; "
+        # Start tunnel fully detached from SSH session
+        "sh /etc/storage/tunnel.sh </dev/null >/dev/null 2>&1 &"
     )
 
     try:
@@ -1146,8 +1148,8 @@ async def rtunnel_deploy_all(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 "mtd_storage.sh save && "
                 "killall -q tunnel.sh 2>/dev/null; "
                 "pkill -f 'ssh.*-R.*0.0.0.0:.*:127.0.0.1:80' 2>/dev/null; "
-                "sh /etc/storage/tunnel.sh & "
-                "echo TUNNEL_DEPLOY_OK"
+                "echo TUNNEL_DEPLOY_OK; "
+                "sh /etc/storage/tunnel.sh </dev/null >/dev/null 2>&1 &"
             )
 
             is_pptp = r.get("vpn_type") == "pptp"
