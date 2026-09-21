@@ -647,7 +647,544 @@ def ssh_exec_key(ip: str, port: int, user: str, key_path: str, command: str,
 
 GOST_KEYS_DIR = "/root/monitor_bot/gost_keys"
 
+# =====================================================================
+#  SSH REVERSE TUNNEL — Constants / Storage
+# =====================================================================
+TUNNEL_SERVER_FILE = "/root/monitor_bot/tunnel_server.json"
+TUNNEL_KEY_FILE = "/root/monitor_bot/tunnel_key"
+TUNNEL_KEY_PUB_FILE = "/root/monitor_bot/tunnel_key.pub"
+TUNNEL_IP_FILE = "/root/monitor_bot/www/router/tunnel_ip.txt"
+TUNNEL_PORT_START = 9001
+TUNNEL_PORT_END = 9048
 
+def load_tunnel_server() -> Dict:
+    try:
+        with open(TUNNEL_SERVER_FILE, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+def save_tunnel_server(data: Dict):
+    tmp = TUNNEL_SERVER_FILE + ".tmp"
+    bak = TUNNEL_SERVER_FILE + ".bak"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    with open(tmp, "r") as f:
+        json.load(f)
+    if os.path.exists(TUNNEL_SERVER_FILE):
+        shutil.copy2(TUNNEL_SERVER_FILE, bak)
+    os.replace(tmp, TUNNEL_SERVER_FILE)
+    # Also write tunnel_ip.txt for cron fetching by routers
+    _write_tunnel_ip_file(data.get("ip", ""))
+
+def _write_tunnel_ip_file(ip: str):
+    """Write tunnel_ip.txt so routers can fetch it via HTTP."""
+    d = os.path.dirname(TUNNEL_IP_FILE)
+    os.makedirs(d, exist_ok=True)
+    with open(TUNNEL_IP_FILE, "w") as f:
+        f.write(ip + "\n" if ip else "")
+
+def tunnel_generate_key() -> str:
+    """Generate RSA key pair for router SSH tunnel. Returns public key string."""
+    key = paramiko.RSAKey.generate(2048)
+    key.write_private_key_file(TUNNEL_KEY_FILE)
+    os.chmod(TUNNEL_KEY_FILE, 0o600)
+    pub = f"ssh-rsa {key.get_base64()} tunnel@routers"
+    with open(TUNNEL_KEY_PUB_FILE, "w") as f:
+        f.write(pub + "\n")
+    return pub
+
+def tunnel_get_pubkey() -> Optional[str]:
+    """Read public key if it exists."""
+    try:
+        with open(TUNNEL_KEY_PUB_FILE, "r") as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return None
+
+def tunnel_get_privkey() -> Optional[str]:
+    """Read private key content for deploying to routers."""
+    try:
+        with open(TUNNEL_KEY_FILE, "r") as f:
+            return f.read()
+    except FileNotFoundError:
+        return None
+
+def tunnel_assign_port(cn: str) -> int:
+    """Assign a tunnel port to a router if not already assigned. Returns the port."""
+    routers = load_routers()
+    r = routers.get(cn)
+    if not r:
+        return 0
+    if r.get("tunnel_port"):
+        return r["tunnel_port"]
+    # Collect used ports
+    used = {v.get("tunnel_port") for v in routers.values() if v.get("tunnel_port")}
+    for p in range(TUNNEL_PORT_START, TUNNEL_PORT_END + 1):
+        if p not in used:
+            r["tunnel_port"] = p
+            save_routers(routers)
+            return p
+    return 0
+
+
+# =====================================================================
+#  SSH REVERSE TUNNEL — Bot handlers
+# =====================================================================
+async def rtunnel_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show reverse tunnel configuration menu."""
+    q = update.callback_query
+    await q.answer()
+    ts = load_tunnel_server()
+    ip = ts.get("ip", "")
+    ssh_port = ts.get("ssh_port", 22)
+    ssh_user = ts.get("ssh_user", "root")
+    pubkey = tunnel_get_pubkey()
+    routers = load_routers()
+    assigned = sum(1 for v in routers.values() if v.get("tunnel_port"))
+    deployed = sum(1 for v in routers.values() if v.get("tunnel_deployed"))
+
+    lines = [
+        "🔗 <b>Обратный SSH-туннель</b>\n",
+        f"Сервер: <b>{ip or 'не задан'}</b>",
+        f"SSH порт: <b>{ssh_port}</b>, юзер: <b>{ssh_user}</b>",
+        f"Ключ: <b>{'✅ есть' if pubkey else '❌ нет'}</b>",
+        f"Порты назначены: <b>{assigned}</b> из {len(routers)}",
+        f"Залито на роутеры: <b>{deployed}</b>",
+    ]
+    kb = [
+        [InlineKeyboardButton("📡 IP сервера", callback_data='rt_set_ip')],
+        [InlineKeyboardButton("🔑 SSH-ключ", callback_data='rt_key_menu')],
+        [InlineKeyboardButton("📋 Порты роутеров", callback_data='rt_ports')],
+        [InlineKeyboardButton("📤 Залить на роутер", callback_data='rt_deploy_select')],
+        [InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')],
+    ]
+    await safe_edit_text(q, context, "\n".join(lines), parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def rtunnel_set_ip_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ask for tunnel server IP."""
+    q = update.callback_query
+    await q.answer()
+    _clear_awaits(context, keep=None)
+    context.user_data['await_rt_ip'] = True
+    ts = load_tunnel_server()
+    cur = ts.get("ip", "нет")
+    await safe_edit_text(q, context,
+        f"📡 <b>IP туннельного сервера</b>\n\nТекущий: <code>{cur}</code>\n\n"
+        "Введите новый IP (или IP:порт:юзер для полной настройки):\n"
+        "Пример: <code>1.2.3.4</code> или <code>1.2.3.4:22:root</code>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='rt_menu')]]))
+
+
+async def rtunnel_set_ip_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Process tunnel server IP input."""
+    text = update.message.text.strip()
+    context.user_data.pop('await_rt_ip', None)
+
+    # Parse: IP or IP:PORT:USER
+    parts = text.split(":")
+    ip = parts[0].strip()
+    ssh_port = 22
+    ssh_user = "root"
+    if len(parts) >= 2 and parts[1].strip().isdigit():
+        ssh_port = int(parts[1].strip())
+    if len(parts) >= 3 and parts[2].strip():
+        ssh_user = parts[2].strip()
+
+    # Validate IP
+    try:
+        socket.inet_aton(ip)
+    except (socket.error, OSError):
+        await update.message.reply_text(
+            f"❌ Неверный IP: {ip}",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='rt_menu')]]))
+        return
+
+    ts = load_tunnel_server()
+    old_ip = ts.get("ip", "")
+    ts["ip"] = ip
+    ts["ssh_port"] = ssh_port
+    ts["ssh_user"] = ssh_user
+    save_tunnel_server(ts)
+
+    await update.message.reply_text(
+        f"✅ Туннельный сервер: <code>{ip}:{ssh_port}</code> ({ssh_user})\n"
+        + (f"(было: {old_ip})" if old_ip and old_ip != ip else ""),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='rt_menu')]]))
+
+
+async def rtunnel_key_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show SSH key management."""
+    q = update.callback_query
+    await q.answer()
+    pubkey = tunnel_get_pubkey()
+    if pubkey:
+        text = (
+            "🔑 <b>SSH-ключ (публичный)</b>\n\n"
+            f"<code>{pubkey}</code>\n\n"
+            "<i>Добавьте этот ключ в authorized_keys на туннельном сервере.</i>"
+        )
+        kb = [
+            [InlineKeyboardButton("🔄 Перегенерировать", callback_data='rt_key_regen')],
+            [InlineKeyboardButton("◀️ Назад", callback_data='rt_menu')],
+        ]
+    else:
+        text = "🔑 <b>SSH-ключ</b>\n\nКлюч ещё не создан."
+        kb = [
+            [InlineKeyboardButton("🔑 Сгенерировать", callback_data='rt_key_gen')],
+            [InlineKeyboardButton("◀️ Назад", callback_data='rt_menu')],
+        ]
+    await safe_edit_text(q, context, text, parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def rtunnel_key_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Generate a new SSH key pair."""
+    q = update.callback_query
+    await q.answer()
+    pubkey = tunnel_generate_key()
+    await safe_edit_text(q, context,
+        f"✅ <b>Ключ создан!</b>\n\n"
+        f"<code>{pubkey}</code>\n\n"
+        "<i>Скопируйте и добавьте в <code>~/.ssh/authorized_keys</code> на туннельном сервере.</i>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("◀️ Назад", callback_data='rt_key_menu')]]))
+
+
+async def rtunnel_ports(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show tunnel port assignments for all routers."""
+    q = update.callback_query
+    await q.answer()
+    routers = load_routers()
+    if not routers:
+        await safe_edit_text(q, context, "Нет роутеров.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='rt_menu')]]))
+        return
+    lines = ["📋 <b>Порты туннелей</b>\n"]
+    for cn in sorted(routers.keys(), key=_natural_key):
+        r = routers[cn]
+        port = r.get("tunnel_port", 0)
+        deployed = "✅" if r.get("tunnel_deployed") else "❌"
+        if port:
+            lines.append(f"  {cn}: порт <b>{port}</b> {deployed}")
+        else:
+            lines.append(f"  {cn}: <i>не назначен</i>")
+    lines.append("")
+    # Count unassigned
+    unassigned = [cn for cn, v in routers.items() if not v.get("tunnel_port")]
+    kb = []
+    if unassigned:
+        kb.append([InlineKeyboardButton(f"⚡ Назначить всем ({len(unassigned)})", callback_data='rt_assign_all')])
+    kb.append([InlineKeyboardButton("◀️ Назад", callback_data='rt_menu')])
+    await safe_edit_text(q, context, "\n".join(lines), parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def rtunnel_assign_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Assign tunnel ports to all routers that don't have one."""
+    q = update.callback_query
+    await q.answer()
+    routers = load_routers()
+    used = {v.get("tunnel_port") for v in routers.values() if v.get("tunnel_port")}
+    assigned = 0
+    port_iter = iter(range(TUNNEL_PORT_START, TUNNEL_PORT_END + 1))
+    for cn in sorted(routers.keys(), key=_natural_key):
+        if routers[cn].get("tunnel_port"):
+            continue
+        for p in port_iter:
+            if p not in used:
+                routers[cn]["tunnel_port"] = p
+                used.add(p)
+                assigned += 1
+                break
+    if assigned:
+        save_routers(routers)
+    await safe_edit_text(q, context,
+        f"✅ Назначено портов: {assigned}",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='rt_ports')]]))
+
+
+async def rtunnel_deploy_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show router list for tunnel deployment."""
+    q = update.callback_query
+    await q.answer()
+    ts = load_tunnel_server()
+    if not ts.get("ip"):
+        await safe_edit_text(q, context, "❌ Сначала задайте IP туннельного сервера.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='rt_menu')]]))
+        return
+    if not tunnel_get_privkey():
+        await safe_edit_text(q, context, "❌ Сначала сгенерируйте SSH-ключ.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='rt_menu')]]))
+        return
+    routers = load_routers()
+    online = get_online_clients()
+    kb = []
+    for cn in sorted(routers.keys(), key=_natural_key):
+        r = routers[cn]
+        deployed = "✅" if r.get("tunnel_deployed") else ""
+        if cn in online:
+            kb.append([InlineKeyboardButton(f"🟢 {cn} {deployed}", callback_data=f'rt_deploy:{cn}')])
+        else:
+            kb.append([InlineKeyboardButton(f"🔴 {cn} (оффлайн)", callback_data='rt_deploy_select')])
+    kb.append([InlineKeyboardButton("⚡ Все онлайн", callback_data='rt_deploy_all')])
+    kb.append([InlineKeyboardButton("◀️ Назад", callback_data='rt_menu')])
+    await safe_edit_text(q, context,
+        "📤 <b>Залить туннель</b>\n\nВыберите роутер:",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def rtunnel_deploy_one(update: Update, context: ContextTypes.DEFAULT_TYPE, cn: str):
+    """Deploy tunnel to a single router."""
+    q = update.callback_query
+    await q.answer()
+
+    ts = load_tunnel_server()
+    privkey = tunnel_get_privkey()
+    if not ts.get("ip") or not privkey:
+        await safe_edit_text(q, context, "❌ Сервер или ключ не настроены.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='rt_menu')]]))
+        return
+
+    # Assign port if needed
+    port = tunnel_assign_port(cn)
+    if not port:
+        await safe_edit_text(q, context, f"❌ Нет свободных портов для {cn}.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='rt_menu')]]))
+        return
+
+    routers = load_routers()
+    r = routers.get(cn)
+    if not r:
+        await safe_edit_text(q, context, f"❌ Роутер {cn} не найден.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='rt_menu')]]))
+        return
+
+    await safe_edit_text(q, context, f"⏳ Заливаю туннель на {cn} (порт {port})...")
+
+    tunnel_ip = ts["ip"]
+    ssh_port = ts.get("ssh_port", 22)
+    ssh_user = ts.get("ssh_user", "root")
+
+    # Build tunnel.sh script
+    tunnel_sh = (
+        '#!/bin/sh\n'
+        'KEY="/etc/storage/tunnel_key"\n'
+        'CFG="/etc/storage/tunnel_cfg"\n'
+        '[ ! -f "$CFG" ] || [ ! -f "$KEY" ] && exit 0\n'
+        'while true; do\n'
+        '  . "$CFG"\n'
+        '  [ -z "$TUNNEL_SERVER" ] && { sleep 60; continue; }\n'
+        '  /usr/bin/ssh -i "$KEY" -N \\\n'
+        '    -R 0.0.0.0:${TUNNEL_PORT}:127.0.0.1:80 \\\n'
+        '    -o StrictHostKeyChecking=no \\\n'
+        '    -o ServerAliveInterval=60 \\\n'
+        '    -o ServerAliveCountMax=3 \\\n'
+        '    -o ExitOnForwardFailure=yes \\\n'
+        '    -p ${SSH_PORT:-22} ${SSH_USER:-root}@${TUNNEL_SERVER}\n'
+        '  sleep 30\n'
+        'done\n'
+    )
+
+    # Build tunnel_cfg
+    tunnel_cfg = (
+        f'TUNNEL_SERVER="{tunnel_ip}"\n'
+        f'TUNNEL_PORT="{port}"\n'
+        f'SSH_PORT="{ssh_port}"\n'
+        f'SSH_USER="{ssh_user}"\n'
+    )
+
+    # Escape private key for heredoc
+    privkey_esc = privkey.replace("'", "'\\''")
+
+    # Build deploy command
+    cmd = (
+        # Write private key
+        f"cat > /etc/storage/tunnel_key << 'KEYEOF'\n{privkey}KEYEOF\n"
+        f"chmod 600 /etc/storage/tunnel_key && "
+        # Write tunnel.sh
+        f"cat > /etc/storage/tunnel.sh << 'SHEOF'\n{tunnel_sh}SHEOF\n"
+        f"chmod +x /etc/storage/tunnel.sh && "
+        # Write config
+        f"cat > /etc/storage/tunnel_cfg << 'CFGEOF'\n{tunnel_cfg}CFGEOF\n"
+        # Add to autostart if not already there
+        "grep -q 'tunnel.sh' /etc/storage/started_script.sh 2>/dev/null || "
+        "echo 'sh /etc/storage/tunnel.sh &' >> /etc/storage/started_script.sh && "
+        # Save to flash
+        "mtd_storage.sh save && "
+        # Kill any existing tunnel and start fresh
+        "killall -q tunnel.sh 2>/dev/null; "
+        "pkill -f 'ssh.*-R.*0.0.0.0:.*:127.0.0.1:80' 2>/dev/null; "
+        "sh /etc/storage/tunnel.sh & "
+        "echo TUNNEL_DEPLOY_OK"
+    )
+
+    try:
+        is_pptp = r.get("vpn_type") == "pptp"
+        if is_pptp:
+            pptp_clients = load_pptp_clients()
+            pptp_ip = pptp_clients.get(cn)
+            if not pptp_ip:
+                await safe_edit_text(q, context, f"❌ PPTP IP не найден для {cn}",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='rt_menu')]]))
+                return
+            srv = load_pptp_server()
+            ok, out = await asyncio.to_thread(
+                ssh_exec_via_jump, srv["host"], int(srv.get("port", 22)),
+                srv.get("user", "root"), srv.get("password", ""),
+                pptp_ip, int(r.get("port", 22)),
+                r.get("user", "admin"), r.get("password", ""),
+                cmd)
+        else:
+            rip = get_router_ip(cn)
+            if not rip:
+                await safe_edit_text(q, context, f"❌ VPN IP не найден для {cn}",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='rt_menu')]]))
+                return
+            ok, out = await asyncio.to_thread(
+                ssh_exec, rip, int(r.get("port", 22)),
+                r.get("user", "admin"), r.get("password", ""), cmd)
+
+        if ok and "TUNNEL_DEPLOY_OK" in out:
+            routers[cn]["tunnel_deployed"] = True
+            save_routers(routers)
+            await safe_edit_text(q, context,
+                f"✅ Туннель залит на <b>{cn}</b>\n"
+                f"Порт: <b>{port}</b>\n"
+                f"Сервер: <code>{tunnel_ip}:{ssh_port}</code>",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='rt_deploy_select')]]))
+        else:
+            await safe_edit_text(q, context,
+                f"❌ Ошибка деплоя на {cn}:\n<pre>{escape(out[:500])}</pre>",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='rt_deploy_select')]]))
+    except Exception as e:
+        await safe_edit_text(q, context,
+            f"❌ Ошибка: {escape(str(e)[:500])}",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='rt_deploy_select')]]))
+
+
+async def rtunnel_deploy_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Deploy tunnel to all online routers."""
+    q = update.callback_query
+    await q.answer()
+
+    ts = load_tunnel_server()
+    privkey = tunnel_get_privkey()
+    if not ts.get("ip") or not privkey:
+        await safe_edit_text(q, context, "❌ Сервер или ключ не настроены.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='rt_menu')]]))
+        return
+
+    online = get_online_clients()
+    if not online:
+        await safe_edit_text(q, context, "Нет онлайн-роутеров.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='rt_menu')]]))
+        return
+
+    msg = await safe_edit_text(q, context, f"⏳ Заливаю на {len(online)} роутеров...")
+    ok_count = 0
+    fail_count = 0
+    for cn in sorted(online, key=_natural_key):
+        try:
+            # Reuse single-deploy logic inline
+            port = tunnel_assign_port(cn)
+            if not port:
+                fail_count += 1
+                continue
+            routers = load_routers()
+            r = routers.get(cn)
+            if not r:
+                fail_count += 1
+                continue
+
+            tunnel_ip = ts["ip"]
+            ssh_port_ts = ts.get("ssh_port", 22)
+            ssh_user_ts = ts.get("ssh_user", "root")
+
+            tunnel_sh = (
+                '#!/bin/sh\n'
+                'KEY="/etc/storage/tunnel_key"\n'
+                'CFG="/etc/storage/tunnel_cfg"\n'
+                '[ ! -f "$CFG" ] || [ ! -f "$KEY" ] && exit 0\n'
+                'while true; do\n'
+                '  . "$CFG"\n'
+                '  [ -z "$TUNNEL_SERVER" ] && { sleep 60; continue; }\n'
+                '  /usr/bin/ssh -i "$KEY" -N \\\n'
+                '    -R 0.0.0.0:${TUNNEL_PORT}:127.0.0.1:80 \\\n'
+                '    -o StrictHostKeyChecking=no \\\n'
+                '    -o ServerAliveInterval=60 \\\n'
+                '    -o ServerAliveCountMax=3 \\\n'
+                '    -o ExitOnForwardFailure=yes \\\n'
+                '    -p ${SSH_PORT:-22} ${SSH_USER:-root}@${TUNNEL_SERVER}\n'
+                '  sleep 30\n'
+                'done\n'
+            )
+            tunnel_cfg = (
+                f'TUNNEL_SERVER="{tunnel_ip}"\n'
+                f'TUNNEL_PORT="{port}"\n'
+                f'SSH_PORT="{ssh_port_ts}"\n'
+                f'SSH_USER="{ssh_user_ts}"\n'
+            )
+            cmd = (
+                f"cat > /etc/storage/tunnel_key << 'KEYEOF'\n{privkey}KEYEOF\n"
+                f"chmod 600 /etc/storage/tunnel_key && "
+                f"cat > /etc/storage/tunnel.sh << 'SHEOF'\n{tunnel_sh}SHEOF\n"
+                f"chmod +x /etc/storage/tunnel.sh && "
+                f"cat > /etc/storage/tunnel_cfg << 'CFGEOF'\n{tunnel_cfg}CFGEOF\n"
+                "grep -q 'tunnel.sh' /etc/storage/started_script.sh 2>/dev/null || "
+                "echo 'sh /etc/storage/tunnel.sh &' >> /etc/storage/started_script.sh && "
+                "mtd_storage.sh save && "
+                "killall -q tunnel.sh 2>/dev/null; "
+                "pkill -f 'ssh.*-R.*0.0.0.0:.*:127.0.0.1:80' 2>/dev/null; "
+                "sh /etc/storage/tunnel.sh & "
+                "echo TUNNEL_DEPLOY_OK"
+            )
+
+            is_pptp = r.get("vpn_type") == "pptp"
+            if is_pptp:
+                pptp_clients = load_pptp_clients()
+                pptp_ip = pptp_clients.get(cn)
+                if not pptp_ip:
+                    fail_count += 1
+                    continue
+                srv = load_pptp_server()
+                ok, out = await asyncio.to_thread(
+                    ssh_exec_via_jump, srv["host"], int(srv.get("port", 22)),
+                    srv.get("user", "root"), srv.get("password", ""),
+                    pptp_ip, int(r.get("port", 22)),
+                    r.get("user", "admin"), r.get("password", ""), cmd)
+            else:
+                rip = get_router_ip(cn)
+                if not rip:
+                    fail_count += 1
+                    continue
+                ok, out = await asyncio.to_thread(
+                    ssh_exec, rip, int(r.get("port", 22)),
+                    r.get("user", "admin"), r.get("password", ""), cmd)
+
+            if ok and "TUNNEL_DEPLOY_OK" in out:
+                routers = load_routers()
+                routers[cn]["tunnel_deployed"] = True
+                save_routers(routers)
+                ok_count += 1
+            else:
+                fail_count += 1
+        except Exception:
+            fail_count += 1
+
+    await safe_edit_text(q, context,
+        f"📤 Деплой завершён\n✅ Успешно: {ok_count}\n❌ Ошибки: {fail_count}",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='rt_menu')]]))
 
 
 # =====================================================================
@@ -4567,6 +5104,9 @@ async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_T
         await auto_ip_add_handler(update, context); return
     if context.user_data.get('await_aip_replace'):
         await auto_ip_replace_receive(update, context); return
+    # Reverse tunnel text inputs
+    if context.user_data.get('await_rt_ip'):
+        await rtunnel_set_ip_handler(update, context); return
     # GOST text inputs
     if context.user_data.get('await_gost_add'):
         await gost_add_handler(update, context); return
@@ -5008,6 +5548,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # --- SSH Routers ---
     elif data == 'ssh_routers':
         await ssh_menu(update, context)
+    # --- Reverse tunnel ---
+    elif data == 'rt_menu':
+        await rtunnel_menu(update, context)
+    elif data == 'rt_set_ip':
+        await rtunnel_set_ip_start(update, context)
+    elif data == 'rt_key_menu':
+        await rtunnel_key_menu(update, context)
+    elif data in ('rt_key_gen', 'rt_key_regen'):
+        await rtunnel_key_generate(update, context)
+    elif data == 'rt_ports':
+        await rtunnel_ports(update, context)
+    elif data == 'rt_assign_all':
+        await rtunnel_assign_all(update, context)
+    elif data == 'rt_deploy_select':
+        await rtunnel_deploy_select(update, context)
+    elif data.startswith('rt_deploy:'):
+        await rtunnel_deploy_one(update, context, data[len('rt_deploy:'):])
+    elif data == 'rt_deploy_all':
+        await rtunnel_deploy_all(update, context)
     elif data == 'ssh_list':
         await ssh_list_routers(update, context)
     elif data == 'ssh_add':
@@ -5836,6 +6395,7 @@ async def ssh_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("💻 Команда", callback_data='ssh_select_cmd')],
         [InlineKeyboardButton("🔑 Сменить пароль", callback_data='ssh_chpass_menu')],
         [InlineKeyboardButton("📝 Конфиг OpenVPN", callback_data='oec_menu')],
+        [InlineKeyboardButton("🔗 Обратный туннель", callback_data='rt_menu')],
         [InlineKeyboardButton("🏠 В главное меню", callback_data='home')],
     ]
     await safe_edit_text(q, context,

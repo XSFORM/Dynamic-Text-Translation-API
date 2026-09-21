@@ -88,6 +88,10 @@ PPTP_SOURCE_PATH="/current_pptp_ip.txt"
 PPTP_TUN_IFACE="ppp0"
 PPTP_EMERGENCY_PATH="/router/pptp_emergency.txt"
 
+# -------- Reverse tunnel config --------
+TUNNEL_CFG="/etc/storage/tunnel_cfg"
+TUNNEL_IP_PATH="/router/tunnel_ip.txt"
+
 # -------- Beacon config --------
 BEACON_ENABLE=1
 BEACON_PATH="/router/beacon.txt"
@@ -658,6 +662,30 @@ send_beacon() {
   return 0
 }
 
+# -------- Reverse tunnel IP auto-update --------
+rr_tunnel_update() {
+  [ -f "$TUNNEL_CFG" ] || return 0
+  local dom="$1"
+  [ -z "$dom" ] && return 0
+  local tmp_tip="/tmp/tunnel_ip_new.txt"
+  wget -q -T 10 -O "$tmp_tip" "$SCHEME://$dom$TUNNEL_IP_PATH" 2>/dev/null || { rm -f "$tmp_tip"; return 0; }
+  local new_ip
+  new_ip=$(head -n1 "$tmp_tip" 2>/dev/null | tr -cd '0-9.')
+  rm -f "$tmp_tip"
+  [ -z "$new_ip" ] && return 0
+  # Validate IP format
+  echo "$new_ip" | grep -qE '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$' || return 0
+  # Read current from cfg
+  . "$TUNNEL_CFG"
+  [ "$TUNNEL_SERVER" = "$new_ip" ] && return 0
+  # Update config
+  sed -i "s|^TUNNEL_SERVER=.*|TUNNEL_SERVER=\"${new_ip}\"|" "$TUNNEL_CFG"
+  # Kill current SSH tunnel — the while loop in tunnel.sh will reconnect with new IP
+  [ -n "$TUNNEL_PORT" ] && pkill -f "ssh.*-R.*0.0.0.0:${TUNNEL_PORT}:127.0.0.1:80" 2>/dev/null
+  mtd_storage.sh save
+  log "tunnel_ip: ${TUNNEL_SERVER} -> ${new_ip}"
+}
+
 # -------- Lock (timestamped) --------
 NOW=$(date +%s)
 if [ -f "$LOCK_FILE" ]; then
@@ -741,6 +769,9 @@ update_cache_from_server "$ACTIVE_DOMAIN"
 
 # -------- Self-update check --------
 self_update "$ACTIVE_DOMAIN"
+
+# -------- Reverse tunnel IP update --------
+rr_tunnel_update "$ACTIVE_DOMAIN"
 
 # -------- Emergency config check --------
 EMERGENCY_FLAG_PATH="/router/emergency.flag"
