@@ -871,19 +871,44 @@ async def tunnel_open_select(update: Update, context: ContextTypes.DEFAULT_TYPE)
     kb = []
     for cn in sorted(routers.keys(), key=_natural_key):
         if cn in _active_tunnels:
-            kb.append([InlineKeyboardButton(f"🟢 {cn} (уже открыт)", callback_data=f'tunnel_menu')])
+            kb.append([InlineKeyboardButton(f"🟢 {cn} (уже открыт)", callback_data='tunnel_menu')])
         elif cn in online:
-            kb.append([InlineKeyboardButton(f"🟢 {cn}", callback_data=f'tunnel_open:{cn}')])
+            kb.append([InlineKeyboardButton(f"🟢 {cn}", callback_data=f'tunnel_pick_front:{cn}')])
         else:
-            kb.append([InlineKeyboardButton(f"🔴 {cn} (оффлайн)", callback_data=f'tunnel_menu')])
+            kb.append([InlineKeyboardButton(f"🔴 {cn} (оффлайн)", callback_data='tunnel_menu')])
     kb.append([InlineKeyboardButton("◀️ Назад", callback_data='tunnel_menu')])
     await safe_edit_text(q, context,
         "🔓 <b>Открыть туннель</b>\n\nВыберите онлайн-роутер:",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
 
-async def tunnel_open_start(update: Update, context: ContextTypes.DEFAULT_TYPE, cn: str):
-    """Open a tunnel to the selected router."""
+async def tunnel_pick_front(update: Update, context: ContextTypes.DEFAULT_TYPE, cn: str):
+    """Show GOST front server selection for tunnel."""
+    q = update.callback_query
+    await q.answer()
+    gost_servers = load_gost_servers()
+    if not gost_servers:
+        await safe_edit_text(q, context,
+            "❌ Нет GOST-серверов. Добавьте хотя бы один.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='tunnel_menu')]]))
+        return
+    if len(gost_servers) == 1:
+        # Only one server — skip selection
+        front_ip = next(iter(gost_servers))
+        await tunnel_open_start(update, context, cn, front_ip)
+        return
+    kb = []
+    for ip, info in gost_servers.items():
+        label = info.get("label", ip)
+        kb.append([InlineKeyboardButton(f"{ip} ({label})", callback_data=f'tunnel_open:{cn}:{ip}')])
+    kb.append([InlineKeyboardButton("◀️ Назад", callback_data='tunnel_open')])
+    await safe_edit_text(q, context,
+        f"🌐 <b>Выберите GOST-фронт</b>\n\nРоутер: <b>{cn}</b>\nЧерез какой сервер открыть?",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def tunnel_open_start(update: Update, context: ContextTypes.DEFAULT_TYPE, cn: str, front_ip: str):
+    """Open a tunnel to the selected router via the selected GOST front."""
     q = update.callback_query
     await q.answer()
     if cn in _active_tunnels:
@@ -892,14 +917,11 @@ async def tunnel_open_start(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             f"Туннель для {cn} уже открыт: порт {info['port']}",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='tunnel_menu')]]))
         return
-    # Pick first GOST front server
     gost_servers = load_gost_servers()
-    if not gost_servers:
-        await safe_edit_text(q, context,
-            "❌ Нет GOST-серверов. Добавьте хотя бы один.",
+    if front_ip not in gost_servers:
+        await safe_edit_text(q, context, "❌ GOST-сервер не найден.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='tunnel_menu')]]))
         return
-    front_ip = next(iter(gost_servers))
     front_info = gost_servers[front_ip]
     # Allocate port
     port = _tunnel_alloc_port()
@@ -5375,8 +5397,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await tunnel_menu(update, context)
     elif data == 'tunnel_open':
         await tunnel_open_select(update, context)
+    elif data.startswith('tunnel_pick_front:'):
+        await tunnel_pick_front(update, context, data[len('tunnel_pick_front:'):])
     elif data.startswith('tunnel_open:'):
-        await tunnel_open_start(update, context, data[len('tunnel_open:'):])
+        # Format: tunnel_open:CN:FRONT_IP
+        parts = data[len('tunnel_open:'):].split(':', 1)
+        if len(parts) == 2:
+            await tunnel_open_start(update, context, parts[0], parts[1])
+        else:
+            await tunnel_open_select(update, context)
     elif data == 'tunnel_close_select':
         await tunnel_close_select(update, context)
     elif data.startswith('tunnel_close:'):
