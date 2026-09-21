@@ -655,7 +655,7 @@ TUNNEL_KEY_FILE = "/root/monitor_bot/tunnel_key"
 TUNNEL_KEY_PUB_FILE = "/root/monitor_bot/tunnel_key.pub"
 TUNNEL_IP_FILE = "/root/monitor_bot/www/router/tunnel_ip.txt"
 TUNNEL_PORT_START = 9001
-TUNNEL_PORT_END = 9048
+TUNNEL_PORT_END = 9060
 
 def load_tunnel_server() -> Dict:
     try:
