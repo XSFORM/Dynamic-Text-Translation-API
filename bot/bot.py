@@ -880,12 +880,16 @@ async def rtunnel_ports(update: Update, context: ContextTypes.DEFAULT_TYPE, show
         title = "📋 <b>Порты туннелей</b>"
         show_routers = sorted(routers.keys(), key=_natural_key)
 
+    ts = load_tunnel_server()
+    tunnel_ip = ts.get("ip", "")
     lines = [f"{title}\n✅ Залито: {len(deployed_list)} | ❌ Не залито: {len(not_deployed)} | ⚪ Без порта: {len(unassigned)}\n"]
     for cn in sorted(show_routers, key=_natural_key):
         r = routers[cn]
         port = r.get("tunnel_port", 0)
         deployed = "✅" if r.get("tunnel_deployed") else "❌"
-        if port:
+        if port and tunnel_ip:
+            lines.append(f'  {cn}: <a href="http://{tunnel_ip}:{port}">{port}</a> {deployed}')
+        elif port:
             lines.append(f"  {cn}: порт <b>{port}</b> {deployed}")
         else:
             lines.append(f"  {cn}: <i>не назначен</i>")
@@ -900,6 +904,7 @@ async def rtunnel_ports(update: Update, context: ContextTypes.DEFAULT_TYPE, show
         kb.append([InlineKeyboardButton(f"⚡ Назначить всем ({len(unassigned)})", callback_data='rt_assign_all')])
     kb.append([InlineKeyboardButton("◀️ Назад", callback_data='rt_menu')])
     await safe_edit_text(q, context, "\n".join(lines), parse_mode="HTML",
+        disable_web_page_preview=True,
         reply_markup=InlineKeyboardMarkup(kb))
 
 
