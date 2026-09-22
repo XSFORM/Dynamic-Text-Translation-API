@@ -2414,15 +2414,24 @@ def _count_clients_by_ip() -> str:
                 real_addr = parts[2]  # IP:PORT
                 real_ip = real_addr.rsplit(":", 1)[0] if ":" in real_addr else real_addr
                 ip_counts[real_ip] = ip_counts.get(real_ip, 0) + 1
+    # Add PPTP clients by their current_ip
+    routers = load_routers()
+    for cn, r in routers.items():
+        if r.get("vpn_type") == "pptp" and r.get("current_ip"):
+            cip = r["current_ip"]
+            ip_counts[cip] = ip_counts.get(cip, 0) + 1
+
     if not ip_counts:
         return ""
     total = sum(ip_counts.values())
-    # Count PPTP clients
-    pptp_count = sum(1 for r in load_routers().values() if r.get("vpn_type") == "pptp")
     sorted_ips = sorted(ip_counts.items(), key=lambda x: -x[1])
+    # Count PPTP separately for label
+    pptp_count = sum(1 for r in routers.values() if r.get("vpn_type") == "pptp")
+    pptp_with_ip = sum(1 for r in routers.values() if r.get("vpn_type") == "pptp" and r.get("current_ip"))
+    pptp_no_ip = pptp_count - pptp_with_ip
     header = f"\n📊 Клиентов по IP (всего {total}"
-    if pptp_count:
-        header += f" + {pptp_count} PPTP = {total + pptp_count}"
+    if pptp_no_ip:
+        header += f" + {pptp_no_ip} PPTP без IP"
     header += "):"
     lines_out = [header]
     for ip, cnt in sorted_ips:
@@ -3120,6 +3129,12 @@ async def _force_ip_execute(msg, targets, new_ip: str):
             if applied:
                 lines.append(f"✅ <b>{cn}</b>{vpn_tag}: {new_line}")
                 ok_count += 1
+                # Save current IP in routers.json for PPTP stats
+                if is_pptp:
+                    _r = load_routers()
+                    if cn in _r:
+                        _r[cn]["current_ip"] = new_ip
+                        save_routers(_r)
             else:
                 lines.append(f"⚠️ <b>{cn}</b>{vpn_tag}: {new_line or out[-80:]}")
         else:
@@ -8554,6 +8569,12 @@ async def auto_ip_monitor(app):
                     if auto_ip_state.get("pptp"):
                         rr_write_file(RR_PPTP_IP_FILE, new_ip + "\n")
                         changed.append("PPTP")
+                        # Update current_ip for all PPTP routers
+                        _rt = load_routers()
+                        for _cn, _rv in _rt.items():
+                            if _rv.get("vpn_type") == "pptp":
+                                _rv["current_ip"] = new_ip
+                        save_routers(_rt)
                     rr_append_history(f"AUTO: {old_ip} -> {new_ip} ({'+'.join(changed)}, blocked)")
                     auto_ip_fail_count = 0
                     replaced = True
