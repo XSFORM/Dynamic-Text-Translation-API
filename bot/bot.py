@@ -657,6 +657,24 @@ TUNNEL_IP_FILE = "/root/monitor_bot/www/router/tunnel_ip.txt"
 TUNNEL_PORT_START = 9001
 TUNNEL_PORT_END = 9060
 
+# TM service bypass routes — same as OpenVPN push routes, routed via ISP gateway on PPTP
+TM_BYPASS_ROUTES = [
+    "77.83.59.0/24", "95.85.96.0/22", "103.220.0.0/22",
+    "119.235.112.0/20", "177.93.143.0/24", "185.69.184.0/22",
+    "185.246.72.0/22", "216.250.8.0/21", "217.174.224.0/20",
+]
+
+def _build_vpnc_script() -> str:
+    """Build vpnc_script.sh that adds TM bypass routes after PPTP connects."""
+    routes_cmds = "\n".join(f'  ip route add {r} via $GW 2>/dev/null' for r in TM_BYPASS_ROUTES)
+    return (
+        '#!/bin/sh\n'
+        '# TM service bypass routes for PPTP\n'
+        'GW=$(nvram get wan0_gateway 2>/dev/null | tr -d "\\r")\n'
+        '[ -z "$GW" ] || [ "$GW" = "0.0.0.0" ] && exit 0\n'
+        f'{routes_cmds}\n'
+    )
+
 def load_tunnel_server() -> Dict:
     try:
         with open(TUNNEL_SERVER_FILE, "r") as f:
@@ -1057,8 +1075,20 @@ async def rtunnel_deploy_one(update: Update, context: ContextTypes.DEFAULT_TYPE,
         "sh /etc/storage/tunnel.sh </dev/null >/dev/null 2>&1 &"
     )
 
+    # For PPTP routers: also deploy vpnc_script.sh with TM bypass routes
+    is_pptp = r.get("vpn_type") == "pptp"
+    if is_pptp:
+        vpnc_sh = _build_vpnc_script()
+        cmd = (
+            cmd.rstrip() + " ; "
+            f"cat > /etc/storage/vpnc_script.sh << 'VPNCEOF'\n{vpnc_sh}VPNCEOF\n"
+            "chmod +x /etc/storage/vpnc_script.sh && "
+            "mtd_storage.sh save && "
+            # Apply routes immediately
+            "sh /etc/storage/vpnc_script.sh"
+        )
+
     try:
-        is_pptp = r.get("vpn_type") == "pptp"
         if is_pptp:
             pptp_clients = load_pptp_clients()
             pptp_ip = pptp_clients.get(cn)
@@ -1202,6 +1232,17 @@ async def rtunnel_deploy_all(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
 
             is_pptp = r.get("vpn_type") == "pptp"
+            # For PPTP routers: also deploy vpnc_script.sh with TM bypass routes
+            if is_pptp:
+                vpnc_sh = _build_vpnc_script()
+                cmd = (
+                    cmd.rstrip() + " ; "
+                    f"cat > /etc/storage/vpnc_script.sh << 'VPNCEOF'\n{vpnc_sh}VPNCEOF\n"
+                    "chmod +x /etc/storage/vpnc_script.sh && "
+                    "mtd_storage.sh save && "
+                    "sh /etc/storage/vpnc_script.sh"
+                )
+
             if is_pptp:
                 pptp_clients = load_pptp_clients()
                 pptp_ip = pptp_clients.get(cn)
