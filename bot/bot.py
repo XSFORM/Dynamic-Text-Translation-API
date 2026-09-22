@@ -2416,6 +2416,14 @@ def _format_status_table() -> str:
                 # Shorten: drop year, drop seconds → "09-22 16:27"
                 short_dt = dt[5:16] if len(dt) >= 16 else dt
                 rows.append((vpn_ip, name, real_ip, short_dt))
+    # Add PPTP routers
+    routers = load_routers()
+    pptp_clients = load_pptp_clients()
+    for cn, r in routers.items():
+        if r.get("vpn_type") == "pptp":
+            vpn_ip = pptp_clients.get(cn, "—")
+            real_ip = r.get("current_ip", "—")
+            rows.append((vpn_ip, cn + " [P]", real_ip, "PPTP"))
     if not rows:
         return ""
     # Sort by name
