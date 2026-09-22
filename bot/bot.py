@@ -858,7 +858,7 @@ async def rtunnel_key_generate(update: Update, context: ContextTypes.DEFAULT_TYP
             [InlineKeyboardButton("◀️ Назад", callback_data='rt_key_menu')]]))
 
 
-async def rtunnel_ports(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def rtunnel_ports(update: Update, context: ContextTypes.DEFAULT_TYPE, show_filter: str = "all"):
     """Show tunnel port assignments for all routers."""
     q = update.callback_query
     await q.answer()
@@ -867,8 +867,21 @@ async def rtunnel_ports(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit_text(q, context, "Нет роутеров.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='rt_menu')]]))
         return
-    lines = ["📋 <b>Порты туннелей</b>\n"]
-    for cn in sorted(routers.keys(), key=_natural_key):
+
+    deployed_list = [cn for cn, v in routers.items() if v.get("tunnel_deployed")]
+    not_deployed = [cn for cn, v in routers.items() if v.get("tunnel_port") and not v.get("tunnel_deployed")]
+    unassigned = [cn for cn, v in routers.items() if not v.get("tunnel_port")]
+    total = len(routers)
+
+    if show_filter == "not_deployed":
+        title = "❌ <b>Не залитые роутеры</b>"
+        show_routers = not_deployed + unassigned
+    else:
+        title = "📋 <b>Порты туннелей</b>"
+        show_routers = sorted(routers.keys(), key=_natural_key)
+
+    lines = [f"{title}\n✅ Залито: {len(deployed_list)} | ❌ Не залито: {len(not_deployed)} | ⚪ Без порта: {len(unassigned)}\n"]
+    for cn in sorted(show_routers, key=_natural_key):
         r = routers[cn]
         port = r.get("tunnel_port", 0)
         deployed = "✅" if r.get("tunnel_deployed") else "❌"
@@ -877,9 +890,12 @@ async def rtunnel_ports(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             lines.append(f"  {cn}: <i>не назначен</i>")
     lines.append("")
-    # Count unassigned
-    unassigned = [cn for cn, v in routers.items() if not v.get("tunnel_port")]
+
     kb = []
+    if show_filter == "all" and (not_deployed or unassigned):
+        kb.append([InlineKeyboardButton(f"❌ Не залитые ({len(not_deployed) + len(unassigned)})", callback_data='rt_ports_notdeployed')])
+    if show_filter == "not_deployed":
+        kb.append([InlineKeyboardButton("📋 Все роутеры", callback_data='rt_ports')])
     if unassigned:
         kb.append([InlineKeyboardButton(f"⚡ Назначить всем ({len(unassigned)})", callback_data='rt_assign_all')])
     kb.append([InlineKeyboardButton("◀️ Назад", callback_data='rt_menu')])
@@ -976,9 +992,17 @@ async def rtunnel_deploy_one(update: Update, context: ContextTypes.DEFAULT_TYPE,
     # Build tunnel.sh script
     tunnel_sh = (
         '#!/bin/sh\n'
+        'PIDFILE="/tmp/tunnel.pid"\n'
+        'if [ -f "$PIDFILE" ]; then\n'
+        '  OLDPID=$(cat "$PIDFILE" 2>/dev/null)\n'
+        '  if [ -n "$OLDPID" ] && kill -0 "$OLDPID" 2>/dev/null; then\n'
+        '    exit 0\n'
+        '  fi\n'
+        'fi\n'
+        'echo $$ > "$PIDFILE"\n'
         'KEY="/etc/storage/tunnel_key"\n'
         'CFG="/etc/storage/tunnel_cfg"\n'
-        '[ ! -f "$CFG" ] || [ ! -f "$KEY" ] && exit 0\n'
+        '[ ! -f "$CFG" ] || [ ! -f "$KEY" ] && { rm -f "$PIDFILE"; exit 0; }\n'
         'while true; do\n'
         '  . "$CFG"\n'
         '  [ -z "$TUNNEL_SERVER" ] && { sleep 60; continue; }\n'
@@ -1019,9 +1043,9 @@ async def rtunnel_deploy_one(update: Update, context: ContextTypes.DEFAULT_TYPE,
         "echo 'sh /etc/storage/tunnel.sh &' >> /etc/storage/started_script.sh && "
         # Save to flash
         "mtd_storage.sh save && "
-        # Kill any existing tunnel and start fresh
-        "killall -q tunnel.sh 2>/dev/null; "
-        "pkill -f 'ssh.*-R.*0.0.0.0:.*:127.0.0.1:80' 2>/dev/null; "
+        # Kill any existing tunnel processes by PID (BusyBox killall sees 'sh' not 'tunnel.sh')
+        "for p in $(ps | grep 'tunnel.sh' | grep -v grep | awk '{print $1}'); do kill $p 2>/dev/null; done; "
+        "for p in $(ps | grep 'ssh.*tunnel_key' | grep -v grep | awk '{print $1}'); do kill $p 2>/dev/null; done; "
         # Print OK BEFORE starting tunnel (so SSH read doesn't hang)
         "echo TUNNEL_DEPLOY_OK; "
         # Start tunnel fully detached from SSH session
@@ -1093,20 +1117,35 @@ async def rtunnel_deploy_all(update: Update, context: ContextTypes.DEFAULT_TYPE)
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='rt_menu')]]))
         return
 
-    msg = await safe_edit_text(q, context, f"⏳ Заливаю на {len(online)} роутеров...")
+    total = len(online)
+    msg = await safe_edit_text(q, context, f"⏳ Заливаю на {total} роутеров...\n0/{total} (0%)")
     ok_count = 0
     fail_count = 0
+    done = 0
+    failed_names = []
     for cn in sorted(online, key=_natural_key):
         try:
-            # Reuse single-deploy logic inline
+            # Update progress every router
+            done += 1
+            pct = done * 100 // total
+            try:
+                await safe_edit_text(q, context,
+                    f"⏳ Заливаю на {total} роутеров...\n"
+                    f"{done}/{total} ({pct}%) — <b>{cn}</b>",
+                    parse_mode="HTML")
+            except Exception:
+                pass  # Telegram rate limit — ignore
+
             port = tunnel_assign_port(cn)
             if not port:
                 fail_count += 1
+                failed_names.append(cn)
                 continue
             routers = load_routers()
             r = routers.get(cn)
             if not r:
                 fail_count += 1
+                failed_names.append(cn)
                 continue
 
             tunnel_ip = ts["ip"]
@@ -1146,8 +1185,9 @@ async def rtunnel_deploy_all(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 "grep -q 'tunnel.sh' /etc/storage/started_script.sh 2>/dev/null || "
                 "echo 'sh /etc/storage/tunnel.sh &' >> /etc/storage/started_script.sh && "
                 "mtd_storage.sh save && "
-                "killall -q tunnel.sh 2>/dev/null; "
-                "pkill -f 'ssh.*-R.*0.0.0.0:.*:127.0.0.1:80' 2>/dev/null; "
+                # Kill ALL existing tunnel.sh and ssh tunnel processes
+                "for p in $(ps | grep 'tunnel.sh' | grep -v grep | awk '{print $1}'); do kill $p 2>/dev/null; done; "
+                "for p in $(ps | grep 'ssh.*tunnel_key' | grep -v grep | awk '{print $1}'); do kill $p 2>/dev/null; done; "
                 "echo TUNNEL_DEPLOY_OK; "
                 "sh /etc/storage/tunnel.sh </dev/null >/dev/null 2>&1 &"
             )
@@ -1158,6 +1198,7 @@ async def rtunnel_deploy_all(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 pptp_ip = pptp_clients.get(cn)
                 if not pptp_ip:
                     fail_count += 1
+                    failed_names.append(cn)
                     continue
                 srv = load_pptp_server()
                 ok, out = await asyncio.to_thread(
@@ -1169,6 +1210,7 @@ async def rtunnel_deploy_all(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 rip = get_router_ip(cn)
                 if not rip:
                     fail_count += 1
+                    failed_names.append(cn)
                     continue
                 ok, out = await asyncio.to_thread(
                     ssh_exec, rip, int(r.get("port", 22)),
@@ -1181,11 +1223,15 @@ async def rtunnel_deploy_all(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 ok_count += 1
             else:
                 fail_count += 1
+                failed_names.append(cn)
         except Exception:
             fail_count += 1
+            failed_names.append(cn)
 
-    await safe_edit_text(q, context,
-        f"📤 Деплой завершён\n✅ Успешно: {ok_count}\n❌ Ошибки: {fail_count}",
+    result = f"📤 Деплой завершён\n✅ Успешно: {ok_count}\n❌ Ошибки: {fail_count}"
+    if failed_names:
+        result += f"\n\n❌ Не залились:\n" + "\n".join(f"  • {n}" for n in failed_names)
+    await safe_edit_text(q, context, result,
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='rt_menu')]]))
 
 
@@ -5561,6 +5607,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await rtunnel_key_generate(update, context)
     elif data == 'rt_ports':
         await rtunnel_ports(update, context)
+    elif data == 'rt_ports_notdeployed':
+        await rtunnel_ports(update, context, show_filter="not_deployed")
     elif data == 'rt_assign_all':
         await rtunnel_assign_all(update, context)
     elif data == 'rt_deploy_select':
