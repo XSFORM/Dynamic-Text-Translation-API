@@ -2417,8 +2417,14 @@ def _count_clients_by_ip() -> str:
     if not ip_counts:
         return ""
     total = sum(ip_counts.values())
+    # Count PPTP clients
+    pptp_count = sum(1 for r in load_routers().values() if r.get("vpn_type") == "pptp")
     sorted_ips = sorted(ip_counts.items(), key=lambda x: -x[1])
-    lines_out = [f"\n📊 Клиентов по IP (всего {total}):"]
+    header = f"\n📊 Клиентов по IP (всего {total}"
+    if pptp_count:
+        header += f" + {pptp_count} PPTP = {total + pptp_count}"
+    header += "):"
+    lines_out = [header]
     for ip, cnt in sorted_ips:
         lines_out.append(f"  {ip} — {cnt}")
     return "\n".join(lines_out)
