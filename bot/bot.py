@@ -1112,6 +1112,10 @@ async def rtunnel_deploy_all(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     online = get_online_clients()
+    # Also include PPTP routers — they are not in OpenVPN status.log
+    routers_all = load_routers()
+    pptp_names = {cn for cn, v in routers_all.items() if v.get("vpn_type") == "pptp"}
+    online = online | pptp_names
     if not online:
         await safe_edit_text(q, context, "Нет онлайн-роутеров.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='rt_menu')]]))
