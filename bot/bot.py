@@ -4118,7 +4118,8 @@ async def pptp_clients_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = [
         [InlineKeyboardButton("➕ Добавить", callback_data='pptp_cl_add'),
          InlineKeyboardButton("➕ Все роутеры", callback_data='pptp_cl_bulk')],
-        [InlineKeyboardButton("🗑 Удалить", callback_data='pptp_cl_del')],
+        [InlineKeyboardButton("🗑 Удалить", callback_data='pptp_cl_del'),
+         InlineKeyboardButton("🔄 Синхр.", callback_data='pptp_cl_sync')],
         [InlineKeyboardButton("🔗 PPTP", callback_data='pptp_menu')],
     ]
     await safe_edit_text(q, context,
@@ -4213,6 +4214,42 @@ async def pptp_cl_bulk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = [[InlineKeyboardButton("👥 Клиенты", callback_data='pptp_clients')]]
     await safe_edit_text(q, context,
         f"✅ Добавлено <b>{len(added)}</b> клиентов в chap-secrets.",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+async def pptp_cl_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Re-write chap-secrets on PPTP server from local pptp_clients list."""
+    q = update.callback_query
+    await q.answer()
+    clients = load_pptp_clients()
+    if not clients:
+        await safe_edit_text(q, context, "Список клиентов пуст.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀ Назад", callback_data='pptp_clients')]]))
+        return
+    srv = load_pptp_server()
+    if not srv.get("host"):
+        await safe_edit_text(q, context, "❌ PPTP сервер не настроен.")
+        return
+    vpn_pass = srv.get("vpn_password", "pass123")
+    # Build full chap-secrets content
+    lines = [f"{cn} pptpd {vpn_pass} {ip}" for cn, ip in
+             sorted(clients.items(), key=lambda x: x[1])]
+    content = "\\n".join(lines)
+    # Overwrite chap-secrets (keep header comment)
+    cmd = (
+        f'echo "# Secrets for authentication using CHAP" > /etc/ppp/chap-secrets && '
+        f'printf "{content}\\n" >> /etc/ppp/chap-secrets'
+    )
+    ok, out = pptp_ssh_exec(cmd)
+    if not ok:
+        await safe_edit_text(q, context, f"❌ Ошибка SSH: {out}",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀ Назад", callback_data='pptp_clients')]]))
+        return
+    rr_append_history(f"PPTP_SYNC: {len(clients)} clients to chap-secrets")
+    kb = [[InlineKeyboardButton("👥 Клиенты", callback_data='pptp_clients')]]
+    await safe_edit_text(q, context,
+        f"✅ Синхронизировано <b>{len(clients)}</b> клиентов в chap-secrets на сервере.",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
 async def pptp_cl_del_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6167,6 +6204,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await pptp_cl_bulk(update, context)
     elif data == 'pptp_cl_del':
         await pptp_cl_del_start(update, context)
+    elif data == 'pptp_cl_sync':
+        await pptp_cl_sync(update, context)
     elif data.startswith('pptp_cl_rm:'):
         await pptp_cl_remove(update, context, data[len('pptp_cl_rm:'):])
     elif data == 'vpn_switch':
