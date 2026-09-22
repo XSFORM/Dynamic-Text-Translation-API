@@ -2389,6 +2389,46 @@ def get_status_log_tail(n=40):
     except Exception as e:
         return f"Ошибка чтения status.log: {e}"
 
+def _format_status_table() -> str:
+    """Parse status.log routing table and format into aligned columns."""
+    try:
+        with open(STATUS_LOG, "r") as f:
+            lines = f.readlines()
+    except Exception:
+        return ""
+    rows = []
+    in_routing = False
+    for line in lines:
+        line = line.strip()
+        if line.startswith("ROUTING TABLE"):
+            in_routing = True
+            continue
+        if line.startswith("GLOBAL STATS"):
+            break
+        if in_routing and "," in line and not line.startswith("Virtual"):
+            parts = line.split(",")
+            if len(parts) >= 4:
+                vpn_ip = parts[0]          # 10.9.0.20
+                name = parts[1]            # gowher-10
+                real_addr = parts[2]       # 15.175.114.180:53020
+                real_ip = real_addr.rsplit(":", 1)[0] if ":" in real_addr else real_addr
+                dt = parts[3].strip()      # 2026-09-22 16:27:48
+                # Shorten: drop year, drop seconds → "09-22 16:27"
+                short_dt = dt[5:16] if len(dt) >= 16 else dt
+                rows.append((vpn_ip, name, real_ip, short_dt))
+    if not rows:
+        return ""
+    # Sort by name
+    rows.sort(key=lambda r: _natural_key(r[1]))
+    # Column widths
+    W_IP = 12
+    W_NAME = max(len(r[1]) for r in rows) + 1
+    W_REAL = 16
+    out = []
+    for vpn_ip, name, real_ip, dt in rows:
+        out.append(f"{vpn_ip:<{W_IP}}{name:<{W_NAME}}{real_ip:<{W_REAL}}{dt}")
+    return "\n".join(out)
+
 def _html_escape(s: str) -> str:
     return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
@@ -2440,11 +2480,16 @@ def _count_clients_by_ip() -> str:
 
 async def log_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
-    log_text = get_status_log_tail()
+    table = _format_status_table()
     ip_summary = _count_clients_by_ip()
-    safe = _html_escape(log_text)
-    safe_summary = _html_escape(ip_summary)
-    msgs = split_message(f"<b>status.log (хвост):</b>\n<pre>{safe}</pre>\n<b>{safe_summary}</b>")
+    if table:
+        safe = _html_escape(table)
+        text = f"<b>status.log:</b>\n<pre>{safe}</pre>\n{_html_escape(ip_summary)}"
+    else:
+        log_text = get_status_log_tail()
+        safe = _html_escape(log_text)
+        text = f"<b>status.log (хвост):</b>\n<pre>{safe}</pre>\n{_html_escape(ip_summary)}"
+    msgs = split_message(text)
     await safe_edit_text(q, context, msgs[0], parse_mode="HTML")
     for m in msgs[1:]:
         await context.bot.send_message(chat_id=q.message.chat_id, text=m, parse_mode="HTML")
