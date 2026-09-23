@@ -4053,7 +4053,8 @@ async def pptp_server_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     port = srv.get("port", 22)
     vpn_pass = srv.get("vpn_password", "(не задан)")
     kb = [
-        [InlineKeyboardButton("✏️ Настроить", callback_data='pptp_srv_setup')],
+        [InlineKeyboardButton("✏️ Настроить", callback_data='pptp_srv_setup'),
+         InlineKeyboardButton("📦 Установить", callback_data='pptp_install')],
         [InlineKeyboardButton("🔗 PPTP", callback_data='pptp_menu')],
     ]
     await safe_edit_text(q, context,
@@ -4100,6 +4101,220 @@ async def pptp_srv_setup_receive(update: Update, context: ContextTypes.DEFAULT_T
         f"✅ PPTP сервер сохранён:\n"
         f"<code>{srv['user']}@{srv['host']}:{srv['port']}</code>\n\n{status}",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+# =====================================================================
+#  PPTP INSTALLER (non-interactive, via SSH)
+# =====================================================================
+
+def _build_pptp_install_script(vpn_password: str) -> str:
+    """Build a non-interactive PPTP server install script."""
+    return r'''#!/bin/bash
+set -e
+
+echo "=== PPTP Server Installer (non-interactive) ==="
+
+# 1. Install packages
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get -y -qq install ppp pptpd cron iptables procps net-tools
+
+# 2. Sysctl — enable forwarding
+for key in \
+    "net.ipv4.ip_forward=1" \
+    "net.ipv4.conf.all.accept_redirects=0" \
+    "net.ipv4.conf.all.send_redirects=0" \
+    "net.ipv4.conf.default.rp_filter=0" \
+    "net.ipv4.conf.default.accept_source_route=0" \
+    "net.ipv4.conf.default.send_redirects=0" \
+    "net.ipv4.icmp_ignore_bogus_error_responses=1"; do
+    param="${key%%=*}"
+    sed -i -e "/$param/d" /etc/sysctl.conf
+    echo "$key" >> /etc/sysctl.conf
+done
+sysctl -p 2>/dev/null || true
+
+# 3. PPP options
+cat > /etc/ppp/options.pptp << 'PPTPOPT'
+name pptpd
+refuse-eap
+refuse-pap
+refuse-chap
+refuse-mschap
+require-mschap-v2
+require-mppe
+require-mppe-128
+auth
+proxyarp
+lock
+nobsdcomp
+novj
+novjccomp
+nolog
+nologfd
+lcp-echo-interval 30
+lcp-echo-failure 5
+mtu 1200
+mru 1200
+ms-dns 8.8.8.8
+ms-dns 8.8.4.4
+PPTPOPT
+
+# 4. pptpd.conf
+cat > /etc/pptpd.conf << 'PPTPDCONF'
+option      /etc/ppp/options.pptp
+localip     172.16.0.1
+remoteip    172.16.0.10-254
+PPTPDCONF
+
+# 5. Empty chap-secrets (bot will sync clients)
+echo "# Secrets for authentication using CHAP" > /etc/ppp/chap-secrets
+
+# 6. Iptables — auto-detect interface
+GATE=$(ip route | grep '^default' | awk '{print $5}' | head -1)
+if [ -z "$GATE" ]; then
+    echo "ERROR: cannot detect default gateway interface"
+    exit 1
+fi
+echo "Detected interface: $GATE"
+
+# MASQUERADE for VPN subnet
+iptables -t nat -C POSTROUTING -s 172.16.0.0/24 -o $GATE -j MASQUERADE 2>/dev/null || \
+    iptables -t nat -A POSTROUTING -s 172.16.0.0/24 -o $GATE -j MASQUERADE -m comment --comment "PPTP"
+
+# Forwarding
+iptables -C FORWARD -j ACCEPT -m comment --comment "PPTP" 2>/dev/null || \
+    iptables -A FORWARD -j ACCEPT -m comment --comment "PPTP"
+
+# MSS clamping
+iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu -m comment --comment "PPTP" 2>/dev/null || \
+    iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu -m comment --comment "PPTP"
+
+# PPP interfaces
+iptables -C INPUT -i ppp+ -j ACCEPT -m comment --comment "PPTP" 2>/dev/null || \
+    iptables -A INPUT -i ppp+ -j ACCEPT -m comment --comment "PPTP"
+iptables -C OUTPUT -o ppp+ -j ACCEPT -m comment --comment "PPTP" 2>/dev/null || \
+    iptables -A OUTPUT -o ppp+ -j ACCEPT -m comment --comment "PPTP"
+
+# PPTP port
+iptables -C INPUT -p tcp --dport 1723 -j ACCEPT -m comment --comment "PPTP" 2>/dev/null || \
+    iptables -A INPUT -p tcp --dport 1723 -j ACCEPT -m comment --comment "PPTP"
+iptables -C OUTPUT -p tcp --sport 1723 -j ACCEPT -m comment --comment "PPTP" 2>/dev/null || \
+    iptables -A OUTPUT -p tcp --sport 1723 -j ACCEPT -m comment --comment "PPTP"
+
+# GRE
+iptables -C INPUT -p gre -j ACCEPT -m comment --comment "PPTP" 2>/dev/null || \
+    iptables -A INPUT -p gre -j ACCEPT -m comment --comment "PPTP"
+iptables -C OUTPUT -p gre -j ACCEPT -m comment --comment "PPTP" 2>/dev/null || \
+    iptables -A OUTPUT -p gre -j ACCEPT -m comment --comment "PPTP"
+
+# Save iptables for reboot
+iptables-save > /etc/iptables.rules
+
+# 7. Cron — restore iptables + check pptpd
+cat > /etc/ppp/checkserver.sh << 'CHKSRV'
+#!/bin/bash
+pgrep pptpd >/dev/null || systemctl restart pptpd
+CHKSRV
+chmod +x /etc/ppp/checkserver.sh
+
+RESTOREPATH=$(which iptables-restore)
+(crontab -l 2>/dev/null; echo "@reboot $RESTOREPATH < /etc/iptables.rules >/dev/null 2>&1") | sort -u | crontab -
+(crontab -l 2>/dev/null; echo "*/5 * * * * /etc/ppp/checkserver.sh >/dev/null 2>&1") | sort -u | crontab -
+
+# 8. Start
+systemctl enable pptpd 2>/dev/null || true
+systemctl restart pptpd
+
+echo "=== PPTP INSTALL OK ==="
+'''
+
+
+async def pptp_install_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show confirmation before installing PPTP on server."""
+    q = update.callback_query
+    await q.answer()
+    srv = load_pptp_server()
+    if not srv.get("host"):
+        await safe_edit_text(q, context,
+            "❌ Сначала настройте сервер через ✏️ Настроить.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⚙️ Сервер PPTP", callback_data='pptp_server')]]))
+        return
+    host = srv.get("host")
+    kb = [
+        [InlineKeyboardButton("✅ Да, установить", callback_data='pptp_install_go')],
+        [InlineKeyboardButton("◀ Назад", callback_data='pptp_server')],
+    ]
+    await safe_edit_text(q, context,
+        f"📦 <b>Установка PPTP сервера</b>\n\n"
+        f"Сервер: <code>{host}</code>\n\n"
+        f"Будет установлено:\n"
+        f"• pptpd + ppp\n"
+        f"• iptables (NAT, GRE, forwarding)\n"
+        f"• sysctl (ip_forward)\n"
+        f"• cron (автозапуск)\n"
+        f"• подсеть 172.16.0.0/24\n\n"
+        f"После установки клиенты будут синхронизированы автоматически.\n\n"
+        f"⚠️ Убедитесь что сервер <b>чистый</b> (Ubuntu/Debian).",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def pptp_install_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Run non-interactive PPTP install on the configured server."""
+    q = update.callback_query
+    await q.answer()
+    srv = load_pptp_server()
+    if not srv.get("host"):
+        await safe_edit_text(q, context, "❌ PPTP сервер не настроен.")
+        return
+
+    await safe_edit_text(q, context,
+        "⏳ <b>Установка PPTP...</b>\nЭто может занять 1-2 минуты.",
+        parse_mode="HTML")
+
+    vpn_pass = srv.get("vpn_password", "pass123")
+    script = _build_pptp_install_script(vpn_pass)
+
+    # Upload and run the script
+    ok, out = pptp_ssh_exec(
+        f"cat > /tmp/pptp_install.sh << 'INSTEOF'\n{script}INSTEOF\n"
+        f"chmod +x /tmp/pptp_install.sh && bash /tmp/pptp_install.sh 2>&1; "
+        f"rm -f /tmp/pptp_install.sh"
+    )
+
+    if ok and "PPTP INSTALL OK" in (out or ""):
+        # Auto-sync clients if any exist
+        clients = load_pptp_clients()
+        sync_msg = ""
+        if clients:
+            lines = [f"{cn} pptpd {vpn_pass} {ip}" for cn, ip in
+                     sorted(clients.items(), key=lambda x: x[1])]
+            content = "\\n".join(lines)
+            cmd = (
+                f'echo "# Secrets for authentication using CHAP" > /etc/ppp/chap-secrets && '
+                f'printf "{content}\\n" >> /etc/ppp/chap-secrets'
+            )
+            s_ok, _ = pptp_ssh_exec(cmd)
+            if s_ok:
+                sync_msg = f"\n🔄 Синхронизировано {len(clients)} клиентов."
+            else:
+                sync_msg = "\n⚠️ Не удалось синхронизировать клиентов."
+
+        rr_append_history(f"PPTP_INSTALL: {srv['host']}")
+        kb = [[InlineKeyboardButton("⚙️ Сервер PPTP", callback_data='pptp_server')]]
+        # Show last 15 lines of output
+        tail = "\n".join((out or "").strip().split("\n")[-15:])
+        await safe_edit_text(q, context,
+            f"✅ <b>PPTP установлен!</b>\n\n"
+            f"<pre>{_html_escape(tail)}</pre>{sync_msg}",
+            parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+    else:
+        kb = [[InlineKeyboardButton("⚙️ Сервер PPTP", callback_data='pptp_server')]]
+        tail = "\n".join((out or "no output").strip().split("\n")[-20:])
+        await safe_edit_text(q, context,
+            f"❌ <b>Ошибка установки</b>\n\n<pre>{_html_escape(tail)}</pre>",
+            parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
 
 # =====================================================================
 #  PPTP CLIENTS (chap-secrets management)
@@ -6194,6 +6409,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await pptp_server_menu(update, context)
     elif data == 'pptp_srv_setup':
         await pptp_srv_setup_start(update, context)
+    elif data == 'pptp_install':
+        await pptp_install_confirm(update, context)
+    elif data == 'pptp_install_go':
+        await pptp_install_run(update, context)
     elif data == 'pptp_clients':
         await pptp_clients_menu(update, context)
     elif data == 'pptp_cl_add':
