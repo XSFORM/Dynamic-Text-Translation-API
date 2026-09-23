@@ -421,7 +421,7 @@ def get_router_ip(cn: str) -> Optional[str]:
     return tunnel_ips.get(cn)
 
 def get_online_clients() -> set:
-    """Get set of currently connected client CNs from status.log."""
+    """Get set of currently connected client CNs from status.log + PPTP routers."""
     online = set()
     try:
         with open(STATUS_LOG, "r") as f:
@@ -438,6 +438,14 @@ def get_online_clients() -> set:
                     if len(parts) >= 2:
                         online.add(parts[1])
     except FileNotFoundError:
+        pass
+    # PPTP routers are not in OpenVPN status.log — treat them as always online
+    try:
+        routers = load_routers()
+        for cn, r in routers.items():
+            if r.get("vpn_type") == "pptp":
+                online.add(cn)
+    except Exception:
         pass
     return online
 
@@ -601,6 +609,40 @@ def ssh_exec_via_jump(jump_ip: str, jump_port: int, jump_user: str, jump_pass: s
         return False, f"Ошибка: {e}"
     finally:
         jump_client.close()
+
+
+def router_ssh_exec(cn: str, command: str) -> Tuple[bool, str]:
+    """Universal SSH to router — auto-detect PPTP (jump host) vs OpenVPN (direct).
+
+    For PPTP routers: SSH via PPTP server as jump host → 172.16.0.x
+    For OpenVPN routers: direct SSH to VPN IP from status.log/ipp.txt
+    """
+    routers = load_routers()
+    r = routers.get(cn)
+    if not r:
+        return False, f"Роутер {cn} не найден"
+    is_pptp = r.get("vpn_type") == "pptp"
+    if is_pptp:
+        pptp_clients = load_pptp_clients()
+        pptp_ip = pptp_clients.get(cn)
+        if not pptp_ip:
+            return False, "Нет PPTP IP"
+        srv = load_pptp_server()
+        if not srv.get("host"):
+            return False, "PPTP сервер не настроен"
+        return ssh_exec_via_jump(
+            srv["host"], int(srv.get("port", 22)),
+            srv.get("user", "root"), srv.get("password", ""),
+            pptp_ip, int(r.get("port", 22)),
+            r.get("user", "admin"), r.get("password", ""),
+            command)
+    else:
+        ip = get_router_ip(cn)
+        if not ip:
+            return False, "Нет VPN IP"
+        return ssh_exec(ip, int(r.get("port", 22)),
+                        r.get("user", "admin"), r.get("password", ""),
+                        command)
 
 
 def ssh_exec_key(ip: str, port: int, user: str, key_path: str, command: str,
@@ -1089,29 +1131,7 @@ async def rtunnel_deploy_one(update: Update, context: ContextTypes.DEFAULT_TYPE,
         )
 
     try:
-        if is_pptp:
-            pptp_clients = load_pptp_clients()
-            pptp_ip = pptp_clients.get(cn)
-            if not pptp_ip:
-                await safe_edit_text(q, context, f"❌ PPTP IP не найден для {cn}",
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='rt_menu')]]))
-                return
-            srv = load_pptp_server()
-            ok, out = await asyncio.to_thread(
-                ssh_exec_via_jump, srv["host"], int(srv.get("port", 22)),
-                srv.get("user", "root"), srv.get("password", ""),
-                pptp_ip, int(r.get("port", 22)),
-                r.get("user", "admin"), r.get("password", ""),
-                cmd)
-        else:
-            rip = get_router_ip(cn)
-            if not rip:
-                await safe_edit_text(q, context, f"❌ VPN IP не найден для {cn}",
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='rt_menu')]]))
-                return
-            ok, out = await asyncio.to_thread(
-                ssh_exec, rip, int(r.get("port", 22)),
-                r.get("user", "admin"), r.get("password", ""), cmd)
+        ok, out = await asyncio.to_thread(router_ssh_exec, cn, cmd)
 
         if ok and "TUNNEL_DEPLOY_OK" in out:
             routers[cn]["tunnel_deployed"] = True
@@ -1243,28 +1263,7 @@ async def rtunnel_deploy_all(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     "sh /etc/storage/vpnc_script.sh"
                 )
 
-            if is_pptp:
-                pptp_clients = load_pptp_clients()
-                pptp_ip = pptp_clients.get(cn)
-                if not pptp_ip:
-                    fail_count += 1
-                    failed_names.append(cn)
-                    continue
-                srv = load_pptp_server()
-                ok, out = await asyncio.to_thread(
-                    ssh_exec_via_jump, srv["host"], int(srv.get("port", 22)),
-                    srv.get("user", "root"), srv.get("password", ""),
-                    pptp_ip, int(r.get("port", 22)),
-                    r.get("user", "admin"), r.get("password", ""), cmd)
-            else:
-                rip = get_router_ip(cn)
-                if not rip:
-                    fail_count += 1
-                    failed_names.append(cn)
-                    continue
-                ok, out = await asyncio.to_thread(
-                    ssh_exec, rip, int(r.get("port", 22)),
-                    r.get("user", "admin"), r.get("password", ""), cmd)
+            ok, out = await asyncio.to_thread(router_ssh_exec, cn, cmd)
 
             if ok and "TUNNEL_DEPLOY_OK" in out:
                 routers = load_routers()
@@ -3083,8 +3082,6 @@ async def force_ip_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE, cn
 async def _force_ip_execute(msg, targets, new_ip: str):
     """SSH to routers, change IP for both OpenVPN and PPTP routers."""
     routers = load_routers()
-    pptp_clients = load_pptp_clients()
-    srv = load_pptp_server()
     total = len(targets)
     results = []
     done = 0
@@ -3112,21 +3109,7 @@ async def _force_ip_execute(msg, targets, new_ip: str):
                 f'sleep 1 ; /sbin/restart_vpn_client ; '
                 f'echo "===DONE==="'
             )
-            # PPTP routers are on 172.16.0.x — SSH via jump host
-            pptp_ip = pptp_clients.get(cn)
-            if pptp_ip and srv.get("host"):
-                ok, out = await asyncio.to_thread(
-                    ssh_exec_via_jump,
-                    srv["host"], int(srv.get("port", 22)),
-                    srv.get("user", "root"), srv.get("password", ""),
-                    pptp_ip, r.get('port', 22),
-                    r.get('user', 'admin'), r.get('password', ''),
-                    cmd)
-            else:
-                # Fallback: try direct SSH (might work if router has dual connectivity)
-                ok, out = await asyncio.to_thread(
-                    ssh_exec, ip, r.get('port', 22),
-                    r.get('user', 'admin'), r.get('password', ''), cmd)
+            ok, out = await asyncio.to_thread(router_ssh_exec, cn, cmd)
         else:
             # OpenVPN: sed the remote line in client.conf, restart
             cmd = (
@@ -3148,9 +3131,7 @@ async def _force_ip_execute(msg, targets, new_ip: str):
                 f'/sbin/restart_vpn_client ; '
                 f'echo "===DONE==="'
             )
-            ok, out = await asyncio.to_thread(
-                ssh_exec, ip, r.get('port', 22),
-                r.get('user', 'admin'), r.get('password', ''), cmd)
+            ok, out = await asyncio.to_thread(router_ssh_exec, cn, cmd)
         results.append((cn, ok, out, is_pptp))
         done += 1
         now_t = time.time()
@@ -3303,15 +3284,13 @@ async def check_router_ports(update: Update, context: ContextTypes.DEFAULT_TYPE)
     total = len(routers)
     for cn in sorted(routers.keys(), key=_natural_key):
         r = routers[cn]
-        ip = get_router_ip(cn)
-        if not ip:
-            results.append((cn, False, None, cn not in online))
+        if cn not in online:
+            results.append((cn, False, None, True))
             done += 1
             continue
-        ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'),
-                           r.get('password', ''), 'nvram get vpnc_ov_port')
+        ok, out = router_ssh_exec(cn, 'nvram get vpnc_ov_port')
         port_val = out.strip() if ok else None
-        results.append((cn, ok, port_val, cn not in online))
+        results.append((cn, ok, port_val, False))
         done += 1
         now_t = time.time()
         if total > 5 and (done % 5 == 0 or done == total) and now_t - last_edit >= 2:
@@ -3775,28 +3754,13 @@ async def canary_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #  HMAC KEY DEPLOY
 # =====================================================================
 
-def _hmac_deploy_one(cn, key_hex, routers, srv, pptp_clients):
+def _hmac_deploy_one(cn, key_hex):
     """Synchronous: deploy HMAC key to one router. Returns (cn, result_str)."""
-    r = routers.get(cn, {})
-    ip = get_router_ip(cn)
-    if not ip:
-        return cn, f"⚠️ {cn}: нет IP"
     cmd = (f'printf "%s\\n" "{key_hex}" > /etc/storage/rr_key ; '
            f'chmod 600 /etc/storage/rr_key ; '
            f'[ -f /etc/storage/rr_key ] && echo "KEY_OK" || echo "KEY_FAIL"')
-    if r.get("vpn_type") == "pptp":
-        pptp_ip = pptp_clients.get(cn)
-        if not pptp_ip:
-            return cn, f"⚠️ {cn}: нет PPTP IP для jump"
-        ok, out = ssh_exec_via_jump(
-            srv.get("host", ""), int(srv.get("port", 22)),
-            srv.get("user", "root"), srv.get("password", ""),
-            pptp_ip, r.get('port', 22), r.get('user', 'admin'),
-            r.get('password', ''), cmd)
-    else:
-        ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'),
-                           r.get('password', ''), cmd)
-    if "KEY_OK" in out:
+    ok, out = router_ssh_exec(cn, cmd)
+    if ok and "KEY_OK" in out:
         return cn, f"✅ {cn}"
     return cn, f"❌ {cn}: {out[:60]}"
 
@@ -3809,8 +3773,6 @@ async def hmac_key_deploy(update: Update, context: ContextTypes.DEFAULT_TYPE,
         await q.answer()
     key_hex = rr_get_hmac_key().hex()
     routers = load_routers()
-    srv = load_pptp_server()
-    pptp_clients = load_pptp_clients()
     if targets == '__all__':
         cns = sorted(routers.keys(), key=_natural_key)
     else:
@@ -3830,7 +3792,7 @@ async def hmac_key_deploy(update: Update, context: ContextTypes.DEFAULT_TYPE,
             except Exception:
                 pass
         _cn, result = await loop.run_in_executor(
-            None, _hmac_deploy_one, cn, key_hex, routers, srv, pptp_clients)
+            None, _hmac_deploy_one, cn, key_hex)
         results.append(result)
     report = "\n".join(results)
     total = len(cns)
@@ -3845,28 +3807,13 @@ async def hmac_key_deploy(update: Update, context: ContextTypes.DEFAULT_TYPE,
     else:
         await update.message.reply_text(text, parse_mode="HTML")
 
-def _hmac_check_one(cn, routers, srv, pptp_clients):
+def _hmac_check_one(cn):
     """Synchronous: check one router for HMAC key. Returns (cn, 'has'|'no'|'err')."""
-    r = routers.get(cn, {})
-    ip = get_router_ip(cn)
-    if not ip:
-        return cn, "err"
     cmd = '[ -s /etc/storage/rr_key ] && echo "HAS_KEY" || echo "NO_KEY"'
-    if r.get("vpn_type") == "pptp":
-        pptp_ip = pptp_clients.get(cn)
-        if not pptp_ip:
-            return cn, "err"
-        ok, out = ssh_exec_via_jump(
-            srv.get("host", ""), int(srv.get("port", 22)),
-            srv.get("user", "root"), srv.get("password", ""),
-            pptp_ip, r.get('port', 22), r.get('user', 'admin'),
-            r.get('password', ''), cmd)
-    else:
-        ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'),
-                           r.get('password', ''), cmd)
-    if "HAS_KEY" in out:
+    ok, out = router_ssh_exec(cn, cmd)
+    if ok and "HAS_KEY" in out:
         return cn, "has"
-    elif "NO_KEY" in out:
+    elif ok and "NO_KEY" in out:
         return cn, "no"
     return cn, "err"
 
@@ -3877,8 +3824,6 @@ async def hmac_key_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     await safe_edit_text(q, context, "🔍 Проверяю ключи...")
     routers = load_routers()
-    srv = load_pptp_server()
-    pptp_clients = load_pptp_clients()
     has_key = []
     no_key = []
     errors = []
@@ -3897,7 +3842,7 @@ async def hmac_key_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
         _cn, status = await loop.run_in_executor(
-            None, _hmac_check_one, cn, routers, srv, pptp_clients)
+            None, _hmac_check_one, cn)
         if status == "has":
             has_key.append(cn)
         elif status == "no":
@@ -4153,8 +4098,8 @@ nolog
 nologfd
 lcp-echo-interval 30
 lcp-echo-failure 5
-mtu 1200
-mru 1200
+mtu 1400
+mru 1400
 ms-dns 8.8.8.8
 ms-dns 8.8.4.4
 PPTPOPT
@@ -4611,21 +4556,7 @@ async def vpn_switch_exec(update: Update, context: ContextTypes.DEFAULT_TYPE,
                    f'chmod +x /etc/openvpn/client/ovpnc.script ; '
                    f'sleep 1 ; /sbin/restart_vpn_client')
 
-        cur_type = routers[c].get("vpn_type", "openvpn")
-        if cur_type == "pptp" and target_type == "openvpn":
-            # Router is on PPTP network (172.16.0.x) — SSH via PPTP server as jump host
-            pptp_ip = clients.get(c)
-            if not pptp_ip:
-                results.append(f"🔴 {c}: нет PPTP IP для jump")
-                continue
-            ok, out = ssh_exec_via_jump(
-                srv.get("host", ""), int(srv.get("port", 22)),
-                srv.get("user", "root"), srv.get("password", ""),
-                pptp_ip, r.get('port', 22), r.get('user', 'admin'), r.get('password', ''),
-                cmd)
-        else:
-            ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'),
-                               r.get('password', ''), cmd)
+        ok, out = router_ssh_exec(c, cmd)
         # Update vpn_type in routers.json
         if target_type == "pptp":
             routers[c]["vpn_type"] = "pptp"
@@ -4806,8 +4737,7 @@ async def emg_apply_one(update: Update, context: ContextTypes.DEFAULT_TYPE, cn: 
         f'nvram commit 2>/dev/null ; '
         f'sleep 1 && /sbin/restart_vpn_client && echo EMG_OK'
     )
-    ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'),
-                       r.get('password', ''), cmd)
+    ok, out = router_ssh_exec(cn, cmd)
     # Update vpn_type
     routers[cn].pop("vpn_type", None)  # back to openvpn
     save_routers(routers)
@@ -4922,18 +4852,14 @@ async def rr_push_domains(update: Update, context: ContextTypes.DEFAULT_TYPE):
     old_domains_text = "—"
     for cn in online:
         if cn in routers:
-            ip = get_router_ip(cn)
-            if ip:
-                r = routers[cn]
-                ok, out = await asyncio.to_thread(
-                    ssh_exec, ip, r.get('port', 22),
-                    r.get('user', 'admin'), r.get('password', ''),
-                    'cat /etc/storage/remote_domains.list 2>/dev/null || echo "(файл не найден)"')
-                if ok and out.strip():
-                    old_lines = [l.strip() for l in out.strip().splitlines() if l.strip()]
-                    old_domains_text = "\n".join(f"  {i+1}. {d}" for i, d in enumerate(old_lines))
-                    context.user_data['push_dom_old'] = old_lines
-                break
+            ok, out = await asyncio.to_thread(
+                router_ssh_exec, cn,
+                'cat /etc/storage/remote_domains.list 2>/dev/null || echo "(файл не найден)"')
+            if ok and out.strip():
+                old_lines = [l.strip() for l in out.strip().splitlines() if l.strip()]
+                old_domains_text = "\n".join(f"  {i+1}. {d}" for i, d in enumerate(old_lines))
+                context.user_data['push_dom_old'] = old_lines
+            break
     new_text = "\n".join(f"  {i+1}. {d}" for i, d in enumerate(new_domains))
     context.user_data['push_dom_new'] = new_domains
     context.user_data['push_dom_selected'] = set()
@@ -5021,14 +4947,7 @@ async def _rr_push_dom_exec(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             results.append(f"❌ <b>{cn}</b> — оффлайн")
             done += 1
             continue
-        ip = get_router_ip(cn)
-        if not ip:
-            results.append(f"❌ <b>{cn}</b> — нет IP")
-            done += 1
-            continue
-        ok, out = await asyncio.to_thread(
-            ssh_exec, ip, r.get('port', 22),
-            r.get('user', 'admin'), r.get('password', ''), cmd)
+        ok, out = await asyncio.to_thread(router_ssh_exec, cn, cmd)
         if ok and 'DOMUPD_OK' in out:
             results.append(f"✅ <b>{cn}</b>")
             ok_count += 1
@@ -5133,12 +5052,8 @@ async def _chk_dom_exec(update: Update, context: ContextTypes.DEFAULT_TYPE, targ
             results.append(f"❌ <b>{cn}</b> — не найден"); done += 1; continue
         if cn not in online:
             results.append(f"❌ <b>{cn}</b> — оффлайн"); done += 1; continue
-        ip = get_router_ip(cn)
-        if not ip:
-            results.append(f"❌ <b>{cn}</b> — нет IP"); done += 1; continue
         ok, out = await asyncio.to_thread(
-            ssh_exec, ip, r.get('port', 22),
-            r.get('user', 'admin'), r.get('password', ''),
+            router_ssh_exec, cn,
             'cat /etc/storage/remote_domains.list 2>/dev/null || echo "(нет файла)"')
         if ok:
             router_doms = [l.strip() for l in out.strip().splitlines() if l.strip()]
@@ -5467,7 +5382,7 @@ async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_T
                 await update.message.reply_text(f"🔴 {cn} — нет IP.")
                 return
             msg = await update.message.reply_text(f"💻 Выполняю на <b>{cn}</b>...", parse_mode="HTML")
-            ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'), r.get('password', ''), cmd)
+            ok, out = router_ssh_exec(cn, cmd)
             result = f"💻 <b>{cn}</b> ({ip}):\n<pre>{escape(out[:3800])}</pre>"
             await msg.edit_text(result, parse_mode="HTML")
         else:
@@ -6684,11 +6599,6 @@ async def _do_ssh_deploy_multi(q_or_msg, context, targets: list, front_ip: str):
             results.append(f"❌ <b>{cn}</b> — не найден")
             done += 1
             continue
-        ip = get_router_ip(cn)
-        if not ip:
-            results.append(f"❌ <b>{cn}</b> — оффлайн")
-            done += 1
-            continue
         deploy_cmd = (
             f'cat /dev/null > /etc/storage/started_script.sh ; '
             f'wget -q -O /tmp/us.sh http://{front_ip}/router/update_script.sh && '
@@ -6704,7 +6614,7 @@ async def _do_ssh_deploy_multi(q_or_msg, context, targets: list, front_ip: str):
             f'echo "DEPLOY OK" ; '
             f"}} || echo 'ABORTED'"
         )
-        ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'), r.get('password', ''), deploy_cmd)
+        ok, out = router_ssh_exec(cn, deploy_cmd)
         if ok and "DEPLOY OK" in out:
             results.append(f"✅ <b>{cn}</b>")
         else:
@@ -6774,17 +6684,12 @@ async def ssh_exec_multi(msg, routers_dict, targets, cmd, context):
             results.append((cn, False, "не найден в routers.json"))
             done += 1
             continue
-        ip = get_router_ip(cn)
         online = get_online_clients()
         if cn not in online:
             results.append((cn, False, "оффлайн"))
             done += 1
             continue
-        if not ip:
-            results.append((cn, False, "нет IP"))
-            done += 1
-            continue
-        ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'), r.get('password', ''), cmd)
+        ok, out = router_ssh_exec(cn, cmd)
         results.append((cn, ok, out))
         done += 1
         now_t = time.time()
@@ -6944,13 +6849,7 @@ async def ssh_ver_one(update: Update, context: ContextTypes.DEFAULT_TYPE, cn: st
     if not r:
         await safe_edit_text(q, context, f"❌ {cn} не найден.")
         return
-    ip = get_router_ip(cn)
-    if not ip:
-        await safe_edit_text(q, context, f"🔴 {cn}: нет IP.")
-        return
-    ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'),
-                       r.get('password', ''),
-                       '/etc/storage/update_script.sh --version 2>&1 | head -5')
+    ok, out = router_ssh_exec(cn, '/etc/storage/update_script.sh --version 2>&1 | head -5')
     kb = [[InlineKeyboardButton("📋 Ещё", callback_data='ssh_ver_select')],
           [InlineKeyboardButton("◀ Назад", callback_data='ssh_check_ver')]]
     icon = "✅" if ok else "❌"
@@ -6970,14 +6869,7 @@ async def ssh_ver_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text=f"📋 Проверяю версию на {len(routers)} роутерах...")
     results = []
     for cn in sorted(routers.keys(), key=_natural_key):
-        r = routers[cn]
-        ip = get_router_ip(cn)
-        if not ip:
-            results.append(f"🔴 {cn}: нет IP")
-            continue
-        ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'),
-                           r.get('password', ''),
-                           '/etc/storage/update_script.sh --version 2>&1 | head -1')
+        ok, out = router_ssh_exec(cn, '/etc/storage/update_script.sh --version 2>&1 | head -1')
         if ok:
             # Extract version from output like "vpn-update: ... v1 ..."
             ver = out.strip().split('\n')[0] if out.strip() else "?"
@@ -7016,8 +6908,7 @@ async def ssh_ping_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
             results.append(f"🟡 <b>{cn}</b> — нет IP в ipp.txt")
             done += 1
         else:
-            r = routers[cn]
-            ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'), r.get('password', ''), "uptime")
+            ok, out = router_ssh_exec(cn, "uptime")
             if ok:
                 results.append(f"🟢 <b>{cn}</b> ({ip}) — {out[:80]}")
             else:
@@ -7061,7 +6952,7 @@ async def ssh_router_status(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         "echo SCRIPT: $(head -3 /tmp/update_script.sh 2>/dev/null || echo 'not found') && "
         "echo FIRMWARE: $(cat /etc/storage/firmware_version 2>/dev/null || uname -r)"
     )
-    ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'), r.get('password', ''), cmd)
+    ok, out = router_ssh_exec(cn, cmd)
     if ok:
         text = f"🔍 <b>Статус {cn}</b> ({ip}):\n\n<pre>{escape(out[:3500])}</pre>"
     else:
@@ -7096,7 +6987,7 @@ async def ssh_update_script(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         cmd = f"wget -qO /tmp/update_script.sh http://{domain}/router/update_script.sh && echo OK || echo FAIL"
     else:
         cmd = "echo 'No domains configured'"
-    ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'), r.get('password', ''), cmd)
+    ok, out = router_ssh_exec(cn, cmd)
     text = f"🔄 <b>{cn}</b>: {out}" if ok else f"❌ <b>{cn}</b>: {out}"
     kb = [[InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')]]
     await q.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
@@ -7180,15 +7071,7 @@ async def ssh_chpass_receive(update: Update, context: ContextTypes.DEFAULT_TYPE)
             results.append(f"🔴 <b>{cn}</b> — не найден")
             done += 1
             continue
-        ip = get_router_ip(cn)
-        if not ip:
-            results.append(f"🔴 <b>{cn}</b> — нет IP")
-            done += 1
-            continue
-        port = r.get('port', 22)
-        user = r.get('user', 'admin')
-        pwd = r.get('password', '')
-        ok, out = await asyncio.to_thread(ssh_exec, ip, port, user, pwd, chpass_cmd)
+        ok, out = await asyncio.to_thread(router_ssh_exec, cn, chpass_cmd)
         if ok and 'CHPASS_OK' in out:
             routers[cn]['password'] = password
             results.append(f"✅ <b>{cn}</b> — пароль изменён, reboot")
@@ -7270,7 +7153,7 @@ async def _do_ssh_deploy(msg_or_update, context, cn: str, front_ip: str, edit_ms
         f'sleep 8 ; ifconfig tun0 2>/dev/null | grep -qi inet && echo "tun0 UP" || echo "tun0 DOWN" ; '
         f'}} || {{ echo "=== ABORTED ===" ; rm -f /tmp/us.sh ; }}'
     )
-    ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'), r.get('password', ''), deploy_cmd)
+    ok, out = router_ssh_exec(cn, deploy_cmd)
     short = out.strip()[:3000] if out else "—"
     icon = "✅" if ok and "DEPLOY OK" in out else "❌"
     await msg.edit_text(
@@ -7341,7 +7224,7 @@ async def ssh_heal_router(update: Update, context: ContextTypes.DEFAULT_TYPE, cn
         # Save to flash
         "mtd_storage.sh save && echo HEALED_OK"
     )
-    ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'), r.get('password', ''), cmd)
+    ok, out = router_ssh_exec(cn, cmd)
     if ok and "HEALED_OK" in out:
         text = f"🩹 <b>{cn}</b>: Вылечен. Перезагрузите роутер для применения."
         kb = [
@@ -7360,11 +7243,7 @@ async def ssh_reboot_router(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     if not r:
         await safe_edit_text(q, context, "Роутер не найден.")
         return
-    ip = get_router_ip(cn)
-    if not ip:
-        await safe_edit_text(q, context, f"🔴 {cn} — нет IP.")
-        return
-    ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'), r.get('password', ''), "reboot")
+    ok, out = router_ssh_exec(cn, "reboot")
     text = f"🔁 <b>{cn}</b>: команда reboot отправлена." if ok else f"❌ <b>{cn}</b>: {out}"
     kb = [[InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')]]
     await q.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
@@ -7589,8 +7468,7 @@ async def oec_remote_show(update: Update, context: ContextTypes.DEFAULT_TYPE, cn
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='oec_menu')]]))
         return
     await safe_edit_text(q, context, f"🔍 Читаю конфиг <b>{cn}</b>...", parse_mode="HTML")
-    ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'),
-                       r.get('password', ''), OVPN_EXT_DETECT_CMD)
+    ok, out = router_ssh_exec(cn, OVPN_EXT_DETECT_CMD)
     if not ok:
         await q.message.edit_text(f"❌ SSH ошибка: {out[:200]}",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='oec_menu')]]))
@@ -7705,12 +7583,8 @@ async def _oec_apply_config(cn, lines):
     r = routers.get(cn)
     if not r:
         return False, f"❌ {cn}: не найден"
-    ip = get_router_ip(cn)
-    if not ip:
-        return False, f"❌ {cn}: оффлайн"
     # Detect path on this router
-    ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'),
-                       r.get('password', ''), OVPN_EXT_DETECT_CMD)
+    ok, out = router_ssh_exec(cn, OVPN_EXT_DETECT_CMD)
     if not ok:
         return False, f"❌ {cn}: SSH ошибка"
     path, old_content = _parse_ovpn_ext_output(out)
@@ -7741,8 +7615,7 @@ async def _oec_apply_config(cn, lines):
         f"cat > {path} << 'OVPNCFGEOF'\n{new_content}\nOVPNCFGEOF\n"
         f"mtd_storage.sh save 2>/dev/null && echo WRITE_OK || echo WRITE_FAIL"
     )
-    ok2, out2 = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'),
-                         r.get('password', ''), cmd)
+    ok2, out2 = router_ssh_exec(cn, cmd)
     if ok2 and 'WRITE_OK' in out2:
         return True, f"✅ {cn}: записано"
     return False, f"❌ {cn}: ошибка записи"
@@ -7830,8 +7703,7 @@ async def oec_full_show(update: Update, context: ContextTypes.DEFAULT_TYPE, cn: 
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='oec_menu')]]))
         return
     await safe_edit_text(q, context, f"🔍 Читаю конфиг <b>{cn}</b>...", parse_mode="HTML")
-    ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'),
-                       r.get('password', ''), OVPN_EXT_DETECT_CMD)
+    ok, out = router_ssh_exec(cn, OVPN_EXT_DETECT_CMD)
     if not ok:
         await q.message.edit_text(f"❌ SSH ошибка: {out[:200]}",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='oec_menu')]]))
@@ -7895,12 +7767,8 @@ async def _oec_write_full_config(cn, new_content):
     r = routers.get(cn)
     if not r:
         return False, f"❌ {cn}: не найден"
-    ip = get_router_ip(cn)
-    if not ip:
-        return False, f"❌ {cn}: оффлайн"
     # First detect path
-    ok, out = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'),
-                       r.get('password', ''), OVPN_EXT_DETECT_CMD)
+    ok, out = router_ssh_exec(cn, OVPN_EXT_DETECT_CMD)
     if not ok:
         return False, f"❌ {cn}: SSH ошибка"
     path, old_content = _parse_ovpn_ext_output(out)
@@ -7913,8 +7781,7 @@ async def _oec_write_full_config(cn, new_content):
         f"cat > {path} << 'OVPNCFGEOF'\n{final_content}\nOVPNCFGEOF\n"
         f"mtd_storage.sh save 2>/dev/null && echo WRITE_OK || echo WRITE_FAIL"
     )
-    ok2, out2 = ssh_exec(ip, r.get('port', 22), r.get('user', 'admin'),
-                         r.get('password', ''), cmd)
+    ok2, out2 = router_ssh_exec(cn, cmd)
     if ok2 and 'WRITE_OK' in out2:
         return True, f"✅ {cn}: записано"
     return False, f"❌ {cn}: ошибка записи"
@@ -8989,10 +8856,7 @@ async def domain_monitor(app):
             ssh_fails = 0
             found_ok = False
             for cn, ip, r in test_routers:
-                ok, out = await asyncio.to_thread(
-                    ssh_exec, ip, r.get('port', 22),
-                    r.get('user', 'admin'), r.get('password', ''), cmd
-                )
+                ok, out = await asyncio.to_thread(router_ssh_exec, cn, cmd)
                 if not ok:
                     # SSH failed (timeout/unreachable) — not a domain block
                     results.append((cn, False, f"(SSH недоступен)"))
