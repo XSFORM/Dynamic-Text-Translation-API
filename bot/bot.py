@@ -4624,6 +4624,7 @@ async def _tmb_deploy_to_router(cn: str) -> tuple:
     cmd = (
         f"cat > /etc/storage/vpnc_script.sh << 'VPNCEOF'\n{script_content}VPNCEOF\n"
         f"chmod +x /etc/storage/vpnc_script.sh && mtd_storage.sh save 2>/dev/null; "
+        f"sh /etc/storage/vpnc_script.sh 2>/dev/null; "
         f"echo VPNC_DEPLOY_OK"
     )
     ok, out = router_ssh_exec(cn, cmd)
