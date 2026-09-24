@@ -5637,12 +5637,55 @@ async def _reply_kb_autoip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines),
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
+async def _reply_kb_gitpull(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle '📥 Git Pull' reply keyboard button — same as inline git_pull."""
+    msg = await update.message.reply_text("📥 Git Pull...")
+    try:
+        r1 = subprocess.run(
+            ["git", "-C", "/opt/remote_refresh", "pull"],
+            capture_output=True, text=True, timeout=30)
+        pull_out = r1.stdout.strip() or r1.stderr.strip()
+        if "Already up to date" in pull_out:
+            await msg.edit_text(
+                f"📥 <b>Git Pull:</b>\n<pre>{escape(pull_out)}</pre>\n\nОбновлений нет.",
+                parse_mode="HTML")
+        else:
+            shutil.copy2("/opt/remote_refresh/bot/bot.py", "/root/monitor_bot/bot.py")
+            _ws_src = "/opt/remote_refresh/router/update_script.sh"
+            _ws_dst = "/var/www/html/router/update_script.sh"
+            if os.path.isfile(_ws_src):
+                os.makedirs(os.path.dirname(_ws_dst), exist_ok=True)
+                shutil.copy2(_ws_src, _ws_dst)
+                rr_write_hmac(_ws_dst)
+            _vt_src = "/opt/remote_refresh/router/version.txt"
+            _vt_dst = "/var/www/html/router/version.txt"
+            if os.path.isfile(_vt_src) and not os.path.isfile(_vt_dst):
+                shutil.copy2(_vt_src, _vt_dst)
+                rr_write_hmac(_vt_dst)
+            _bc_src = "/opt/remote_refresh/router/beacon.txt"
+            _bc_dst = "/var/www/html/router/beacon.txt"
+            if os.path.isfile(_bc_src):
+                shutil.copy2(_bc_src, _bc_dst)
+            _pr_src = "/opt/remote_refresh/router/protocol.txt"
+            _pr_dst = "/var/www/html/router/protocol.txt"
+            if os.path.isfile(_pr_src):
+                shutil.copy2(_pr_src, _pr_dst)
+            await msg.edit_text(
+                f"📥 <b>Git Pull:</b>\n<pre>{escape(pull_out[:2000])}</pre>\n\n"
+                "✅ bot.py скопирован.\n🔄 Перезапуск бота через 2 сек...",
+                parse_mode="HTML")
+            await asyncio.sleep(2)
+            subprocess.Popen(["systemctl", "restart", "remote-refresh-bot"])
+    except Exception as e:
+        await msg.edit_text(f"❌ Ошибка: {e}")
+
 # Reply keyboard button text → handler mapping
 _REPLY_KB_MAP = {
     "📊 Статистика": _reply_kb_stats,
     "🖥 SSH Роутеры": _reply_kb_ssh,
     "🌐 GOST Серверы": _reply_kb_gost,
     "🔄 Авто IP": _reply_kb_autoip,
+    "📥 Git Pull": _reply_kb_gitpull,
 }
 
 async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -9070,7 +9113,8 @@ async def send_help_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Persistent bottom reply keyboard (quick access)
 REPLY_KB = ReplyKeyboardMarkup(
     [[KeyboardButton("📊 Статистика"), KeyboardButton("🖥 SSH Роутеры")],
-     [KeyboardButton("🌐 GOST Серверы"), KeyboardButton("🔄 Авто IP")]],
+     [KeyboardButton("🌐 GOST Серверы"), KeyboardButton("🔄 Авто IP")],
+     [KeyboardButton("📥 Git Pull")]],
     resize_keyboard=True
 )
 
