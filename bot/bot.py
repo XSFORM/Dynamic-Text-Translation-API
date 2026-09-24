@@ -6869,6 +6869,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await gost_rule_done(update, context)
     # --- GOST Templates ---
     elif data == 'gtpl_menu':
+        had = context.user_data.get('await_gtpl_manual')
+        if had:
+            logger.warning("gtpl_menu CLEARING await_gtpl_manual=%s", repr(had))
         for k in ('await_gtpl_manual', 'await_gtpl_name',
                   'await_gost_add', 'await_gost_edit_ip', 'await_gost_edit',
                   'await_gost_rule', 'await_gost_addrule'):
@@ -9807,6 +9810,8 @@ async def gtpl_manual_receive(update: Update, context: ContextTypes.DEFAULT_TYPE
             data.pop(k, None)
         data['rules'].append(rule)
         data['step'] = 'more'
+        logger.info("GTPL remote_port done: rules=%s, data_id=%s, ud_keys=%s",
+                     data['rules'], id(data), [k for k in context.user_data if k.startswith('await_')])
         try:
             r_str = "\n".join(
                 f"  {r['proto']}://:{r['local_port']} → {r['remote_ip']}:{r['remote_port']}"
@@ -9820,7 +9825,9 @@ async def gtpl_manual_receive(update: Update, context: ContextTypes.DEFAULT_TYPE
                 f"<b>{escape(data['name'])}</b> — правила:\n<code>{r_str}</code>\n\n"
                 "Добавить ещё правило или сохранить?",
                 parse_mode="HTML", reply_markup=kb)
-        except Exception:
+            logger.info("GTPL remote_port: reply_text sent OK")
+        except Exception as exc:
+            logger.error("GTPL remote_port reply_text failed: %s", exc)
             # Fallback — buttons must still appear even if HTML formatting fails
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton("✅ Сохранить", callback_data='gtpl_manual_done')],
@@ -9847,9 +9854,12 @@ async def gtpl_manual_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Save manually created template."""
     q = update.callback_query
     await q.answer()
+    logger.warning("gtpl_manual_done CALLED: ud_keys=%s, await_gtpl_manual=%s",
+                   [k for k in context.user_data if k.startswith('await_')],
+                   repr(context.user_data.get('await_gtpl_manual')))
     data = context.user_data.pop('await_gtpl_manual', None)
     if not data or not data.get('rules'):
-        logger.warning("gtpl_manual_done: empty data=%s", data)
+        logger.warning("gtpl_manual_done: FAIL data=%s", data)
         await safe_edit_text(q, context, "❌ Нет правил для сохранения.",
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("◀️ Назад", callback_data='gtpl_menu')]]))
