@@ -375,6 +375,7 @@ PPTP_SERVER_FILE = "/root/monitor_bot/pptp_server.json"
 PPTP_CLIENTS_FILE = "/root/monitor_bot/pptp_clients.json"
 TM_BYPASS_FILE = "/root/monitor_bot/tm_bypass_routes.txt"
 PPTP_FWD_TEMPLATES_FILE = "/root/monitor_bot/pptp_fwd_templates.json"
+GOST_TEMPLATES_FILE = "/root/monitor_bot/gost_templates.json"
 PPTP_IP_START = 10          # 172.16.0.10
 PPTP_IP_PREFIX = "172.16.0"
 IPP_FILE = "/etc/openvpn/ipp.txt"
@@ -5386,7 +5387,7 @@ async def rr_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
               'await_change_port', 'await_script_ver', 'await_canary_ver', 'await_canary_ids',
               'await_oec_radd', 'await_oec_fedit', 'await_ssh_add',
               'await_pptp_ip', 'await_pptp_srv', 'await_tmb_add',
-              'await_fwd_tpl_name', 'await_emg_edit']:
+              'await_fwd_tpl_name', 'await_gtpl_name', 'await_emg_edit']:
         context.user_data.pop(k, None)
     await safe_edit_text(q, context, "Отменено.")
 
@@ -5579,6 +5580,7 @@ async def _reply_kb_gost(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📡 Настроить правила", callback_data='gost_select_rules')],
         [InlineKeyboardButton("➕ Добавить правило", callback_data='gost_select_addrule')],
         [InlineKeyboardButton("📄 Показать конфиг", callback_data='gost_select_showconf')],
+        [InlineKeyboardButton(f"📋 Шаблоны ({len(load_gost_templates())})", callback_data='gtpl_menu')],
         [InlineKeyboardButton("📡 Пинг серверов", callback_data='gost_ping_all')],
         [InlineKeyboardButton("▶️ Старт", callback_data='gost_select_start'),
          InlineKeyboardButton("⏹ Стоп", callback_data='gost_select_stop'),
@@ -5850,6 +5852,8 @@ async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_T
         await gost_edit_ip_handler(update, context); return
     if context.user_data.get('await_gost_edit'):
         await gost_edit_handler(update, context); return
+    if context.user_data.get('await_gtpl_name'):
+        await gtpl_save_receive(update, context); return
     if context.user_data.get('await_gost_rule') or context.user_data.get('await_gost_addrule'):
         await gost_rule_handler(update, context); return
     if context.user_data.get('await_gost_getroot') and context.user_data['await_gost_getroot'] != 'pem':
@@ -6860,6 +6864,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await gost_rule_more(update, context)
     elif data == 'gost_rule_done':
         await gost_rule_done(update, context)
+    # --- GOST Templates ---
+    elif data == 'gtpl_menu':
+        await gost_tpl_menu(update, context)
+    elif data == 'gtpl_save_pick':
+        await gtpl_save_pick(update, context)
+    elif data.startswith('gtpl_save:'):
+        await gtpl_save_name(update, context, data[len('gtpl_save:'):])
+    elif data == 'gtpl_apply_pick':
+        await gtpl_apply_pick(update, context)
+    elif data.startswith('gtpl_use:'):
+        await gtpl_use_pick_server(update, context, int(data[len('gtpl_use:'):]))
+    elif data.startswith('gtpl_exec:'):
+        parts = data[len('gtpl_exec:'):].split(':', 1)
+        await gtpl_exec(update, context, int(parts[0]), parts[1])
+    elif data == 'gtpl_del':
+        await gtpl_del_menu(update, context)
+    elif data.startswith('gtpl_rm:'):
+        await gtpl_del_exec(update, context, int(data[len('gtpl_rm:'):]))
     elif data == 'gost_select_showconf':
         await _gost_select_server(update, context, 'gost_showconf', "📄 <b>Показать конфиг</b>\nВыберите сервер:")
     elif data.startswith('gost_showconf:'):
@@ -9637,11 +9659,288 @@ async def auto_ip_move(update: Update, context: ContextTypes.DEFAULT_TYPE, idx: 
 #  GOST MANAGEMENT — Functions
 # =====================================================================
 
+# -- GOST Templates --
+def load_gost_templates() -> List[dict]:
+    try:
+        with open(GOST_TEMPLATES_FILE, "r") as f:
+            return json.loads(f.read())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+def save_gost_templates(templates: List[dict]):
+    with open(GOST_TEMPLATES_FILE, "w") as f:
+        f.write(json.dumps(templates, indent=2, ensure_ascii=False))
+
+
+async def gost_tpl_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show saved GOST rule templates."""
+    q = update.callback_query
+    await q.answer()
+    templates = load_gost_templates()
+    if not templates:
+        lines = "<i>Нет сохранённых шаблонов.</i>"
+    else:
+        parts = []
+        for i, t in enumerate(templates):
+            name = t.get("name", f"Шаблон {i+1}")
+            rules = t.get("rules", [])
+            r_str = ", ".join(f"{r['proto']}:{r['local_port']}→{r['remote_ip']}:{r['remote_port']}"
+                              for r in rules[:3])
+            if len(rules) > 3:
+                r_str += f" +{len(rules)-3}"
+            parts.append(f"{i+1}. <b>{escape(name)}</b> ({len(rules)} правил)\n   {r_str}")
+        lines = "\n".join(parts)
+    kb = [
+        [InlineKeyboardButton("➕ Сохранить с сервера", callback_data='gtpl_save_pick')],
+        [InlineKeyboardButton("📤 Применить шаблон", callback_data='gtpl_apply_pick')],
+        [InlineKeyboardButton("🗑 Удалить шаблон", callback_data='gtpl_del')],
+        [InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')],
+    ]
+    await safe_edit_text(q, context,
+        f"📋 <b>Шаблоны GOST правил</b>\n\n{lines}",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def gtpl_save_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Pick a GOST server to save its rules as template."""
+    q = update.callback_query
+    await q.answer()
+    servers = load_gost_servers()
+    has_rules = {ip: s for ip, s in servers.items() if s.get("rules")}
+    if not has_rules:
+        kb = [[InlineKeyboardButton("◀️ Назад", callback_data='gtpl_menu')]]
+        await safe_edit_text(q, context,
+            "❌ Нет серверов с настроенными правилами GOST.",
+            reply_markup=InlineKeyboardMarkup(kb))
+        return
+    kb = []
+    for ip, s in sorted(has_rules.items()):
+        label = s.get("label", ip)
+        n = len(s.get("rules", []))
+        kb.append([InlineKeyboardButton(f"💾 {label} ({ip}) — {n} правил",
+                                        callback_data=f'gtpl_save:{ip}')])
+    kb.append([InlineKeyboardButton("◀️ Назад", callback_data='gtpl_menu')])
+    await safe_edit_text(q, context,
+        "💾 <b>Сохранить шаблон GOST</b>\n\nВыберите сервер-источник:",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def gtpl_save_name(update: Update, context: ContextTypes.DEFAULT_TYPE, ip: str):
+    """Prompt for GOST template name."""
+    q = update.callback_query
+    await q.answer()
+    servers = load_gost_servers()
+    srv = servers.get(ip)
+    if not srv or not srv.get("rules"):
+        await safe_edit_text(q, context, "❌ Нет правил на этом сервере.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀️ Назад", callback_data='gtpl_menu')]]))
+        return
+    context.user_data['await_gtpl_name'] = ip
+    rules = srv.get("rules", [])
+    r_str = "\n".join(f"  {r['proto']}://:{r['local_port']} → {r['remote_ip']}:{r['remote_port']}"
+                      for r in rules)
+    await safe_edit_text(q, context,
+        f"💾 <b>Сохранить шаблон GOST</b>\n\n"
+        f"Правила ({len(rules)}):\n<code>{r_str}</code>\n\n"
+        "Введите название шаблона:",
+        parse_mode="HTML")
+
+
+async def gtpl_save_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Save GOST rules template."""
+    ip = context.user_data.pop('await_gtpl_name', None)
+    if not ip:
+        return
+    name = update.message.text.strip()[:50]
+    servers = load_gost_servers()
+    srv = servers.get(ip)
+    if not srv or not srv.get("rules"):
+        await update.message.reply_text("❌ Нет правил на сервере.")
+        return
+    templates = load_gost_templates()
+    tpl = {
+        "name": name,
+        "rules": list(srv["rules"]),  # deep copy
+    }
+    templates.append(tpl)
+    save_gost_templates(templates)
+    rr_append_history(f"GOST_TPL_SAVE: {name} ({len(srv['rules'])} rules)")
+    kb = [[InlineKeyboardButton("📋 Шаблоны GOST", callback_data='gtpl_menu')]]
+    await update.message.reply_text(
+        f"✅ Шаблон <b>{escape(name)}</b> сохранён ({len(srv['rules'])} правил).",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def gtpl_apply_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Pick a GOST template to apply."""
+    q = update.callback_query
+    await q.answer()
+    templates = load_gost_templates()
+    if not templates:
+        kb = [[InlineKeyboardButton("◀️ Назад", callback_data='gtpl_menu')]]
+        await safe_edit_text(q, context, "Нет шаблонов.",
+            reply_markup=InlineKeyboardMarkup(kb))
+        return
+    kb = []
+    for i, t in enumerate(templates):
+        name = t.get("name", f"Шаблон {i+1}")
+        n = len(t.get("rules", []))
+        kb.append([InlineKeyboardButton(f"📤 {name} ({n})", callback_data=f'gtpl_use:{i}')])
+    kb.append([InlineKeyboardButton("◀️ Назад", callback_data='gtpl_menu')])
+    await safe_edit_text(q, context,
+        "📤 <b>Применить шаблон GOST</b>\n\nВыберите шаблон:",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def gtpl_use_pick_server(update: Update, context: ContextTypes.DEFAULT_TYPE, tpl_idx: int):
+    """After picking GOST template, pick server to apply."""
+    q = update.callback_query
+    await q.answer()
+    templates = load_gost_templates()
+    if tpl_idx < 0 or tpl_idx >= len(templates):
+        await safe_edit_text(q, context, "❌ Шаблон не найден.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀️ Назад", callback_data='gtpl_menu')]]))
+        return
+    tpl = templates[tpl_idx]
+    servers = load_gost_servers()
+    if not servers:
+        await safe_edit_text(q, context, "Нет GOST серверов.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀️ Назад", callback_data='gtpl_menu')]]))
+        return
+    kb = []
+    for ip, s in sorted(servers.items()):
+        label = s.get("label", ip)
+        kb.append([InlineKeyboardButton(f"🖥 {label} ({ip})", callback_data=f'gtpl_exec:{tpl_idx}:{ip}')])
+    kb.append([InlineKeyboardButton("◀️ Назад", callback_data='gtpl_menu')])
+    rules = tpl.get("rules", [])
+    r_str = "\n".join(f"  {r['proto']}://:{r['local_port']} → {r['remote_ip']}:{r['remote_port']}"
+                      for r in rules)
+    await safe_edit_text(q, context,
+        f"📤 <b>Шаблон: {escape(tpl.get('name', ''))}</b>\n"
+        f"Правил: {len(rules)}\n<code>{r_str}</code>\n\n"
+        "Выберите сервер для применения:",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def gtpl_exec(update: Update, context: ContextTypes.DEFAULT_TYPE, tpl_idx: int, front_ip: str):
+    """Apply GOST template to a server — same as gost_rule_done but from template."""
+    q = update.callback_query
+    await q.answer()
+    templates = load_gost_templates()
+    if tpl_idx < 0 or tpl_idx >= len(templates):
+        await safe_edit_text(q, context, "❌ Шаблон не найден.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀️ Назад", callback_data='gtpl_menu')]]))
+        return
+    tpl = templates[tpl_idx]
+    rules = tpl.get("rules", [])
+    if not rules:
+        await safe_edit_text(q, context, "❌ Шаблон пуст.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀️ Назад", callback_data='gtpl_menu')]]))
+        return
+    servers = load_gost_servers()
+    srv = servers.get(front_ip)
+    if not srv:
+        await safe_edit_text(q, context, "❌ Сервер не найден.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀️ Назад", callback_data='gtpl_menu')]]))
+        return
+
+    await safe_edit_text(q, context,
+        f"⏳ Применяю шаблон <b>{escape(tpl.get('name', ''))}</b> на <code>{front_ip}</code>...",
+        parse_mode="HTML")
+
+    srv["rules"] = list(rules)
+    save_gost_servers(servers)
+
+    gost_ls = " ".join(
+        f"-L={r['proto']}://:{r['local_port']}/{r['remote_ip']}:{r['remote_port']}"
+        for r in rules)
+    service_content = (
+        "[Unit]\\n"
+        "Description=GO Simple Tunnel\\n"
+        "After=network.target\\n"
+        "Wants=network.target\\n"
+        "\\n"
+        "[Service]\\n"
+        "Type=simple\\n"
+        f"ExecStart={GOST_BIN} {gost_ls}\\n"
+        "Restart=on-failure\\n"
+        "\\n"
+        "[Install]\\n"
+        "WantedBy=multi-user.target"
+    )
+    cmd = (
+        f"echo -e '{service_content}' > {GOST_SERVICE_PATH} && "
+        "systemctl daemon-reload && systemctl enable gost && systemctl restart gost && echo GOST_CONF_OK"
+    )
+    ok, out = ssh_exec(front_ip, 22, srv["ssh_user"], srv["ssh_pass"], cmd)
+    kb = [[InlineKeyboardButton("📋 Шаблоны GOST", callback_data='gtpl_menu'),
+           InlineKeyboardButton("🌐 GOST", callback_data='gost_menu')]]
+    if ok and "GOST_CONF_OK" in out:
+        rr_append_history(f"GOST_TPL_APPLY: {tpl.get('name','')} -> {front_ip}")
+        r_disp = "\n".join(
+            f"  {r['proto']}://:{r['local_port']} → {r['remote_ip']}:{r['remote_port']}"
+            for r in rules)
+        await safe_edit_text(q, context,
+            f"✅ Шаблон <b>{escape(tpl.get('name',''))}</b> применён на <code>{front_ip}</code>\n\n"
+            f"<code>{r_disp}</code>",
+            parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+    else:
+        await safe_edit_text(q, context,
+            f"❌ Ошибка:\n<pre>{escape(out[:2000])}</pre>",
+            parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def gtpl_del_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show GOST templates for deletion."""
+    q = update.callback_query
+    await q.answer()
+    templates = load_gost_templates()
+    if not templates:
+        kb = [[InlineKeyboardButton("◀️ Назад", callback_data='gtpl_menu')]]
+        await safe_edit_text(q, context, "Нет шаблонов.",
+            reply_markup=InlineKeyboardMarkup(kb))
+        return
+    kb = []
+    for i, t in enumerate(templates):
+        name = t.get("name", f"Шаблон {i+1}")
+        kb.append([InlineKeyboardButton(f"❌ {name}", callback_data=f'gtpl_rm:{i}')])
+    kb.append([InlineKeyboardButton("◀️ Назад", callback_data='gtpl_menu')])
+    await safe_edit_text(q, context,
+        "🗑 <b>Удалить шаблон GOST</b>\n\nВыберите:",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def gtpl_del_exec(update: Update, context: ContextTypes.DEFAULT_TYPE, idx: int):
+    """Delete GOST template."""
+    q = update.callback_query
+    await q.answer()
+    templates = load_gost_templates()
+    if idx < 0 or idx >= len(templates):
+        await safe_edit_text(q, context, "❌ Шаблон не найден.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀️ Назад", callback_data='gtpl_menu')]]))
+        return
+    removed = templates.pop(idx)
+    save_gost_templates(templates)
+    rr_append_history(f"GOST_TPL_DEL: {removed.get('name','')}")
+    kb = [[InlineKeyboardButton("📋 Шаблоны GOST", callback_data='gtpl_menu')]]
+    await safe_edit_text(q, context,
+        f"✅ Шаблон <b>{escape(removed.get('name',''))}</b> удалён.",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
 async def gost_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     servers = load_gost_servers()
     count = len(servers)
+    gtpl_count = len(load_gost_templates())
     kb = [
         [InlineKeyboardButton(f"📋 Список серверов ({count})", callback_data='gost_list')],
         [InlineKeyboardButton("➕ Добавить сервер", callback_data='gost_add')],
@@ -9649,6 +9948,7 @@ async def gost_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📡 Настроить правила", callback_data='gost_select_rules')],
         [InlineKeyboardButton("➕ Добавить правило", callback_data='gost_select_addrule')],
         [InlineKeyboardButton("📄 Показать конфиг", callback_data='gost_select_showconf')],
+        [InlineKeyboardButton(f"📋 Шаблоны ({gtpl_count})", callback_data='gtpl_menu')],
         [InlineKeyboardButton("📡 Пинг серверов", callback_data='gost_ping_all')],
         [InlineKeyboardButton("▶️ Старт", callback_data='gost_select_start'),
          InlineKeyboardButton("⏹ Стоп", callback_data='gost_select_stop'),
