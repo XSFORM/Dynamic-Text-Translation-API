@@ -374,6 +374,7 @@ ROUTERS_FILE = "/root/monitor_bot/routers.json"
 PPTP_SERVER_FILE = "/root/monitor_bot/pptp_server.json"
 PPTP_CLIENTS_FILE = "/root/monitor_bot/pptp_clients.json"
 TM_BYPASS_FILE = "/root/monitor_bot/tm_bypass_routes.txt"
+PPTP_FWD_TEMPLATES_FILE = "/root/monitor_bot/pptp_fwd_templates.json"
 PPTP_IP_START = 10          # 172.16.0.10
 PPTP_IP_PREFIX = "172.16.0"
 IPP_FILE = "/etc/openvpn/ipp.txt"
@@ -5384,7 +5385,8 @@ async def rr_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for k in ['await_rr_ip', 'await_rr_domain_add', 'await_force_ip',
               'await_change_port', 'await_script_ver', 'await_canary_ver', 'await_canary_ids',
               'await_oec_radd', 'await_oec_fedit', 'await_ssh_add',
-              'await_pptp_ip', 'await_pptp_srv', 'await_tmb_add', 'await_emg_edit']:
+              'await_pptp_ip', 'await_pptp_srv', 'await_tmb_add',
+              'await_fwd_tpl_name', 'await_emg_edit']:
         context.user_data.pop(k, None)
     await safe_edit_text(q, context, "Отменено.")
 
@@ -5852,6 +5854,8 @@ async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_T
         await gost_rule_handler(update, context); return
     if context.user_data.get('await_gost_getroot') and context.user_data['await_gost_getroot'] != 'pem':
         await gost_getroot_handler(update, context); return
+    if context.user_data.get('await_fwd_tpl_name'):
+        await fwd_tpl_save_receive(update, context); return
     if context.user_data.get('await_pptp_fwd_backend'):
         await pptp_fwd_backend_receive(update, context); return
     # OpenVPN Ext Config text inputs
@@ -6944,6 +6948,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     [[InlineKeyboardButton("❌ Отмена", callback_data='pptp_fwd_menu')]]))
     elif data == 'pptp_fwd_apply':
         await pptp_fwd_apply_rules(update, context)
+    # --- PPTP Forward Templates ---
+    elif data == 'fwd_tpl_menu':
+        await pptp_fwd_tpl_menu(update, context)
+    elif data == 'fwd_tpl_save_pick':
+        await fwd_tpl_save_pick(update, context)
+    elif data.startswith('fwd_tpl_save:'):
+        await fwd_tpl_save_name(update, context, data[len('fwd_tpl_save:'):])
+    elif data == 'fwd_tpl_apply_pick':
+        await fwd_tpl_apply_pick(update, context)
+    elif data.startswith('fwd_tpl_use:'):
+        await fwd_tpl_use_pick_server(update, context, int(data[len('fwd_tpl_use:'):]))
+    elif data.startswith('fwd_tpl_exec:'):
+        parts = data[len('fwd_tpl_exec:'):].split(':', 1)
+        await fwd_tpl_exec(update, context, int(parts[0]), parts[1])
+    elif data == 'fwd_tpl_del':
+        await fwd_tpl_del_menu(update, context)
+    elif data.startswith('fwd_tpl_rm:'):
+        await fwd_tpl_del_exec(update, context, int(data[len('fwd_tpl_rm:'):]))
 
     else:
         await safe_edit_text(q, context, "Неизвестная команда.")
@@ -10670,14 +10692,325 @@ async def gost_getroot_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 #  PPTP IPTABLES FORWARD (on GOST front servers)
 # =====================================================================
 
+# -- PPTP Forward Templates --
+def load_fwd_templates() -> List[dict]:
+    try:
+        with open(PPTP_FWD_TEMPLATES_FILE, "r") as f:
+            return json.loads(f.read())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+def save_fwd_templates(templates: List[dict]):
+    with open(PPTP_FWD_TEMPLATES_FILE, "w") as f:
+        f.write(json.dumps(templates, indent=2, ensure_ascii=False))
+
+
+async def pptp_fwd_tpl_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show list of saved forwarding templates."""
+    q = update.callback_query
+    await q.answer()
+    templates = load_fwd_templates()
+    if not templates:
+        lines = "<i>Нет сохранённых шаблонов.</i>"
+    else:
+        parts = []
+        for i, t in enumerate(templates):
+            name = t.get("name", f"Шаблон {i+1}")
+            pptp = t.get("pptp_backend", "?")
+            ovpn = t.get("ovpn_rules", [])
+            ovpn_str = ", ".join(f"{r['proto'].upper()}:{r['port']}→{r['ip']}" for r in ovpn)
+            parts.append(f"{i+1}. <b>{escape(name)}</b>\n   PPTP→<code>{pptp}</code>"
+                         + (f"\n   {ovpn_str}" if ovpn_str else ""))
+        lines = "\n".join(parts)
+    kb = [
+        [InlineKeyboardButton("➕ Сохранить текущий", callback_data='fwd_tpl_save_pick')],
+        [InlineKeyboardButton("📤 Применить шаблон", callback_data='fwd_tpl_apply_pick')],
+        [InlineKeyboardButton("🗑 Удалить шаблон", callback_data='fwd_tpl_del')],
+        [InlineKeyboardButton("◀️ Назад", callback_data='pptp_fwd_menu')],
+    ]
+    await safe_edit_text(q, context,
+        f"📋 <b>Шаблоны PPTP форварда</b>\n\n{lines}",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def fwd_tpl_save_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Pick a GOST server to save its current forwarding config as template."""
+    q = update.callback_query
+    await q.answer()
+    servers = load_gost_servers()
+    # Only show servers that have pptp_backend configured
+    has_fwd = {ip: s for ip, s in servers.items() if s.get("pptp_backend")}
+    if not has_fwd:
+        kb = [[InlineKeyboardButton("◀️ Назад", callback_data='fwd_tpl_menu')]]
+        await safe_edit_text(q, context,
+            "❌ Нет серверов с настроенным PPTP форвардом.",
+            reply_markup=InlineKeyboardMarkup(kb))
+        return
+    kb = []
+    for ip, s in sorted(has_fwd.items()):
+        label = s.get("label", ip)
+        kb.append([InlineKeyboardButton(f"💾 {label} ({ip})", callback_data=f'fwd_tpl_save:{ip}')])
+    kb.append([InlineKeyboardButton("◀️ Назад", callback_data='fwd_tpl_menu')])
+    await safe_edit_text(q, context,
+        "💾 <b>Сохранить шаблон</b>\n\nВыберите сервер-источник:",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def fwd_tpl_save_name(update: Update, context: ContextTypes.DEFAULT_TYPE, ip: str):
+    """Prompt for template name."""
+    q = update.callback_query
+    await q.answer()
+    servers = load_gost_servers()
+    srv = servers.get(ip)
+    if not srv or not srv.get("pptp_backend"):
+        await safe_edit_text(q, context, "❌ Нет данных форварда.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀️ Назад", callback_data='fwd_tpl_menu')]]))
+        return
+    context.user_data['await_fwd_tpl_name'] = ip
+    pptp = srv.get("pptp_backend", "?")
+    ovpn = srv.get("ovpn_rules", [])
+    ovpn_str = "\n".join(f"  {r['proto'].upper()} :{r['port']} → {r['ip']}" for r in ovpn)
+    await safe_edit_text(q, context,
+        f"💾 <b>Сохранить шаблон</b>\n\n"
+        f"PPTP бэкенд: <code>{pptp}</code>\n"
+        + (f"Правила DNAT:\n<code>{ovpn_str}</code>\n\n" if ovpn_str else "\n")
+        + "Введите название шаблона:",
+        parse_mode="HTML")
+
+
+async def fwd_tpl_save_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Save the template with the given name."""
+    ip = context.user_data.pop('await_fwd_tpl_name', None)
+    if not ip:
+        return
+    name = update.message.text.strip()[:50]
+    servers = load_gost_servers()
+    srv = servers.get(ip)
+    if not srv or not srv.get("pptp_backend"):
+        await update.message.reply_text("❌ Нет данных форварда.")
+        return
+    templates = load_fwd_templates()
+    tpl = {
+        "name": name,
+        "pptp_backend": srv["pptp_backend"],
+        "ovpn_rules": srv.get("ovpn_rules", []),
+    }
+    templates.append(tpl)
+    save_fwd_templates(templates)
+    rr_append_history(f"FWD_TPL_SAVE: {name}")
+    kb = [[InlineKeyboardButton("📋 Шаблоны", callback_data='fwd_tpl_menu')]]
+    await update.message.reply_text(
+        f"✅ Шаблон <b>{escape(name)}</b> сохранён.",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def fwd_tpl_apply_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Pick a template to apply."""
+    q = update.callback_query
+    await q.answer()
+    templates = load_fwd_templates()
+    if not templates:
+        kb = [[InlineKeyboardButton("◀️ Назад", callback_data='fwd_tpl_menu')]]
+        await safe_edit_text(q, context, "Нет шаблонов.",
+            reply_markup=InlineKeyboardMarkup(kb))
+        return
+    kb = []
+    for i, t in enumerate(templates):
+        name = t.get("name", f"Шаблон {i+1}")
+        kb.append([InlineKeyboardButton(f"📤 {name}", callback_data=f'fwd_tpl_use:{i}')])
+    kb.append([InlineKeyboardButton("◀️ Назад", callback_data='fwd_tpl_menu')])
+    await safe_edit_text(q, context,
+        "📤 <b>Применить шаблон</b>\n\nВыберите шаблон:",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def fwd_tpl_use_pick_server(update: Update, context: ContextTypes.DEFAULT_TYPE, tpl_idx: int):
+    """After picking template, pick which server to apply it to."""
+    q = update.callback_query
+    await q.answer()
+    templates = load_fwd_templates()
+    if tpl_idx < 0 or tpl_idx >= len(templates):
+        await safe_edit_text(q, context, "❌ Шаблон не найден.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀️ Назад", callback_data='fwd_tpl_menu')]]))
+        return
+    tpl = templates[tpl_idx]
+    servers = load_gost_servers()
+    if not servers:
+        await safe_edit_text(q, context, "Нет GOST серверов.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀️ Назад", callback_data='fwd_tpl_menu')]]))
+        return
+    kb = []
+    for ip, s in sorted(servers.items()):
+        label = s.get("label", ip)
+        kb.append([InlineKeyboardButton(f"🖥 {label} ({ip})", callback_data=f'fwd_tpl_exec:{tpl_idx}:{ip}')])
+    kb.append([InlineKeyboardButton("◀️ Назад", callback_data='fwd_tpl_menu')])
+    name = tpl.get("name", f"Шаблон {tpl_idx+1}")
+    pptp = tpl.get("pptp_backend", "?")
+    ovpn = tpl.get("ovpn_rules", [])
+    ovpn_str = "\n".join(f"  {r['proto'].upper()} :{r['port']} → {r['ip']}" for r in ovpn)
+    await safe_edit_text(q, context,
+        f"📤 <b>Шаблон: {escape(name)}</b>\n"
+        f"PPTP→<code>{pptp}</code>\n"
+        + (f"<code>{ovpn_str}</code>\n\n" if ovpn_str else "\n")
+        + "Выберите сервер для установки:",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def fwd_tpl_exec(update: Update, context: ContextTypes.DEFAULT_TYPE, tpl_idx: int, front_ip: str):
+    """Apply template to a server — same as pptp_fwd_apply but from template data."""
+    q = update.callback_query
+    await q.answer()
+    templates = load_fwd_templates()
+    if tpl_idx < 0 or tpl_idx >= len(templates):
+        await safe_edit_text(q, context, "❌ Шаблон не найден.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀️ Назад", callback_data='fwd_tpl_menu')]]))
+        return
+    tpl = templates[tpl_idx]
+    servers = load_gost_servers()
+    srv = servers.get(front_ip)
+    if not srv:
+        await safe_edit_text(q, context, "❌ Сервер не найден.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀️ Назад", callback_data='fwd_tpl_menu')]]))
+        return
+
+    backend = tpl["pptp_backend"]
+    ovpn_rules = tpl.get("ovpn_rules", [])
+
+    await safe_edit_text(q, context,
+        f"⏳ Применяю шаблон <b>{escape(tpl.get('name', ''))}</b> на <code>{front_ip}</code>...",
+        parse_mode="HTML")
+
+    # Build DNAT commands
+    ovpn_flush = ""
+    ovpn_add = ""
+    for r in ovpn_rules:
+        ovpn_flush += (
+            f"iptables -t nat -D PREROUTING -p {r['proto']} --dport {r['port']} "
+            f"-j DNAT --to-destination {r['ip']}:{r['port']} 2>/dev/null ; "
+        )
+        ovpn_add += (
+            f"iptables -t nat -A PREROUTING -p {r['proto']} --dport {r['port']} "
+            f"-j DNAT --to-destination {r['ip']}:{r['port']} ; "
+        )
+
+    install_cmd = (
+        "sysctl -w net.ipv4.ip_forward=1 > /dev/null 2>&1 ; "
+        "grep -q 'net.ipv4.ip_forward=1' /etc/sysctl.conf 2>/dev/null || "
+        "echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf ; "
+        "modprobe nf_nat_pptp 2>/dev/null ; "
+        "modprobe nf_conntrack_pptp 2>/dev/null ; "
+        "modprobe ip_gre 2>/dev/null ; "
+        "iptables -t nat -D PREROUTING -p tcp --dport 1723 -j DNAT --to-destination "
+        f"{backend}:1723 2>/dev/null ; "
+        "iptables -t nat -D PREROUTING -p gre ! -s "
+        f"{backend} -j DNAT --to-destination {backend} 2>/dev/null ; "
+        "iptables -t raw -D PREROUTING -p tcp --dport 1723 -j CT --helper pptp 2>/dev/null ; "
+        f"iptables -t nat -A PREROUTING -p tcp --dport 1723 -j DNAT --to-destination {backend}:1723 ; "
+        f"iptables -t nat -A PREROUTING -p gre ! -s {backend} -j DNAT --to-destination {backend} ; "
+        + ovpn_flush + ovpn_add +
+        "iptables -t nat -C POSTROUTING -j MASQUERADE 2>/dev/null || "
+        "iptables -t nat -A POSTROUTING -j MASQUERADE ; "
+        "iptables -C FORWARD -j ACCEPT 2>/dev/null || "
+        "iptables -A FORWARD -j ACCEPT ; "
+        "iptables -t raw -A PREROUTING -p tcp --dport 1723 -j CT --helper pptp 2>/dev/null ; "
+        "grep -q nf_nat_pptp /etc/modules 2>/dev/null || echo nf_nat_pptp >> /etc/modules ; "
+        "grep -q nf_conntrack_pptp /etc/modules 2>/dev/null || echo nf_conntrack_pptp >> /etc/modules ; "
+        "grep -q ip_gre /etc/modules 2>/dev/null || echo ip_gre >> /etc/modules ; "
+        "cat > /etc/rc.local << 'RCEOF'\n"
+        "#!/bin/bash\n"
+        "modprobe nf_nat_pptp\n"
+        "modprobe nf_conntrack_pptp\n"
+        "modprobe ip_gre\n"
+        "iptables -t raw -A PREROUTING -p tcp --dport 1723 -j CT --helper pptp\n"
+        "exit 0\n"
+        "RCEOF\n"
+        "chmod +x /etc/rc.local ; "
+        "systemctl enable rc-local 2>/dev/null ; "
+        "iptables -t nat -S PREROUTING 2>/dev/null | grep -q '1723' && echo PPTP_FWD_OK || echo PPTP_FWD_FAIL ; "
+        "which netfilter-persistent >/dev/null 2>&1 || "
+        "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iptables-persistent 2>/dev/null || "
+        "yum install -y -q iptables-services 2>/dev/null ; "
+        "netfilter-persistent save 2>/dev/null || "
+        "service iptables save 2>/dev/null"
+    )
+    ok, out = ssh_exec(front_ip, 22, srv["ssh_user"], srv["ssh_pass"], install_cmd)
+    kb = [[InlineKeyboardButton("📋 Шаблоны", callback_data='fwd_tpl_menu'),
+           InlineKeyboardButton("🔀 PPTP форвард", callback_data='pptp_fwd_menu')]]
+    if ok and "PPTP_FWD_OK" in out:
+        srv["pptp_backend"] = backend
+        if ovpn_rules:
+            srv["ovpn_rules"] = ovpn_rules
+            srv["ovpn_backend"] = ovpn_rules[0]['ip']
+        save_gost_servers(servers)
+        rr_append_history(f"FWD_TPL_APPLY: {tpl.get('name','')} -> {front_ip}")
+        ovpn_disp = "\n".join(
+            f"DNAT {r['proto'].upper()} :{r['port']} → <code>{r['ip']}:{r['port']}</code>"
+            for r in ovpn_rules)
+        await safe_edit_text(q, context,
+            f"✅ Шаблон <b>{escape(tpl.get('name',''))}</b> применён на <code>{front_ip}</code>\n\n"
+            f"PPTP (TCP:1723+GRE) → <code>{backend}</code>\n"
+            + (ovpn_disp if ovpn_rules else ""),
+            parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+    else:
+        await safe_edit_text(q, context,
+            f"❌ Ошибка:\n<pre>{escape(out[:2000])}</pre>",
+            parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def fwd_tpl_del_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show templates for deletion."""
+    q = update.callback_query
+    await q.answer()
+    templates = load_fwd_templates()
+    if not templates:
+        kb = [[InlineKeyboardButton("◀️ Назад", callback_data='fwd_tpl_menu')]]
+        await safe_edit_text(q, context, "Нет шаблонов.",
+            reply_markup=InlineKeyboardMarkup(kb))
+        return
+    kb = []
+    for i, t in enumerate(templates):
+        name = t.get("name", f"Шаблон {i+1}")
+        kb.append([InlineKeyboardButton(f"❌ {name}", callback_data=f'fwd_tpl_rm:{i}')])
+    kb.append([InlineKeyboardButton("◀️ Назад", callback_data='fwd_tpl_menu')])
+    await safe_edit_text(q, context,
+        "🗑 <b>Удалить шаблон</b>\n\nВыберите:",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def fwd_tpl_del_exec(update: Update, context: ContextTypes.DEFAULT_TYPE, idx: int):
+    """Delete a template by index."""
+    q = update.callback_query
+    await q.answer()
+    templates = load_fwd_templates()
+    if idx < 0 or idx >= len(templates):
+        await safe_edit_text(q, context, "❌ Шаблон не найден.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀️ Назад", callback_data='fwd_tpl_menu')]]))
+        return
+    removed = templates.pop(idx)
+    save_fwd_templates(templates)
+    rr_append_history(f"FWD_TPL_DEL: {removed.get('name','')}")
+    kb = [[InlineKeyboardButton("📋 Шаблоны", callback_data='fwd_tpl_menu')]]
+    await safe_edit_text(q, context,
+        f"✅ Шаблон <b>{escape(removed.get('name',''))}</b> удалён.",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
 async def pptp_fwd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+    tpl_count = len(load_fwd_templates())
     kb = [
         [InlineKeyboardButton("⚙️ Установить PPTP форвард", callback_data='pptp_fwd_select_install')],
         [InlineKeyboardButton("🔄 Сменить PPTP бэкенд", callback_data='pptp_fwd_select_change')],
         [InlineKeyboardButton("📊 Статус PPTP форварда", callback_data='pptp_fwd_select_status')],
         [InlineKeyboardButton("🗑️ Удалить PPTP форвард", callback_data='pptp_fwd_select_remove')],
+        [InlineKeyboardButton(f"📋 Шаблоны ({tpl_count})", callback_data='fwd_tpl_menu')],
         [InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')],
     ]
     await safe_edit_text(q, context,
