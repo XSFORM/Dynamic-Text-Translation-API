@@ -376,6 +376,7 @@ PPTP_CLIENTS_FILE = "/root/monitor_bot/pptp_clients.json"
 TM_BYPASS_FILE = "/root/monitor_bot/tm_bypass_routes.txt"
 PPTP_FWD_TEMPLATES_FILE = "/root/monitor_bot/pptp_fwd_templates.json"
 GOST_TEMPLATES_FILE = "/root/monitor_bot/gost_templates.json"
+_GTPL_DRAFT = {}  # backup storage for manual template: {user_id: {'name':..., 'rules':[...]}}
 PPTP_IP_START = 10          # 172.16.0.10
 PPTP_IP_PREFIX = "172.16.0"
 IPP_FILE = "/etc/openvpn/ipp.txt"
@@ -6919,6 +6920,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                   'await_gost_add', 'await_gost_edit_ip', 'await_gost_edit',
                   'await_gost_rule', 'await_gost_addrule'):
             context.user_data.pop(k, None)
+        _GTPL_DRAFT.pop(update.effective_user.id, None)
         await gost_tpl_menu(update, context)
     elif data == 'gtpl_add_manual':
         await gtpl_add_manual_start(update, context)
@@ -9794,6 +9796,8 @@ async def gtpl_add_manual_start(update: Update, context: ContextTypes.DEFAULT_TY
     for k in ('await_gost_add', 'await_gost_edit_ip', 'await_gost_edit',
               'await_gost_rule', 'await_gost_addrule', 'await_gtpl_name'):
         context.user_data.pop(k, None)
+    # Clear old draft backup
+    _GTPL_DRAFT.pop(update.effective_user.id, None)
     context.user_data['await_gtpl_manual'] = {'step': 'name', 'rules': []}
     await safe_edit_text(q, context,
         "➕ <b>Новый шаблон GOST</b>\n\n"
@@ -9854,8 +9858,11 @@ async def gtpl_manual_receive(update: Update, context: ContextTypes.DEFAULT_TYPE
             data.pop(k, None)
         data['rules'].append(rule)
         data['step'] = 'more'
-        logger.info("GTPL remote_port done: rules=%s, data_id=%s, ud_keys=%s",
-                     data['rules'], id(data), [k for k in context.user_data if k.startswith('await_')])
+        # Backup to module-level dict in case user_data gets cleared
+        uid = update.effective_user.id
+        _GTPL_DRAFT[uid] = {'name': data['name'], 'rules': list(data['rules'])}
+        logger.info("GTPL remote_port done: rules=%s, draft=%s, ud_keys=%s",
+                     data['rules'], _GTPL_DRAFT.get(uid), [k for k in context.user_data if k.startswith('await_')])
         try:
             r_str = "\n".join(
                 f"  {r['proto']}://:{r['local_port']} → {r['remote_ip']}:{r['remote_port']}"
@@ -9898,10 +9905,19 @@ async def gtpl_manual_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Save manually created template."""
     q = update.callback_query
     await q.answer()
-    logger.warning("gtpl_manual_done CALLED: ud_keys=%s, await_gtpl_manual=%s",
+    uid = update.effective_user.id
+    logger.warning("gtpl_manual_done CALLED: ud_keys=%s, await_gtpl_manual=%s, draft=%s",
                    [k for k in context.user_data if k.startswith('await_')],
-                   repr(context.user_data.get('await_gtpl_manual')))
+                   repr(context.user_data.get('await_gtpl_manual')),
+                   repr(_GTPL_DRAFT.get(uid)))
     data = context.user_data.pop('await_gtpl_manual', None)
+    # Fallback: if user_data was cleared, use backup draft
+    if not data or not data.get('rules'):
+        data = _GTPL_DRAFT.pop(uid, None)
+        if data:
+            logger.warning("gtpl_manual_done: RECOVERED from _GTPL_DRAFT: %s", data)
+    else:
+        _GTPL_DRAFT.pop(uid, None)
     if not data or not data.get('rules'):
         logger.warning("gtpl_manual_done: FAIL data=%s", data)
         await safe_edit_text(q, context, "❌ Нет правил для сохранения.",
