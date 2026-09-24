@@ -29,7 +29,8 @@ import pytz
 import pyzipper
 
 from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile,
+    ReplyKeyboardMarkup, KeyboardButton
 )
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, ContextTypes,
@@ -5495,8 +5496,158 @@ def _clear_awaits(context, keep: str = None):
 # =====================================================================
 #  UNIVERSAL TEXT HANDLER
 # =====================================================================
+async def _reply_kb_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle '📊 Статистика' reply keyboard button."""
+    clients, online_names, tunnel_ips = parse_openvpn_status()
+    files = get_ovpn_files()
+    files = sorted(files, key=lambda x: _natural_key(x[:-5]))
+    routers = load_routers()
+    pptp_clients = load_pptp_clients()
+    lines = ["<b>Статус всех ключей:</b>"]
+    cnt_online = cnt_offline = cnt_disabled = cnt_pptp = 0
+    for f in files:
+        name = f[:-5]
+        r = routers.get(name, {})
+        is_pptp = r.get("vpn_type") == "pptp"
+        if is_pptp and name in online_names:
+            switch_ts = r.get("vpn_type_ts", 0)
+            if time.time() - switch_ts > 600:
+                r.pop("vpn_type", None)
+                r.pop("vpn_type_ts", None)
+                is_pptp = False
+        if is_client_ccd_disabled(name):
+            cnt_disabled += 1
+            lines.append(f"⛔ {name}")
+        elif is_pptp:
+            pptp_ip = pptp_clients.get(name, "")
+            cnt_pptp += 1
+            lines.append(f'🟡 {name}  <a href="http://{pptp_ip}">{pptp_ip}</a> [PPTP]')
+        elif name in online_names:
+            cnt_online += 1
+            tip = tunnel_ips.get(name, "")
+            if tip:
+                lines.append(f'🟢 {name}  <a href="http://{tip}">{tip}</a>')
+            else:
+                lines.append(f"🟢 {name}")
+        else:
+            cnt_offline += 1
+            lines.append(f"🔴 {name}")
+    summary = (f"\nОнлайн: {cnt_online}  Офлайн: {cnt_offline}  "
+               f"Откл: {cnt_disabled}  PPTP: {cnt_pptp}  Всего: {len(files)}")
+    lines.append(summary)
+    kb = [[InlineKeyboardButton("🔄 Обновить", callback_data='stats'),
+           InlineKeyboardButton("🏠 Меню", callback_data='home')]]
+    await update.message.reply_text("\n".join(lines),
+        parse_mode="HTML", disable_web_page_preview=True,
+        reply_markup=InlineKeyboardMarkup(kb))
+
+async def _reply_kb_ssh(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle '🖥 SSH Роутеры' reply keyboard button."""
+    routers = load_routers()
+    count = len(routers)
+    kb = [
+        [InlineKeyboardButton(f"📋 Список роутеров ({count})", callback_data='ssh_list')],
+        [InlineKeyboardButton("➕ Добавить", callback_data='ssh_add'),
+         InlineKeyboardButton("✏️ Редактировать", callback_data='ssh_select_edit')],
+        [InlineKeyboardButton("🗑️ Удалить", callback_data='ssh_select_delete')],
+        [InlineKeyboardButton("📡 Пинг всех", callback_data='ssh_ping_all')],
+        [InlineKeyboardButton("🔍 Статус роутера", callback_data='ssh_select_status')],
+        [InlineKeyboardButton("📦 Залить скрипт", callback_data='ssh_select_deploy'),
+         InlineKeyboardButton("📋 Версия", callback_data='ssh_check_ver')],
+        [InlineKeyboardButton("🩹 Лечение", callback_data='ssh_select_heal')],
+        [InlineKeyboardButton("🔁 Перезагрузка", callback_data='ssh_select_reboot')],
+        [InlineKeyboardButton("💻 Команда", callback_data='ssh_select_cmd')],
+        [InlineKeyboardButton("🔑 Сменить пароль", callback_data='ssh_chpass_menu')],
+        [InlineKeyboardButton("📝 Конфиг OpenVPN", callback_data='oec_menu')],
+        [InlineKeyboardButton("🔗 Обратный туннель", callback_data='rt_menu')],
+        [InlineKeyboardButton("🏠 В главное меню", callback_data='home')],
+    ]
+    await update.message.reply_text(
+        f"🖥 <b>SSH Роутеры</b>\n\nСохранено роутеров: {count}",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+async def _reply_kb_gost(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle '🌐 GOST Серверы' reply keyboard button."""
+    servers = load_gost_servers()
+    count = len(servers)
+    kb = [
+        [InlineKeyboardButton(f"📋 Список серверов ({count})", callback_data='gost_list')],
+        [InlineKeyboardButton("➕ Добавить сервер", callback_data='gost_add')],
+        [InlineKeyboardButton("⚙️ Установить GOST", callback_data='gost_select_install')],
+        [InlineKeyboardButton("📡 Настроить правила", callback_data='gost_select_rules')],
+        [InlineKeyboardButton("➕ Добавить правило", callback_data='gost_select_addrule')],
+        [InlineKeyboardButton("📄 Показать конфиг", callback_data='gost_select_showconf')],
+        [InlineKeyboardButton("📡 Пинг серверов", callback_data='gost_ping_all')],
+        [InlineKeyboardButton("▶️ Старт", callback_data='gost_select_start'),
+         InlineKeyboardButton("⏹ Стоп", callback_data='gost_select_stop'),
+         InlineKeyboardButton("🔁 Рестарт", callback_data='gost_select_restart')],
+        [InlineKeyboardButton("📊 Статус", callback_data='gost_select_status'),
+         InlineKeyboardButton("📜 Лог", callback_data='gost_select_log')],
+        [InlineKeyboardButton("💾 Бэкап", callback_data='gost_select_backup'),
+         InlineKeyboardButton("📥 Восстановить", callback_data='gost_select_restore')],
+        [InlineKeyboardButton("🚀 Ускорить TCP/UDP", callback_data='gost_select_optimize')],
+        [InlineKeyboardButton("🔀 PPTP форвард (iptables)", callback_data='pptp_fwd_menu')],
+        [InlineKeyboardButton("🗑️ Удалить GOST", callback_data='gost_select_uninstall')],
+        [InlineKeyboardButton("🔐 Получить Root", callback_data='gost_getroot')],
+        [InlineKeyboardButton("❓ Помощь GOST", callback_data='gost_help')],
+        [InlineKeyboardButton("🏠 В главное меню", callback_data='home')],
+    ]
+    await update.message.reply_text(
+        f"🌐 <b>GOST Серверы</b> — управление\nСерверов: <b>{count}</b>",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+async def _reply_kb_autoip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle '🔄 Авто IP' reply keyboard button."""
+    pool = load_ip_pool()
+    current_ip = rr_read_file(RR_IP_FILE, "").strip()
+    pptp_ip = rr_read_file(RR_PPTP_IP_FILE, "").strip()
+    ovpn_st = "🟢" if auto_ip_state["ovpn"] else "🔴"
+    pptp_st = "🟢" if auto_ip_state["pptp"] else "🔴"
+    lines = [
+        f"<b>🔄 Авто IP</b>",
+        f"OVPN: {ovpn_st}  PPTP: {pptp_st}",
+        f"OpenVPN IP: <code>{current_ip}</code>",
+        f"PPTP IP: <code>{pptp_ip}</code>",
+        "",
+    ]
+    if pool:
+        for i, entry in enumerate(pool, 1):
+            marker = " ◀️" if entry["ip"] == current_ip else ""
+            label = entry.get("label", "")
+            lines.append(f"{i}. <code>{entry['ip']}</code> ({label}){marker}")
+    else:
+        lines.append("Пул пуст.")
+    ovpn_btn = "🔴 OVPN выкл" if auto_ip_state["ovpn"] else "🟢 OVPN вкл"
+    pptp_btn = "🔴 PPTP выкл" if auto_ip_state["pptp"] else "🟢 PPTP вкл"
+    kb = [
+        [InlineKeyboardButton(ovpn_btn, callback_data='aip_toggle_ovpn'),
+         InlineKeyboardButton(pptp_btn, callback_data='aip_toggle_pptp')],
+        [InlineKeyboardButton("➕ Добавить IP", callback_data='aip_add'),
+         InlineKeyboardButton("\U0001f5d1 Удалить IP", callback_data='aip_remove')],
+        [InlineKeyboardButton("↕️ Порядок", callback_data='aip_reorder'),
+         InlineKeyboardButton("🔄 Заменить IP", callback_data='aip_replace')],
+        [InlineKeyboardButton("📡 Пинг", callback_data='aip_ping')],
+        [InlineKeyboardButton("\U0001f3e0 Меню", callback_data='home')],
+    ]
+    await update.message.reply_text("\n".join(lines),
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+# Reply keyboard button text → handler mapping
+_REPLY_KB_MAP = {
+    "📊 Статистика": _reply_kb_stats,
+    "🖥 SSH Роутеры": _reply_kb_ssh,
+    "🌐 GOST Серверы": _reply_kb_gost,
+    "🔄 Авто IP": _reply_kb_autoip,
+}
+
 async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
+    # Handle reply keyboard quick buttons
+    text = update.message.text.strip() if update.message.text else ""
+    handler = _REPLY_KB_MAP.get(text)
+    if handler:
+        await handler(update, context)
+        return
     # Subnet Pool setup
     if context.user_data.get('await_subnet_setup'):
         handled = await subnet_setup_receive(update, context)
@@ -8856,6 +9007,13 @@ async def send_help_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =====================================================================
 #  COMMANDS
 # =====================================================================
+# Persistent bottom reply keyboard (quick access)
+REPLY_KB = ReplyKeyboardMarkup(
+    [[KeyboardButton("📊 Статистика"), KeyboardButton("🖥 SSH Роутеры")],
+     [KeyboardButton("🌐 GOST Серверы"), KeyboardButton("🔄 Авто IP")]],
+    resize_keyboard=True
+)
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
     global MENU_MESSAGE_ID, MENU_CHAT_ID
@@ -8869,7 +9027,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.delete()
     except Exception:
         pass
-    sent = await update.message.reply_text(f"Добро пожаловать! Версия: {BOT_VERSION}", reply_markup=kb)
+    # Send reply keyboard first (persists at bottom)
+    await update.message.reply_text(
+        f"Добро пожаловать! Версия: {BOT_VERSION}",
+        reply_markup=REPLY_KB)
+    # Then send inline menu
+    sent = await update.message.reply_text("📋 <b>Главное меню</b>",
+        parse_mode="HTML", reply_markup=kb)
     MENU_MESSAGE_ID = sent.message_id; MENU_CHAT_ID = sent.chat.id
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
