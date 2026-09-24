@@ -540,16 +540,18 @@ def set_pptp_emergency(enabled: bool):
             pass
 
 
-def ssh_exec(ip: str, port: int, user: str, password: str, command: str) -> Tuple[bool, str]:
+def ssh_exec(ip: str, port: int, user: str, password: str, command: str,
+             cmd_timeout: int = None) -> Tuple[bool, str]:
     """Execute SSH command on router. Returns (success, output)."""
+    _timeout = cmd_timeout or SSH_CMD_TIMEOUT
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     try:
         client.connect(ip, port=port, username=user, password=password,
                        timeout=SSH_TIMEOUT, look_for_keys=False, allow_agent=False)
-        stdin, stdout, stderr = client.exec_command(command, timeout=SSH_CMD_TIMEOUT)
+        stdin, stdout, stderr = client.exec_command(command, timeout=_timeout)
         # Set channel read timeout so read() doesn't hang when VPN drops
-        stdout.channel.settimeout(SSH_CMD_TIMEOUT)
+        stdout.channel.settimeout(_timeout)
         try:
             out = stdout.read().decode("utf-8", errors="replace").strip()
         except socket.timeout:
@@ -10447,7 +10449,7 @@ async def gost_install(update: Update, context: ContextTypes.DEFAULT_TYPE, ip: s
         "rm -f gost.tar.gz && "
         "echo \"GOST_OK:$VER\""
     )
-    ok, out = ssh_exec(ip, 22, srv["ssh_user"], srv["ssh_pass"], install_cmd)
+    ok, out = ssh_exec(ip, 22, srv["ssh_user"], srv["ssh_pass"], install_cmd, cmd_timeout=120)
     if ok and "GOST_OK:" in out:
         ver = out.split("GOST_OK:")[-1].strip()
         result = f"✅ GOST v{ver} установлен на <code>{ip}</code>"
