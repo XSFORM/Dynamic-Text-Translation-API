@@ -6869,7 +6869,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await gost_rule_done(update, context)
     # --- GOST Templates ---
     elif data == 'gtpl_menu':
-        context.user_data.pop('await_gtpl_manual', None)
+        for k in ('await_gtpl_manual', 'await_gtpl_name',
+                  'await_gost_add', 'await_gost_edit_ip', 'await_gost_edit',
+                  'await_gost_rule', 'await_gost_addrule'):
+            context.user_data.pop(k, None)
         await gost_tpl_menu(update, context)
     elif data == 'gtpl_add_manual':
         await gtpl_add_manual_start(update, context)
@@ -9740,6 +9743,10 @@ async def gtpl_add_manual_start(update: Update, context: ContextTypes.DEFAULT_TY
     """Start manual template creation — ask for name first."""
     q = update.callback_query
     await q.answer()
+    # Clear any conflicting GOST await states that sit above us in the text handler chain
+    for k in ('await_gost_add', 'await_gost_edit_ip', 'await_gost_edit',
+              'await_gost_rule', 'await_gost_addrule', 'await_gtpl_name'):
+        context.user_data.pop(k, None)
     context.user_data['await_gtpl_manual'] = {'step': 'name', 'rules': []}
     await safe_edit_text(q, context,
         "➕ <b>Новый шаблон GOST</b>\n\n"
@@ -9790,25 +9797,39 @@ async def gtpl_manual_receive(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text("Порт должен быть числом 1-65535. Повторите:")
             return
         rule = {
-            "proto": data.pop('proto'),
-            "local_port": data.pop('local_port'),
-            "remote_ip": data.pop('remote_ip'),
+            "proto": data.get('proto', 'tcp'),
+            "local_port": data.get('local_port', 0),
+            "remote_ip": data.get('remote_ip', '0.0.0.0'),
             "remote_port": int(text),
         }
+        # Clean up temp keys
+        for k in ('proto', 'local_port', 'remote_ip'):
+            data.pop(k, None)
         data['rules'].append(rule)
         data['step'] = 'more'
-        r_str = "\n".join(
-            f"  {r['proto']}://:{r['local_port']} → {r['remote_ip']}:{r['remote_port']}"
-            for r in data['rules'])
-        await update.message.reply_text(
-            f"<b>{escape(data['name'])}</b> — правила:\n<code>{r_str}</code>\n\n"
-            "Добавить ещё правило или сохранить?",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([
+        try:
+            r_str = "\n".join(
+                f"  {r['proto']}://:{r['local_port']} → {r['remote_ip']}:{r['remote_port']}"
+                for r in data['rules'])
+            kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton("➕ Ещё правило", callback_data='gtpl_manual_more')],
                 [InlineKeyboardButton("✅ Сохранить", callback_data='gtpl_manual_done')],
                 [InlineKeyboardButton("❌ Отмена", callback_data='gtpl_menu')],
-            ]))
+            ])
+            await update.message.reply_text(
+                f"<b>{escape(data['name'])}</b> — правила:\n<code>{r_str}</code>\n\n"
+                "Добавить ещё правило или сохранить?",
+                parse_mode="HTML", reply_markup=kb)
+        except Exception:
+            # Fallback — buttons must still appear even if HTML formatting fails
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Сохранить", callback_data='gtpl_manual_done')],
+                [InlineKeyboardButton("➕ Ещё правило", callback_data='gtpl_manual_more')],
+                [InlineKeyboardButton("❌ Отмена", callback_data='gtpl_menu')],
+            ])
+            await update.message.reply_text(
+                f"Правило добавлено ({len(data['rules'])} шт). Сохранить?",
+                reply_markup=kb)
 
 
 async def gtpl_manual_more(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -9828,6 +9849,7 @@ async def gtpl_manual_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     data = context.user_data.pop('await_gtpl_manual', None)
     if not data or not data.get('rules'):
+        logger.warning("gtpl_manual_done: empty data=%s", data)
         await safe_edit_text(q, context, "❌ Нет правил для сохранения.",
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("◀️ Назад", callback_data='gtpl_menu')]]))
