@@ -372,6 +372,7 @@ OVPN_EDIT_FILES = {
 ROUTERS_FILE = "/root/monitor_bot/routers.json"
 PPTP_SERVER_FILE = "/root/monitor_bot/pptp_server.json"
 PPTP_CLIENTS_FILE = "/root/monitor_bot/pptp_clients.json"
+TM_BYPASS_FILE = "/root/monitor_bot/tm_bypass_routes.txt"
 PPTP_IP_START = 10          # 172.16.0.10
 PPTP_IP_PREFIX = "172.16.0"
 IPP_FILE = "/etc/openvpn/ipp.txt"
@@ -699,16 +700,32 @@ TUNNEL_IP_FILE = "/root/monitor_bot/www/router/tunnel_ip.txt"
 TUNNEL_PORT_START = 9001
 TUNNEL_PORT_END = 9060
 
-# TM service bypass routes — same as OpenVPN push routes, routed via ISP gateway on PPTP
-TM_BYPASS_ROUTES = [
-    "77.83.59.0/24", "95.85.96.0/22", "103.220.0.0/22",
+# TM service bypass routes — defaults if tm_bypass_routes.txt doesn't exist yet
+_TM_BYPASS_DEFAULTS = [
+    "77.83.59.0/24", "95.85.96.0/19", "103.220.0.0/22",
     "119.235.112.0/20", "177.93.143.0/24", "185.69.184.0/22",
     "185.246.72.0/22", "216.250.8.0/21", "217.174.224.0/20",
 ]
 
+def load_tm_bypass_routes() -> List[str]:
+    """Load TM bypass routes from file, fall back to defaults."""
+    try:
+        with open(TM_BYPASS_FILE, "r") as f:
+            routes = [l.strip() for l in f if l.strip() and not l.startswith("#")]
+            return routes if routes else list(_TM_BYPASS_DEFAULTS)
+    except FileNotFoundError:
+        return list(_TM_BYPASS_DEFAULTS)
+
+def save_tm_bypass_routes(routes: List[str]):
+    with open(TM_BYPASS_FILE, "w") as f:
+        f.write("# TM bypass routes — one CIDR per line\n")
+        for r in routes:
+            f.write(r + "\n")
+
 def _build_vpnc_script() -> str:
     """Build vpnc_script.sh that adds TM bypass routes after PPTP connects."""
-    routes_cmds = "\n".join(f'  ip route add {r} via $GW 2>/dev/null' for r in TM_BYPASS_ROUTES)
+    routes = load_tm_bypass_routes()
+    routes_cmds = "\n".join(f'  ip route add {r} via $GW 2>/dev/null' for r in routes)
     return (
         '#!/bin/sh\n'
         '# TM service bypass routes for PPTP\n'
@@ -3945,7 +3962,8 @@ async def pptp_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb.extend([
         [InlineKeyboardButton(f"👥 Клиенты ({len(clients)})", callback_data='pptp_clients'),
          InlineKeyboardButton("🔀 Переключить", callback_data='vpn_switch')],
-        [InlineKeyboardButton("⚙️ Сервер PPTP", callback_data='pptp_server')],
+        [InlineKeyboardButton("⚙️ Сервер PPTP", callback_data='pptp_server'),
+         InlineKeyboardButton("🛡 TM Обход", callback_data='tm_bypass')],
         [InlineKeyboardButton("🏠 Меню", callback_data='home')],
     ])
     if pptp_synced:
@@ -4446,6 +4464,231 @@ async def pptp_cl_remove(update: Update, context: ContextTypes.DEFAULT_TYPE, cn:
     await safe_edit_text(q, context,
         f"{status} <b>{cn}</b> ({ip}) удалён.",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+# =====================================================================
+#  TM BYPASS ROUTES (vpnc_script.sh management)
+# =====================================================================
+
+async def tm_bypass_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show current TM bypass routes + management buttons."""
+    q = update.callback_query
+    await q.answer()
+    routes = load_tm_bypass_routes()
+    lines = "\n".join(f"  {i+1}. <code>{r}</code>" for i, r in enumerate(routes))
+    if not lines:
+        lines = "  <i>(пусто)</i>"
+    kb = [
+        [InlineKeyboardButton("➕ Добавить", callback_data='tmb_add'),
+         InlineKeyboardButton("🗑 Удалить", callback_data='tmb_del')],
+        [InlineKeyboardButton("📤 Залить на один", callback_data='tmb_deploy_pick'),
+         InlineKeyboardButton("📤 Залить на все", callback_data='tmb_deploy_all')],
+        [InlineKeyboardButton("🔗 PPTP", callback_data='pptp_menu')],
+    ]
+    await safe_edit_text(q, context,
+        f"🛡 <b>TM Обход — маршруты</b>\n\n"
+        f"Маршруты ({len(routes)}):\n{lines}\n\n"
+        f"<i>Эти маршруты добавляются в vpnc_script.sh\n"
+        f"и направляют трафик к TM-сервисам в обход VPN.</i>",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def tmb_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Prompt to enter a new CIDR route."""
+    q = update.callback_query
+    await q.answer()
+    context.user_data['await_tmb_add'] = True
+    await safe_edit_text(q, context,
+        "🛡 <b>TM Обход — Добавить маршрут</b>\n\n"
+        "Введите подсеть в формате CIDR:\n"
+        "Пример: <code>95.85.96.0/19</code>\n\n"
+        "Можно несколько через пробел или каждый с новой строки.",
+        parse_mode="HTML")
+
+
+async def tmb_add_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Receive new CIDR route(s) from user."""
+    context.user_data.pop('await_tmb_add', None)
+    text = update.message.text.strip()
+    # Split by whitespace and newlines
+    new_routes = [r.strip() for r in text.replace("\n", " ").split() if r.strip()]
+    routes = load_tm_bypass_routes()
+    added = []
+    errors = []
+    for r in new_routes:
+        # Basic CIDR validation
+        if "/" not in r:
+            errors.append(r)
+            continue
+        parts = r.split("/")
+        if len(parts) != 2:
+            errors.append(r)
+            continue
+        octets = parts[0].split(".")
+        if len(octets) != 4:
+            errors.append(r)
+            continue
+        try:
+            for o in octets:
+                v = int(o)
+                if v < 0 or v > 255:
+                    raise ValueError
+            prefix = int(parts[1])
+            if prefix < 0 or prefix > 32:
+                raise ValueError
+        except ValueError:
+            errors.append(r)
+            continue
+        if r in routes:
+            errors.append(f"{r} (дубль)")
+            continue
+        routes.append(r)
+        added.append(r)
+    if added:
+        save_tm_bypass_routes(routes)
+        rr_append_history(f"TMB_ADD: {', '.join(added)}")
+    msg = ""
+    if added:
+        msg += f"✅ Добавлено: {', '.join(added)}\n"
+    if errors:
+        msg += f"⚠️ Пропущено: {', '.join(errors)}\n"
+    if not added and not errors:
+        msg = "❌ Ничего не добавлено."
+    kb = [[InlineKeyboardButton("🛡 TM Обход", callback_data='tm_bypass')]]
+    await update.message.reply_text(msg.strip(),
+        reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def tmb_del_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show list of routes as buttons for deletion."""
+    q = update.callback_query
+    await q.answer()
+    routes = load_tm_bypass_routes()
+    if not routes:
+        kb = [[InlineKeyboardButton("🛡 TM Обход", callback_data='tm_bypass')]]
+        await safe_edit_text(q, context, "Список маршрутов пуст.",
+            reply_markup=InlineKeyboardMarkup(kb))
+        return
+    kb = []
+    for i, r in enumerate(routes):
+        kb.append([InlineKeyboardButton(f"❌ {r}", callback_data=f'tmb_del_{i}')])
+    kb.append([InlineKeyboardButton("◀ Назад", callback_data='tm_bypass')])
+    await safe_edit_text(q, context,
+        "🗑 <b>Удалить маршрут</b>\n\nНажмите на маршрут для удаления:",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def tmb_del_exec(update: Update, context: ContextTypes.DEFAULT_TYPE, idx: int):
+    """Delete route by index."""
+    q = update.callback_query
+    await q.answer()
+    routes = load_tm_bypass_routes()
+    if idx < 0 or idx >= len(routes):
+        await safe_edit_text(q, context, "❌ Маршрут не найден.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🛡 TM Обход", callback_data='tm_bypass')]]))
+        return
+    removed = routes.pop(idx)
+    save_tm_bypass_routes(routes)
+    rr_append_history(f"TMB_DEL: {removed}")
+    kb = [[InlineKeyboardButton("🛡 TM Обход", callback_data='tm_bypass')]]
+    await safe_edit_text(q, context,
+        f"✅ Удалён: <code>{removed}</code>",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def tmb_deploy_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show list of PPTP routers to deploy vpnc_script.sh to."""
+    q = update.callback_query
+    await q.answer()
+    routers = load_routers()
+    pptp_routers = {cn: r for cn, r in routers.items() if r.get("vpn_type") == "pptp"}
+    if not pptp_routers:
+        kb = [[InlineKeyboardButton("🛡 TM Обход", callback_data='tm_bypass')]]
+        await safe_edit_text(q, context, "❌ Нет роутеров на PPTP.",
+            reply_markup=InlineKeyboardMarkup(kb))
+        return
+    kb = []
+    for cn in sorted(pptp_routers.keys()):
+        kb.append([InlineKeyboardButton(f"📤 {cn}", callback_data=f'tmb_dep_{cn}')])
+    kb.append([InlineKeyboardButton("◀ Назад", callback_data='tm_bypass')])
+    await safe_edit_text(q, context,
+        "📤 <b>Залить vpnc_script.sh</b>\n\nВыберите роутер:",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def _tmb_deploy_to_router(cn: str) -> tuple:
+    """Deploy vpnc_script.sh to a single PPTP router. Returns (ok, msg)."""
+    script_content = _build_vpnc_script()
+    # Escape single quotes in script for heredoc safety
+    escaped = script_content.replace("'", "'\\''")
+    cmd = (
+        f"cat > /etc/storage/vpnc_script.sh << 'VPNCEOF'\n{script_content}VPNCEOF\n"
+        f"chmod +x /etc/storage/vpnc_script.sh && mtd_storage.sh save 2>/dev/null; "
+        f"echo VPNC_DEPLOY_OK"
+    )
+    ok, out = router_ssh_exec(cn, cmd)
+    if ok and "VPNC_DEPLOY_OK" in (out or ""):
+        return True, "✅"
+    return False, out or "no output"
+
+
+async def tmb_deploy_one(update: Update, context: ContextTypes.DEFAULT_TYPE, cn: str):
+    """Deploy vpnc_script.sh to a single router."""
+    q = update.callback_query
+    await q.answer()
+    await safe_edit_text(q, context,
+        f"⏳ Заливаю vpnc_script.sh на <b>{cn}</b>...",
+        parse_mode="HTML")
+    ok, msg = await _tmb_deploy_to_router(cn)
+    rr_append_history(f"TMB_DEPLOY: {cn} -> {'OK' if ok else 'FAIL'}")
+    if ok:
+        kb = [[InlineKeyboardButton("🛡 TM Обход", callback_data='tm_bypass')]]
+        await safe_edit_text(q, context,
+            f"✅ <b>{cn}</b> — vpnc_script.sh залит и сохранён.",
+            parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+    else:
+        kb = [[InlineKeyboardButton("🛡 TM Обход", callback_data='tm_bypass')]]
+        await safe_edit_text(q, context,
+            f"❌ <b>{cn}</b> — ошибка:\n<pre>{_html_escape(msg)}</pre>",
+            parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def tmb_deploy_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Deploy vpnc_script.sh to ALL PPTP routers."""
+    q = update.callback_query
+    await q.answer()
+    routers = load_routers()
+    pptp_routers = sorted(cn for cn, r in routers.items() if r.get("vpn_type") == "pptp")
+    if not pptp_routers:
+        kb = [[InlineKeyboardButton("🛡 TM Обход", callback_data='tm_bypass')]]
+        await safe_edit_text(q, context, "❌ Нет роутеров на PPTP.",
+            reply_markup=InlineKeyboardMarkup(kb))
+        return
+    await safe_edit_text(q, context,
+        f"⏳ Заливаю vpnc_script.sh на <b>{len(pptp_routers)}</b> роутер(ов)...",
+        parse_mode="HTML")
+    ok_list = []
+    fail_list = []
+    for cn in pptp_routers:
+        ok, msg = await _tmb_deploy_to_router(cn)
+        if ok:
+            ok_list.append(cn)
+        else:
+            fail_list.append(f"{cn}: {msg}")
+    rr_append_history(f"TMB_DEPLOY_ALL: {len(ok_list)} ok, {len(fail_list)} fail")
+    result = f"📤 <b>Результат деплоя vpnc_script.sh</b>\n\n"
+    if ok_list:
+        result += f"✅ Успешно ({len(ok_list)}): {', '.join(ok_list)}\n"
+    if fail_list:
+        result += f"❌ Ошибки ({len(fail_list)}):\n"
+        for f_line in fail_list:
+            result += f"  • {_html_escape(f_line)}\n"
+    if not fail_list:
+        result += "\n🎉 Все роутеры обновлены!"
+    kb = [[InlineKeyboardButton("🛡 TM Обход", callback_data='tm_bypass')]]
+    await safe_edit_text(q, context, result,
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
 
 # =====================================================================
 #  VPN SWITCHER (OpenVPN ↔ PPTP)
@@ -5139,7 +5382,7 @@ async def rr_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for k in ['await_rr_ip', 'await_rr_domain_add', 'await_force_ip',
               'await_change_port', 'await_script_ver', 'await_canary_ver', 'await_canary_ids',
               'await_oec_radd', 'await_oec_fedit', 'await_ssh_add',
-              'await_pptp_ip', 'await_pptp_srv', 'await_emg_edit']:
+              'await_pptp_ip', 'await_pptp_srv', 'await_tmb_add', 'await_emg_edit']:
         context.user_data.pop(k, None)
     await safe_edit_text(q, context, "Отменено.")
 
@@ -5488,6 +5731,8 @@ async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_T
         await pptp_set_ip_receive(update, context); return
     if context.user_data.get('await_pptp_srv'):
         await pptp_srv_setup_receive(update, context); return
+    if context.user_data.get('await_tmb_add'):
+        await tmb_add_receive(update, context); return
     if context.user_data.get('await_emg_edit'):
         await emergency_edit_receive(update, context); return
     await update.message.reply_text("Неизвестный ввод. Используй меню или /start.")
@@ -6342,6 +6587,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await pptp_cl_sync(update, context)
     elif data.startswith('pptp_cl_rm:'):
         await pptp_cl_remove(update, context, data[len('pptp_cl_rm:'):])
+    # --- TM Bypass ---
+    elif data == 'tm_bypass':
+        await tm_bypass_menu(update, context)
+    elif data == 'tmb_add':
+        await tmb_add_start(update, context)
+    elif data == 'tmb_del':
+        await tmb_del_menu(update, context)
+    elif data.startswith('tmb_del_'):
+        idx = int(data[len('tmb_del_'):])
+        await tmb_del_exec(update, context, idx)
+    elif data == 'tmb_deploy_pick':
+        await tmb_deploy_pick(update, context)
+    elif data.startswith('tmb_dep_'):
+        cn = data[len('tmb_dep_'):]
+        await tmb_deploy_one(update, context, cn)
+    elif data == 'tmb_deploy_all':
+        await tmb_deploy_all(update, context)
     elif data == 'vpn_switch':
         await vpn_switch_menu(update, context)
     elif data == 'vpn_to_pptp':
