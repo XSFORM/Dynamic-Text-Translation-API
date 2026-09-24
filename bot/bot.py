@@ -16,6 +16,7 @@ import json
 import traceback
 import re
 import hashlib, hmac as _hmac_mod
+import base64
 import tempfile
 import requests
 import shlex
@@ -10427,36 +10428,77 @@ async def _gost_select_server(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def gost_install(update: Update, context: ContextTypes.DEFAULT_TYPE, ip: str):
-    """Install GOST on remote server via SSH."""
+    """Install GOST on remote server via SSH (background + polling)."""
     q = update.callback_query
     await q.answer()
     servers = load_gost_servers()
     srv = servers.get(ip)
+    back_kb = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')]])
     if not srv:
-        await safe_edit_text(q, context, "Сервер не найден.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')]]))
+        await safe_edit_text(q, context, "Сервер не найден.", reply_markup=back_kb)
         return
-    msg = await safe_edit_text(q, context, f"⏳ Устанавливаю GOST на <code>{ip}</code>...", parse_mode="HTML")
-    install_cmd = (
-        "apt-get update -qq && apt-get install -y -qq wget curl jq tar gzip > /dev/null 2>&1 ; "
-        f"VER=$(curl -s 'https://api.github.com/repos/{GOST_REPO}/releases/latest' | jq -r '.tag_name' | sed 's/^v//') ; "
-        "ARCH=$(dpkg --print-architecture 2>/dev/null || echo amd64) ; "
-        "[ \"$ARCH\" = 'arm64' ] && ARCH='armv8' ; "
-        "[ \"$ARCH\" = 'armhf' ] && ARCH='armv7' ; "
-        "cd /tmp && "
-        f"wget -q 'https://github.com/{GOST_REPO}/releases/download/v'$VER'/gost_'$VER'_linux_'$ARCH'.tar.gz' -O gost.tar.gz && "
-        "tar -xzf gost.tar.gz && chmod +x gost && mv gost /usr/local/bin/gost && "
-        "rm -f gost.tar.gz && "
-        "echo \"GOST_OK:$VER\""
+    await safe_edit_text(q, context, f"⏳ Устанавливаю GOST на <code>{ip}</code>...", parse_mode="HTML")
+    install_script = (
+        "#!/bin/bash\n"
+        "apt-get update -qq && apt-get install -y -qq wget curl jq tar gzip > /dev/null 2>&1\n"
+        f"VER=$(curl -s 'https://api.github.com/repos/{GOST_REPO}/releases/latest' | jq -r '.tag_name' | sed 's/^v//')\n"
+        "ARCH=$(dpkg --print-architecture 2>/dev/null || echo amd64)\n"
+        '[ "$ARCH" = "arm64" ] && ARCH="armv8"\n'
+        '[ "$ARCH" = "armhf" ] && ARCH="armv7"\n'
+        "cd /tmp\n"
+        f"wget -q \"https://github.com/{GOST_REPO}/releases/download/v${{VER}}/gost_${{VER}}_linux_${{ARCH}}.tar.gz\" -O gost.tar.gz\n"
+        "tar -xzf gost.tar.gz && chmod +x gost && mv gost /usr/local/bin/gost\n"
+        "rm -f gost.tar.gz\n"
+        'echo "GOST_OK:$VER"\n'
     )
-    ok, out = ssh_exec(ip, 22, srv["ssh_user"], srv["ssh_pass"], install_cmd, cmd_timeout=120)
-    if ok and "GOST_OK:" in out:
-        ver = out.split("GOST_OK:")[-1].strip()
-        result = f"✅ GOST v{ver} установлен на <code>{ip}</code>"
-    else:
-        result = f"❌ Ошибка установки на {ip}:\n<pre>{escape(out[:2000])}</pre>"
-    await safe_edit_text(q, context, result, parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')]]))
+    b64 = base64.b64encode(install_script.encode()).decode()
+    start_cmd = (
+        f"echo '{b64}' | base64 -d > /tmp/gost_install.sh && "
+        "chmod +x /tmp/gost_install.sh && "
+        "rm -f /tmp/gost_install.log && "
+        "nohup bash /tmp/gost_install.sh > /tmp/gost_install.log 2>&1 & "
+        "echo BG_OK"
+    )
+    ok, out = ssh_exec(ip, 22, srv["ssh_user"], srv["ssh_pass"], start_cmd)
+    if not ok or "BG_OK" not in out:
+        await safe_edit_text(q, context,
+            f"❌ Не удалось запустить установку на {ip}:\n<pre>{escape(out[:2000])}</pre>",
+            parse_mode="HTML", reply_markup=back_kb)
+        return
+    # Poll for completion every 10 sec, max 5 min
+    check_cmd = (
+        "cat /tmp/gost_install.log 2>/dev/null; "
+        "pgrep -f gost_install.sh > /dev/null 2>&1 && echo __RUNNING__ || echo __FINISHED__"
+    )
+    for attempt in range(30):
+        await asyncio.sleep(10)
+        elapsed = (attempt + 1) * 10
+        ok2, log = ssh_exec(ip, 22, srv["ssh_user"], srv["ssh_pass"], check_cmd)
+        if "GOST_OK:" in log:
+            ver = log.split("GOST_OK:")[-1].split("\n")[0].split("__")[0].strip()
+            await safe_edit_text(q, context,
+                f"✅ GOST v{ver} установлен на <code>{ip}</code> ({elapsed} сек)",
+                parse_mode="HTML", reply_markup=back_kb)
+            return
+        if "__FINISHED__" in log and "GOST_OK:" not in log:
+            clean = log.replace("__FINISHED__", "").replace("__RUNNING__", "").strip()
+            await safe_edit_text(q, context,
+                f"❌ Ошибка установки на {ip}:\n<pre>{escape(clean[:2000])}</pre>",
+                parse_mode="HTML", reply_markup=back_kb)
+            return
+        # Still running — update progress
+        bars = "▓" * (attempt % 4 + 1) + "░" * (3 - attempt % 4)
+        try:
+            await safe_edit_text(q, context,
+                f"⏳ Устанавливаю GOST на <code>{ip}</code>... {bars} ({elapsed} сек)",
+                parse_mode="HTML")
+        except Exception:
+            pass
+    # 5 min timeout — but GOST may still install
+    await safe_edit_text(q, context,
+        f"⏳ Установка на <code>{ip}</code> идёт дольше 5 мин.\n"
+        "GOST может установиться позже — проверьте статус.",
+        parse_mode="HTML", reply_markup=back_kb)
 
 
 async def gost_configure_rules_start(update: Update, context: ContextTypes.DEFAULT_TYPE, ip: str):
