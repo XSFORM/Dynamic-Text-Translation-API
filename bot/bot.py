@@ -5387,7 +5387,8 @@ async def rr_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
               'await_change_port', 'await_script_ver', 'await_canary_ver', 'await_canary_ids',
               'await_oec_radd', 'await_oec_fedit', 'await_ssh_add',
               'await_pptp_ip', 'await_pptp_srv', 'await_tmb_add',
-              'await_fwd_tpl_name', 'await_gtpl_name', 'await_emg_edit']:
+              'await_fwd_tpl_name', 'await_gtpl_name', 'await_gtpl_manual',
+              'await_emg_edit']:
         context.user_data.pop(k, None)
     await safe_edit_text(q, context, "Отменено.")
 
@@ -5852,6 +5853,8 @@ async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_T
         await gost_edit_ip_handler(update, context); return
     if context.user_data.get('await_gost_edit'):
         await gost_edit_handler(update, context); return
+    if context.user_data.get('await_gtpl_manual') and context.user_data['await_gtpl_manual'].get('step') != 'more':
+        await gtpl_manual_receive(update, context); return
     if context.user_data.get('await_gtpl_name'):
         await gtpl_save_receive(update, context); return
     if context.user_data.get('await_gost_rule') or context.user_data.get('await_gost_addrule'):
@@ -6866,7 +6869,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await gost_rule_done(update, context)
     # --- GOST Templates ---
     elif data == 'gtpl_menu':
+        context.user_data.pop('await_gtpl_manual', None)
         await gost_tpl_menu(update, context)
+    elif data == 'gtpl_add_manual':
+        await gtpl_add_manual_start(update, context)
+    elif data == 'gtpl_manual_more':
+        await gtpl_manual_more(update, context)
+    elif data == 'gtpl_manual_done':
+        await gtpl_manual_done(update, context)
     elif data == 'gtpl_save_pick':
         await gtpl_save_pick(update, context)
     elif data.startswith('gtpl_save:'):
@@ -9691,7 +9701,8 @@ async def gost_tpl_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parts.append(f"{i+1}. <b>{escape(name)}</b> ({len(rules)} правил)\n   {r_str}")
         lines = "\n".join(parts)
     kb = [
-        [InlineKeyboardButton("➕ Сохранить с сервера", callback_data='gtpl_save_pick')],
+        [InlineKeyboardButton("➕ Добавить вручную", callback_data='gtpl_add_manual')],
+        [InlineKeyboardButton("💾 Сохранить с сервера", callback_data='gtpl_save_pick')],
         [InlineKeyboardButton("📤 Применить шаблон", callback_data='gtpl_apply_pick')],
         [InlineKeyboardButton("🗑 Удалить шаблон", callback_data='gtpl_del')],
         [InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')],
@@ -9725,8 +9736,115 @@ async def gtpl_save_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
 
+async def gtpl_add_manual_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start manual template creation — ask for name first."""
+    q = update.callback_query
+    await q.answer()
+    context.user_data['await_gtpl_manual'] = {'step': 'name', 'rules': []}
+    await safe_edit_text(q, context,
+        "➕ <b>Новый шаблон GOST</b>\n\n"
+        "Введите название шаблона:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("❌ Отмена", callback_data='gtpl_menu')]]))
+
+
+async def gtpl_manual_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle multi-step manual template input: name → (proto → local_port → remote_ip → remote_port) × N."""
+    data = context.user_data.get('await_gtpl_manual')
+    if not data:
+        return
+    text = update.message.text.strip()
+    step = data['step']
+
+    if step == 'name':
+        data['name'] = text[:50]
+        data['step'] = 'proto'
+        await update.message.reply_text(
+            f"Шаблон: <b>{escape(data['name'])}</b>\n\n"
+            "Введите протокол (tcp/udp/http/socks5/tls/ws/relay):",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("❌ Отмена", callback_data='gtpl_menu')]]))
+    elif step == 'proto':
+        data['proto'] = text.lower()
+        data['step'] = 'local_port'
+        await update.message.reply_text("Введите локальный порт:")
+    elif step == 'local_port':
+        if not text.isdigit() or not (1 <= int(text) <= 65535):
+            await update.message.reply_text("Порт должен быть числом 1-65535. Повторите:")
+            return
+        data['local_port'] = int(text)
+        data['step'] = 'remote_ip'
+        await update.message.reply_text("Введите IP назначения (бэкенд):")
+    elif step == 'remote_ip':
+        parts = text.split(".")
+        if len(parts) != 4 or not all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
+            await update.message.reply_text("Неверный IP. Повторите:")
+            return
+        data['remote_ip'] = text
+        data['step'] = 'remote_port'
+        await update.message.reply_text("Введите порт назначения:")
+    elif step == 'remote_port':
+        if not text.isdigit() or not (1 <= int(text) <= 65535):
+            await update.message.reply_text("Порт должен быть числом 1-65535. Повторите:")
+            return
+        rule = {
+            "proto": data.pop('proto'),
+            "local_port": data.pop('local_port'),
+            "remote_ip": data.pop('remote_ip'),
+            "remote_port": int(text),
+        }
+        data['rules'].append(rule)
+        data['step'] = 'more'
+        r_str = "\n".join(
+            f"  {r['proto']}://:{r['local_port']} → {r['remote_ip']}:{r['remote_port']}"
+            for r in data['rules'])
+        await update.message.reply_text(
+            f"<b>{escape(data['name'])}</b> — правила:\n<code>{r_str}</code>\n\n"
+            "Добавить ещё правило или сохранить?",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Ещё правило", callback_data='gtpl_manual_more')],
+                [InlineKeyboardButton("✅ Сохранить", callback_data='gtpl_manual_done')],
+                [InlineKeyboardButton("❌ Отмена", callback_data='gtpl_menu')],
+            ]))
+
+
+async def gtpl_manual_more(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Add another rule to manual template."""
+    q = update.callback_query
+    await q.answer()
+    data = context.user_data.get('await_gtpl_manual')
+    if not data:
+        return
+    data['step'] = 'proto'
+    await safe_edit_text(q, context, "Введите протокол для нового правила:")
+
+
+async def gtpl_manual_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Save manually created template."""
+    q = update.callback_query
+    await q.answer()
+    data = context.user_data.pop('await_gtpl_manual', None)
+    if not data or not data.get('rules'):
+        await safe_edit_text(q, context, "❌ Нет правил для сохранения.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀️ Назад", callback_data='gtpl_menu')]]))
+        return
+    templates = load_gost_templates()
+    tpl = {"name": data['name'], "rules": data['rules']}
+    templates.append(tpl)
+    save_gost_templates(templates)
+    rr_append_history(f"GOST_TPL_ADD: {data['name']} ({len(data['rules'])} rules)")
+    kb = [[InlineKeyboardButton("📋 Шаблоны GOST", callback_data='gtpl_menu')]]
+    await safe_edit_text(q, context,
+        f"✅ Шаблон <b>{escape(data['name'])}</b> сохранён ({len(data['rules'])} правил).",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
 async def gtpl_save_name(update: Update, context: ContextTypes.DEFAULT_TYPE, ip: str):
-    """Prompt for GOST template name."""
+    """Prompt for GOST template name (save from server)."""
     q = update.callback_query
     await q.answer()
     servers = load_gost_servers()
@@ -9748,7 +9866,7 @@ async def gtpl_save_name(update: Update, context: ContextTypes.DEFAULT_TYPE, ip:
 
 
 async def gtpl_save_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Save GOST rules template."""
+    """Save GOST rules template from server."""
     ip = context.user_data.pop('await_gtpl_name', None)
     if not ip:
         return
@@ -9761,7 +9879,7 @@ async def gtpl_save_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     templates = load_gost_templates()
     tpl = {
         "name": name,
-        "rules": list(srv["rules"]),  # deep copy
+        "rules": list(srv["rules"]),
     }
     templates.append(tpl)
     save_gost_templates(templates)
