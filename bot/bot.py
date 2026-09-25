@@ -3996,7 +3996,8 @@ async def pptp_set_ip_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🔗 <b>PPTP — Сменить IP</b>\n\n"
         f"Текущий: <code>{cur}</code>\n\n"
         f"Введите новый IP адрес:",
-        parse_mode="HTML")
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data='pptp_menu')]]))
 
 async def pptp_set_ip_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop('await_pptp_ip', None)
@@ -4050,7 +4051,8 @@ async def pptp_srv_setup_start(update: Update, context: ContextTypes.DEFAULT_TYP
         "<code>host user password port vpn_password</code>\n\n"
         "Пример: <code>1.2.3.4 rootpass123 vpnpass123</code>\n"
         "или: <code>1.2.3.4 root rootpass123 22 vpnpass123</code>",
-        parse_mode="HTML")
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data='pptp_server')]]))
 
 async def pptp_srv_setup_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop('await_pptp_srv', None)
@@ -4512,7 +4514,8 @@ async def tmb_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Введите подсеть в формате CIDR:\n"
         "Пример: <code>95.85.96.0/19</code>\n\n"
         "Можно несколько через пробел или каждый с новой строки.",
-        parse_mode="HTML")
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data='tm_bypass')]]))
 
 
 async def tmb_add_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4883,7 +4886,8 @@ async def emergency_edit_start(update: Update, context: ContextTypes.DEFAULT_TYP
     )
     if cur:
         text += f"Текущий:\n<pre>{escape(cur[:800])}</pre>"
-    await safe_edit_text(q, context, text, parse_mode="HTML")
+    await safe_edit_text(q, context, text, parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data='emergency')]]))
 
 async def emergency_edit_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop('await_emg_edit', None)
@@ -6108,6 +6112,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await renew_cancel(update, context)
 
     elif data == 'backup_hub':
+        _clear_awaits(context)
         await backup_hub(update, context)
     elif data == 'backup_create':
         await perform_backup_and_send(update, context)
@@ -6202,7 +6207,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await log_request(update, context)
 
     elif data == 'create_key':
-        await safe_edit_text(q, context, "Введите имя нового клиента:")
+        await safe_edit_text(q, context, "Введите имя нового клиента:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data='menu_openvpn')]]))
         context.user_data['await_key_name'] = True
 
     # --- Subnet Pool ---
@@ -6233,19 +6239,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await subnet_history(update, context)
 
     elif data == 'home':
+        _clear_awaits(context)
         await safe_edit_text(q, context, "📋 <b>Главное меню</b>",
             parse_mode="HTML", reply_markup=get_main_keyboard())
 
     elif data == 'menu_openvpn':
+        _clear_awaits(context)
         await safe_edit_text(q, context, "🔐 <b>OpenVPN</b>",
             parse_mode="HTML", reply_markup=_kb_openvpn())
     elif data == 'menu_routers':
+        _clear_awaits(context)
         await safe_edit_text(q, context, "📡 <b>Роутеры</b>",
             parse_mode="HTML", reply_markup=_kb_routers())
     elif data == 'menu_network':
+        _clear_awaits(context)
         await safe_edit_text(q, context, "🔍 <b>Сеть и Домены</b>",
             parse_mode="HTML", reply_markup=_kb_network())
     elif data == 'menu_system':
+        _clear_awaits(context)
         await safe_edit_text(q, context, "⚙️ <b>Система</b>",
             parse_mode="HTML", reply_markup=_kb_system())
 
@@ -6256,13 +6267,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == 'backup_upload_prompt':
         await safe_edit_text(q, context,
             "Отправьте файл бэкапа OpenVPN (.tar.gz) в чат.\n"
-            "Бот сохранит его в /root для последующего восстановления.")
+            "Бот сохранит его в /root для последующего восстановления.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data='backup_hub')]]))
         context.user_data['await_backup_upload'] = True
 
     elif data == 'rr_restore_prompt':
         await safe_edit_text(q, context,
             "Отправьте файл бэкапа Remote Refresh (.zip) в чат.\n"
-            "Бот восстановит IP, домены, историю и флаги.")
+            "Бот восстановит IP, домены, историю и флаги.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data='backup_hub')]]))
         context.user_data['await_rr_restore'] = True
 
     # --- OVPN EDIT callbacks ---
@@ -6407,6 +6420,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- SSH Routers ---
     elif data == 'ssh_routers':
+        _clear_awaits(context)
         await ssh_menu(update, context)
     # --- Reverse tunnel ---
     elif data == 'rt_menu':
@@ -6561,12 +6575,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == 'ssh_select_reboot':
         await ssh_select_router(update, context, 'ssh_reboot')
     elif data == 'ssh_select_cmd':
+        _clear_awaits(context)
         await ssh_cmd_mode_menu(update, context)
     elif data == 'ssh_cmd_one':
         await ssh_select_router(update, context, 'ssh_cmd')
     elif data == 'ssh_cmd_all':
         context.user_data['await_ssh_cmd'] = '__all__'
-        await safe_edit_text(q, context, "💻 Введите команду для <b>ВСЕХ</b> роутеров:", parse_mode="HTML")
+        await safe_edit_text(q, context, "💻 Введите команду для <b>ВСЕХ</b> роутеров:", parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data='ssh_select_cmd')]]))
     elif data == 'ssh_cmd_multi':
         context.user_data['ssh_cmd_selected'] = []
         await ssh_cmd_multi_select(update, context)
@@ -6587,7 +6603,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             context.user_data['await_ssh_cmd'] = sel
             names = ", ".join(sel)
-            await safe_edit_text(q, context, f"💻 Введите команду для: <b>{names}</b>", parse_mode="HTML")
+            await safe_edit_text(q, context, f"💻 Введите команду для: <b>{names}</b>", parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data='ssh_select_cmd')]]))
     elif data == 'ssh_select_edit':
         await ssh_select_router(update, context, 'ssh_edit')
     elif data == 'ssh_select_delete':
@@ -6605,7 +6622,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cn = data[len('ssh_cmd:'):]
         context.user_data['await_ssh_cmd'] = cn
         context.user_data.pop('await_ssh_add', None)
-        await safe_edit_text(q, context, f"💻 Введите команду для <b>{cn}</b>:", parse_mode="HTML")
+        await safe_edit_text(q, context, f"💻 Введите команду для <b>{cn}</b>:", parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data='ssh_select_cmd')]]))
     elif data.startswith('ssh_edit:'):
         cn = data[len('ssh_edit:'):]
         context.user_data['await_ssh_edit'] = cn
@@ -6616,7 +6634,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✏️ <b>Редактировать {cn}</b>\n\n"
             f"Текущие: user=<code>{r.get('user','admin')}</code> port=<code>{r.get('port',22)}</code>\n\n"
             f"Введите новый пароль (или user:password или user:password:port):",
-            parse_mode="HTML")
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data='ssh_routers')]]))
     elif data.startswith('ssh_delete:'):
         cn = data[len('ssh_delete:'):]
         routers = load_routers()
@@ -6838,10 +6857,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == 'proto_set_tcp':
         await proto_set(update, context, 'tcp')
     elif data == 'pptp_menu':
+        _clear_awaits(context)
         await pptp_menu(update, context)
     elif data == 'pptp_set_ip':
         await pptp_set_ip_start(update, context)
     elif data == 'pptp_server':
+        _clear_awaits(context)
         await pptp_server_menu(update, context)
     elif data == 'pptp_srv_setup':
         await pptp_srv_setup_start(update, context)
@@ -6865,6 +6886,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await pptp_cl_remove(update, context, data[len('pptp_cl_rm:'):])
     # --- TM Bypass ---
     elif data == 'tm_bypass':
+        _clear_awaits(context)
         await tm_bypass_menu(update, context)
     elif data == 'tmb_add':
         await tmb_add_start(update, context)
@@ -6891,6 +6913,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith('vpn_sw_openvpn:'):
         await vpn_switch_exec(update, context, 'openvpn', data[len('vpn_sw_openvpn:'):])
     elif data == 'emergency':
+        _clear_awaits(context)
         await emergency_menu(update, context)
     elif data == 'emg_edit':
         await emergency_edit_start(update, context)
@@ -6919,6 +6942,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- Auto IP callbacks ---
     elif data == 'aip_menu':
+        _clear_awaits(context)
         await auto_ip_menu(update, context)
     elif data == 'aip_toggle_ovpn':
         await auto_ip_toggle(update, context, "ovpn")
@@ -6951,6 +6975,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- GOST callbacks ---
     elif data == 'gost_menu':
+        _clear_awaits(context)
         await gost_menu(update, context)
     elif data == 'gost_list':
         await gost_list(update, context)
@@ -7102,6 +7127,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await pptp_fwd_apply_rules(update, context)
     # --- PPTP Forward Templates ---
     elif data == 'fwd_tpl_menu':
+        _clear_awaits(context)
         await pptp_fwd_tpl_menu(update, context)
     elif data == 'fwd_tpl_save_pick':
         await fwd_tpl_save_pick(update, context)
@@ -7372,7 +7398,8 @@ async def ssh_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "или: <code>имя логин пароль порт</code>\n"
         "Несколько — каждый с новой строки\n"
         "User по умолчанию: admin",
-        parse_mode="HTML")
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data='ssh_routers')]]))
 
 async def ssh_select_router(update: Update, context: ContextTypes.DEFAULT_TYPE, action: str):
     q = update.callback_query
@@ -9587,7 +9614,8 @@ async def auto_ip_replace_start(update: Update, context: ContextTypes.DEFAULT_TY
     context.user_data['await_aip_replace'] = old_ip
     await safe_edit_text(q, context,
         f"🔄 Замена <code>{old_ip}</code>{name}\n\nВведите новый IP:",
-        parse_mode="HTML")
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data='aip_menu')]]))
 
 async def auto_ip_replace_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Receive new IP and replace the old one in the pool."""
@@ -10023,7 +10051,8 @@ async def gtpl_save_name(update: Update, context: ContextTypes.DEFAULT_TYPE, ip:
         f"💾 <b>Сохранить шаблон GOST</b>\n\n"
         f"Правила ({len(rules)}):\n<code>{r_str}</code>\n\n"
         "Введите название шаблона:",
-        parse_mode="HTML")
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data='gtpl_menu')]]))
 
 
 async def gtpl_save_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -11396,7 +11425,8 @@ async def fwd_tpl_save_name(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         f"PPTP бэкенд: <code>{pptp}</code>\n"
         + (f"Правила DNAT:\n<code>{ovpn_str}</code>\n\n" if ovpn_str else "\n")
         + "Введите название шаблона:",
-        parse_mode="HTML")
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data='fwd_tpl_menu')]]))
 
 
 async def fwd_tpl_save_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
