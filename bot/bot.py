@@ -5440,14 +5440,26 @@ async def safe_edit_text(q, context, text, **kwargs):
 #  UNIFIED MAIN KEYBOARD
 # =====================================================================
 def get_main_keyboard():
+    """Compact main menu — 6 category buttons."""
     keyboard = [
-        # --- OpenVPN section ---
-        [InlineKeyboardButton("──── OPENVPN ────", callback_data='noop')],
+        [InlineKeyboardButton("🔐 OpenVPN", callback_data='menu_openvpn'),
+         InlineKeyboardButton("📡 Роутеры", callback_data='menu_routers')],
+        [InlineKeyboardButton("🌐 GOST Серверы", callback_data='gost_menu'),
+         InlineKeyboardButton("🔍 Сеть", callback_data='menu_network')],
+        [InlineKeyboardButton("⚙️ Система", callback_data='menu_system'),
+         InlineKeyboardButton("❓ Помощь", callback_data='help')],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def _kb_openvpn():
+    """OpenVPN submenu keyboard."""
+    return InlineKeyboardMarkup([
         [InlineKeyboardButton("📊 Статистика", callback_data='stats'),
          InlineKeyboardButton("🛣️ Тунель", callback_data='send_ipp')],
-        [InlineKeyboardButton("📶 Трафик", callback_data='traffic')],
-        [InlineKeyboardButton("🧹 Очистить трафик", callback_data='traffic_clear'),
-         InlineKeyboardButton("🌐 Обновить адрес", callback_data='update_remote')],
+        [InlineKeyboardButton("📶 Трафик", callback_data='traffic'),
+         InlineKeyboardButton("🧹 Очистить трафик", callback_data='traffic_clear')],
+        [InlineKeyboardButton("🌐 Обновить адрес", callback_data='update_remote')],
         [InlineKeyboardButton("⏳ Сроки ключей", callback_data='keys_expiry'),
          InlineKeyboardButton("⌛ Обновить ключ", callback_data='renew_key')],
         [InlineKeyboardButton("✅ Вкл.клиента", callback_data='bulk_enable_start'),
@@ -5456,16 +5468,15 @@ def get_main_keyboard():
          InlineKeyboardButton("🗑️ Удалить ключ", callback_data='bulk_delete_start')],
         [InlineKeyboardButton("🔄 Список клиентов", callback_data='refresh'),
          InlineKeyboardButton("📤 Отправить ключи", callback_data='bulk_send_start')],
-        [InlineKeyboardButton("📦 Бэкап", callback_data='backup_hub'),
-         InlineKeyboardButton("📜 Просмотр лога", callback_data='log')],
-        [InlineKeyboardButton("🚨 Тревога", callback_data='block_alert'),
-         InlineKeyboardButton("⚡ Перезагрузка", callback_data='restart_menu')],
-        [InlineKeyboardButton("📥 Git Pull", callback_data='git_pull')],
-        [InlineKeyboardButton("📝 OVPN EDIT", callback_data='ovpn_edit_menu'),
-         InlineKeyboardButton("🖥 SSH Роутеры", callback_data='ssh_routers')],
-        [InlineKeyboardButton("🌐 GOST Серверы", callback_data='gost_menu')],
-        # --- Remote Refresh section ---
-        [InlineKeyboardButton("─── Remote Refresh ───", callback_data='noop')],
+        [InlineKeyboardButton("📝 OVPN EDIT", callback_data='ovpn_edit_menu')],
+        [InlineKeyboardButton("◀️ Главное меню", callback_data='home')],
+    ])
+
+
+def _kb_routers():
+    """Routers submenu keyboard."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🖥 SSH Роутеры", callback_data='ssh_routers')],
         [InlineKeyboardButton("📡 IP роутеров", callback_data='rr_current_ip'),
          InlineKeyboardButton("✏️ Сменить IP", callback_data='rr_set_ip')],
         [InlineKeyboardButton("🔄 Смена IP", callback_data='force_ip'),
@@ -5476,6 +5487,14 @@ def get_main_keyboard():
         [InlineKeyboardButton("🔀 Протокол", callback_data='protocol_menu'),
          InlineKeyboardButton("🔗 PPTP", callback_data='pptp_menu')],
         [InlineKeyboardButton("🛟 Аварийный конфиг", callback_data='emergency')],
+        [InlineKeyboardButton("🛡 TM Обход", callback_data='tm_bypass')],
+        [InlineKeyboardButton("◀️ Главное меню", callback_data='home')],
+    ])
+
+
+def _kb_network():
+    """Network & domains submenu keyboard."""
+    return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔍 IP Scan", callback_data='rr_ip_scan'),
          InlineKeyboardButton("🔍 Port Scan", callback_data='rr_port_scan')],
         [InlineKeyboardButton("📋 История IP", callback_data='rr_history'),
@@ -5483,11 +5502,20 @@ def get_main_keyboard():
         [InlineKeyboardButton("🔎 Проверить домены", callback_data='chk_dom_menu')],
         [InlineKeyboardButton("🔄 Авто IP", callback_data='aip_menu'),
          InlineKeyboardButton("🌐 Подсеть", callback_data='subnet_menu')],
-        # --- Common ---
-        [InlineKeyboardButton("❓ Помощь", callback_data='help'),
-         InlineKeyboardButton("🏠 В главное меню", callback_data='home')],
-    ]
-    return InlineKeyboardMarkup(keyboard)
+        [InlineKeyboardButton("◀️ Главное меню", callback_data='home')],
+    ])
+
+
+def _kb_system():
+    """System submenu keyboard."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📦 Бэкап", callback_data='backup_hub'),
+         InlineKeyboardButton("📜 Просмотр лога", callback_data='log')],
+        [InlineKeyboardButton("🚨 Тревога", callback_data='block_alert'),
+         InlineKeyboardButton("⚡ Перезагрузка", callback_data='restart_menu')],
+        [InlineKeyboardButton("📥 Git Pull", callback_data='git_pull')],
+        [InlineKeyboardButton("◀️ Главное меню", callback_data='home')],
+    ])
 
 # =====================================================================
 #  AWAIT STATE MANAGEMENT
@@ -6188,7 +6216,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await subnet_history(update, context)
 
     elif data == 'home':
-        await context.bot.send_message(q.message.chat_id, "Главное меню уже показано. Для обновления нажми /start.")
+        await safe_edit_text(q, context, "📋 <b>Главное меню</b>",
+            parse_mode="HTML", reply_markup=get_main_keyboard())
+
+    elif data == 'menu_openvpn':
+        await safe_edit_text(q, context, "🔐 <b>OpenVPN</b>",
+            parse_mode="HTML", reply_markup=_kb_openvpn())
+    elif data == 'menu_routers':
+        await safe_edit_text(q, context, "📡 <b>Роутеры</b>",
+            parse_mode="HTML", reply_markup=_kb_routers())
+    elif data == 'menu_network':
+        await safe_edit_text(q, context, "🔍 <b>Сеть и Домены</b>",
+            parse_mode="HTML", reply_markup=_kb_network())
+    elif data == 'menu_system':
+        await safe_edit_text(q, context, "⚙️ <b>Система</b>",
+            parse_mode="HTML", reply_markup=_kb_system())
 
     elif data == 'noop':
         pass  # separator button
