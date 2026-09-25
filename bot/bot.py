@@ -6293,7 +6293,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_edit_text(q, context,
                 f"<b>server.conf:</b>\n<pre>{escape(file_content)}</pre>\n\n"
                 "Отправьте новое содержимое файла целиком для замены.",
-                parse_mode="HTML")
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data='ovpn_edit_cancel')]]))
         context.user_data['await_ovpn_edit'] = 'server_conf'
 
     elif data == 'ovpn_view_client_template':
@@ -6308,19 +6309,22 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.message.reply_document(
                 document=file_content.encode("utf-8"),
                 filename="client-template.txt",
-                caption="Отправьте новое содержимое файла целиком для замены, или /cancel для отмены."
+                caption="Отправьте новое содержимое файла целиком для замены."
             )
-            await safe_edit_text(q, context, "Файл отправлен выше (слишком длинный для сообщения).")
+            await safe_edit_text(q, context, "Файл отправлен выше.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data='ovpn_edit_cancel')]]))
         else:
             await safe_edit_text(q, context,
                 f"<b>client-template.txt:</b>\n<pre>{escape(file_content)}</pre>\n\n"
                 "Отправьте новое содержимое файла целиком для замены.",
-                parse_mode="HTML")
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data='ovpn_edit_cancel')]]))
         context.user_data['await_ovpn_edit'] = 'client_template'
 
     elif data == 'ovpn_edit_cancel':
         context.user_data.pop('await_ovpn_edit', None)
-        await safe_edit_text(q, context, "Отменено.")
+        await safe_edit_text(q, context, "Отменено.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='menu_openvpn')]]))
 
     # --- Restart callbacks ---
     elif data == 'restart_menu':
