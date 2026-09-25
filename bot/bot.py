@@ -2521,9 +2521,12 @@ async def log_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
         safe = _html_escape(log_text)
         text = f"<b>status.log (хвост):</b>\n<pre>{safe}</pre>\n{_html_escape(ip_summary)}"
     msgs = split_message(text)
-    await safe_edit_text(q, context, msgs[0], parse_mode="HTML")
-    for m in msgs[1:]:
-        await context.bot.send_message(chat_id=q.message.chat_id, text=m, parse_mode="HTML")
+    _back_sys = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='menu_system')]])
+    await safe_edit_text(q, context, msgs[0], parse_mode="HTML",
+        reply_markup=(_back_sys if len(msgs) == 1 else None))
+    for i, m in enumerate(msgs[1:]):
+        rm = _back_sys if i == len(msgs) - 2 else None
+        await context.bot.send_message(chat_id=q.message.chat_id, text=m, parse_mode="HTML", reply_markup=rm)
 
 def load_traffic_db():
     global traffic_usage
@@ -5422,10 +5425,11 @@ async def view_keys_expiry_handler(update: Update, context: ContextTypes.DEFAULT
             mark = "⛔" if is_client_ccd_disabled(name) else "🟢"
             rows.append(f"{mark} {name}: {status}")
         text += "\n".join(rows)
+    _back_ovpn = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='menu_openvpn')]])
     if update.callback_query:
-        await safe_edit_text(update.callback_query, context, text, parse_mode="HTML")
+        await safe_edit_text(update.callback_query, context, text, parse_mode="HTML", reply_markup=_back_ovpn)
     else:
-        await update.message.reply_text(text, parse_mode="HTML")
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=_back_ovpn)
 
 # =====================================================================
 #  safe_edit_text
@@ -5572,7 +5576,7 @@ async def _reply_kb_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
                f"Откл: {cnt_disabled}  PPTP: {cnt_pptp}  Всего: {len(files)}")
     lines.append(summary)
     kb = [[InlineKeyboardButton("🔄 Обновить", callback_data='stats'),
-           InlineKeyboardButton("🏠 Меню", callback_data='home')]]
+           InlineKeyboardButton("◀️ Меню", callback_data='menu_openvpn')]]
     await update.message.reply_text("\n".join(lines),
         parse_mode="HTML", disable_web_page_preview=True,
         reply_markup=InlineKeyboardMarkup(kb))
@@ -6057,15 +6061,22 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             save_routers(routers)
         text = "\n".join(lines)
         msgs = split_message(text)
+        _back_kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Обновить", callback_data='stats'),
+             InlineKeyboardButton("◀️ Назад", callback_data='menu_openvpn')]])
         await safe_edit_text(q, context, msgs[0], parse_mode="HTML",
-                             disable_web_page_preview=True)
-        for m in msgs[1:]:
+                             disable_web_page_preview=True,
+                             reply_markup=(_back_kb if len(msgs) == 1 else None))
+        for i, m in enumerate(msgs[1:]):
+            rm = _back_kb if i == len(msgs) - 2 else None
             await context.bot.send_message(chat_id=q.message.chat_id, text=m,
-                                           parse_mode="HTML", disable_web_page_preview=True)
+                                           parse_mode="HTML", disable_web_page_preview=True,
+                                           reply_markup=rm)
 
     elif data == 'traffic':
         save_traffic_db(force=True)
-        await safe_edit_text(q, context, build_traffic_report(), parse_mode="HTML")
+        await safe_edit_text(q, context, build_traffic_report(), parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='menu_openvpn')]]))
 
     elif data == 'traffic_clear':
         kb = InlineKeyboardMarkup([
@@ -6075,14 +6086,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit_text(q, context, "Очистить накопленный трафик?", reply_markup=kb)
 
     elif data == 'confirm_clear_traffic':
-        clear_traffic_stats(); await safe_edit_text(q, context, "Очищено.")
+        clear_traffic_stats()
+        await safe_edit_text(q, context, "✅ Очищено.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='menu_openvpn')]]))
     elif data == 'cancel_clear_traffic':
-        await safe_edit_text(q, context, "Отменено.")
+        await safe_edit_text(q, context, "Отменено.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='menu_openvpn')]]))
 
     elif data == 'update_remote':
         await start_update_remote_dialog(update, context)
     elif data == 'cancel_update_remote':
-        context.user_data.pop('await_remote_input', None); await safe_edit_text(q, context, "Отменено.")
+        context.user_data.pop('await_remote_input', None)
+        await safe_edit_text(q, context, "Отменено.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='menu_openvpn')]]))
 
     elif data == 'renew_key':
         await renew_key_request(update, context)
@@ -6143,12 +6159,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == 'send_ipp':
         ipp_path = "/etc/openvpn/ipp.txt"
+        _back_ovpn = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='menu_openvpn')]])
         if os.path.exists(ipp_path):
             with open(ipp_path, "rb") as f:
                 await context.bot.send_document(chat_id=q.message.chat_id, document=InputFile(f), filename="ipp.txt")
-            await safe_edit_text(q, context, "ipp.txt отправлен.")
+            await safe_edit_text(q, context, "ipp.txt отправлен.", reply_markup=_back_ovpn)
         else:
-            await safe_edit_text(q, context, "ipp.txt не найден.")
+            await safe_edit_text(q, context, "ipp.txt не найден.", reply_markup=_back_ovpn)
 
     elif data == 'block_alert':
         await alert_menu(update, context)
@@ -6335,7 +6352,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         subprocess.Popen(["systemctl", "restart", "remote-refresh-bot"])
 
     elif data == 'rst_cancel':
-        await safe_edit_text(q, context, "Отменено.")
+        await safe_edit_text(q, context, "Отменено.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='menu_system')]]))
 
     elif data == 'git_pull':
         await safe_edit_text(q, context, "📥 Git Pull...")
@@ -6346,7 +6364,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pull_out = r1.stdout.strip() or r1.stderr.strip()
             if "Already up to date" in pull_out:
                 await safe_edit_text(q, context, f"📥 <b>Git Pull:</b>\n<pre>{escape(pull_out)}</pre>\n\nОбновлений нет.",
-                    parse_mode="HTML")
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='menu_system')]]))
             else:
                 shutil.copy2("/opt/remote_refresh/bot/bot.py", "/root/monitor_bot/bot.py")
                 # Sync router scripts to webroot
@@ -6379,7 +6398,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await asyncio.sleep(2)
                 subprocess.Popen(["systemctl", "restart", "remote-refresh-bot"])
         except Exception as e:
-            await safe_edit_text(q, context, f"❌ Ошибка: {e}")
+            await safe_edit_text(q, context, f"❌ Ошибка: {e}",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='menu_system')]]))
 
     # --- SSH Routers ---
     elif data == 'ssh_routers':
