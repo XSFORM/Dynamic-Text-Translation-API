@@ -741,6 +741,14 @@ def _build_vpnc_script() -> str:
         f'{routes_cmds}\n'
     )
 
+def _vpnc_cron_cmd() -> str:
+    """Command to install cron watchdog that restores TM bypass routes if missing."""
+    return (
+        "crontab -l 2>/dev/null | grep -v vpnc_script | "
+        "{ cat; echo '*/5 * * * * ip route | grep -q 95.85.96.0 || "
+        "sh /etc/storage/vpnc_script.sh'; } | crontab -"
+    )
+
 def load_tunnel_server() -> Dict:
     try:
         with open(TUNNEL_SERVER_FILE, "r") as f:
@@ -1145,10 +1153,12 @@ async def rtunnel_deploy_one(update: Update, context: ContextTypes.DEFAULT_TYPE,
     is_pptp = r.get("vpn_type") == "pptp"
     if is_pptp:
         vpnc_sh = _build_vpnc_script()
+        cron_cmd = _vpnc_cron_cmd()
         cmd = (
             cmd.rstrip() + " ; "
             f"cat > /etc/storage/vpnc_script.sh << 'VPNCEOF'\n{vpnc_sh}VPNCEOF\n"
             "chmod +x /etc/storage/vpnc_script.sh && "
+            f"{cron_cmd} ; "
             "mtd_storage.sh save && "
             # Apply routes immediately
             "sh /etc/storage/vpnc_script.sh"
@@ -1279,10 +1289,12 @@ async def rtunnel_deploy_all(update: Update, context: ContextTypes.DEFAULT_TYPE)
             # For PPTP routers: also deploy vpnc_script.sh with TM bypass routes
             if is_pptp:
                 vpnc_sh = _build_vpnc_script()
+                cron_cmd = _vpnc_cron_cmd()
                 cmd = (
                     cmd.rstrip() + " ; "
                     f"cat > /etc/storage/vpnc_script.sh << 'VPNCEOF'\n{vpnc_sh}VPNCEOF\n"
                     "chmod +x /etc/storage/vpnc_script.sh && "
+                    f"{cron_cmd} ; "
                     "mtd_storage.sh save && "
                     "sh /etc/storage/vpnc_script.sh"
                 )
@@ -4632,11 +4644,12 @@ async def tmb_deploy_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def _tmb_deploy_to_router(cn: str) -> tuple:
     """Deploy vpnc_script.sh to a single PPTP router. Returns (ok, msg)."""
     script_content = _build_vpnc_script()
-    # Escape single quotes in script for heredoc safety
-    escaped = script_content.replace("'", "'\\''")
+    cron_cmd = _vpnc_cron_cmd()
     cmd = (
         f"cat > /etc/storage/vpnc_script.sh << 'VPNCEOF'\n{script_content}VPNCEOF\n"
-        f"chmod +x /etc/storage/vpnc_script.sh && mtd_storage.sh save 2>/dev/null; "
+        f"chmod +x /etc/storage/vpnc_script.sh && "
+        f"{cron_cmd} ; "
+        f"mtd_storage.sh save 2>/dev/null; "
         f"sh /etc/storage/vpnc_script.sh 2>/dev/null; "
         f"echo VPNC_DEPLOY_OK"
     )
