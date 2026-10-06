@@ -1224,6 +1224,7 @@ async def rtunnel_deploy_one(update: Update, context: ContextTypes.DEFAULT_TYPE,
         '  /usr/bin/ssh -i "$KEY" -N \\\n'
         '    -R 0.0.0.0:${TUNNEL_PORT}:127.0.0.1:80 \\\n'
         '    -o StrictHostKeyChecking=no \\\n'
+        '    -o UserKnownHostsFile=/dev/null \\\n'
         '    -o ServerAliveInterval=60 \\\n'
         '    -o ServerAliveCountMax=3 \\\n'
         '    -o ExitOnForwardFailure=yes \\\n'
