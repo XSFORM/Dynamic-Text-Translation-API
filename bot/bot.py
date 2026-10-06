@@ -1619,12 +1619,13 @@ def _mgmt_tcp_command(cmd: str) -> str:
 
 def disconnect_client_sessions(client_name: str) -> bool:
     try:
-        out = _mgmt_tcp_command(f"client-kill {client_name}")
+        out = _mgmt_tcp_command(f"kill {client_name}")
         if out:
-            print(f"[mgmt] client-kill {client_name} -> {out.strip()[:120]}")
-            return True
-    except Exception:
-        pass
+            print(f"[mgmt] kill {client_name} -> {out.strip()[:120]}")
+            if "SUCCESS" in out:
+                return True
+    except Exception as e:
+        print(f"[mgmt] tcp kill failed {client_name}: {e}")
     if os.path.exists(MGMT_SOCKET):
         try:
             subprocess.run(f'echo "kill {client_name}" | nc -U {MGMT_SOCKET}', shell=True)
