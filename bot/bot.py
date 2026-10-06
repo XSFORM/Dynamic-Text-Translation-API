@@ -5932,6 +5932,21 @@ _REPLY_KB_MAP = {
     "📥 Git Pull": _reply_kb_gitpull,
 }
 
+async def _reply_kb_openvpn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle '🔐 OpenVPN' reply keyboard button."""
+    _clear_awaits(context)
+    await update.message.reply_text("🔐 <b>OpenVPN</b>",
+        parse_mode="HTML", reply_markup=_kb_openvpn())
+
+async def _reply_kb_routers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle '📡 Роутеры' reply keyboard button."""
+    _clear_awaits(context)
+    await update.message.reply_text("📡 <b>Роутеры</b>",
+        parse_mode="HTML", reply_markup=_kb_routers())
+
+_REPLY_KB_MAP["🔐 OpenVPN"] = _reply_kb_openvpn
+_REPLY_KB_MAP["📡 Роутеры"] = _reply_kb_routers
+
 async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
     # Handle reply keyboard quick buttons
@@ -9431,6 +9446,7 @@ async def send_help_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Persistent bottom reply keyboard (quick access)
 REPLY_KB = ReplyKeyboardMarkup(
     [[KeyboardButton("📊 Статистика"), KeyboardButton("🖥 SSH Роутеры")],
+     [KeyboardButton("🔐 OpenVPN"), KeyboardButton("📡 Роутеры")],
      [KeyboardButton("🌐 GOST Серверы"), KeyboardButton("🔄 Авто IP")],
      [KeyboardButton("📥 Git Pull")]],
     resize_keyboard=True
