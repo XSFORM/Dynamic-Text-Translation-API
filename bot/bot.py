@@ -849,6 +849,7 @@ async def rtunnel_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = [
         [InlineKeyboardButton("📡 IP сервера", callback_data='rt_set_ip')],
         [InlineKeyboardButton("🔑 SSH-ключ", callback_data='rt_key_menu')],
+        [InlineKeyboardButton("🔧 Настроить сервер", callback_data='rt_setup')],
         [InlineKeyboardButton("📋 Порты роутеров", callback_data='rt_ports')],
         [InlineKeyboardButton("📤 Залить на роутер", callback_data='rt_deploy_select')],
         [InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')],
@@ -948,6 +949,120 @@ async def rtunnel_key_generate(update: Update, context: ContextTypes.DEFAULT_TYP
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("◀️ Назад", callback_data='rt_key_menu')]]))
+
+
+async def rtunnel_setup_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ask for tunnel server root password to auto-setup."""
+    q = update.callback_query
+    await q.answer()
+    ts = load_tunnel_server()
+    pubkey = tunnel_get_pubkey()
+    if not ts.get("ip"):
+        await safe_edit_text(q, context, "❌ Сначала задайте IP сервера.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='rt_menu')]]))
+        return
+    if not pubkey:
+        await safe_edit_text(q, context, "❌ Сначала сгенерируйте SSH-ключ.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='rt_menu')]]))
+        return
+    _clear_awaits(context)
+    context.user_data['await_rt_setup_pass'] = True
+    ip = ts["ip"]
+    ssh_port = ts.get("ssh_port", 22)
+    await safe_edit_text(q, context,
+        f"🔧 <b>Автонастройка туннельного сервера</b>\n\n"
+        f"Сервер: <code>{ip}:{ssh_port}</code>\n\n"
+        "Бот подключится и автоматически:\n"
+        "• Добавит SSH-ключ в authorized_keys\n"
+        "• Включит GatewayPorts\n"
+        f"• Откроет порт {ssh_port} в sshd\n"
+        "• Настроит автоочистку зависших сессий\n"
+        "• Перезапустит sshd\n\n"
+        "Введите пароль root от сервера:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data='rt_menu')]]))
+
+
+async def rtunnel_setup_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Process tunnel server password and run auto-setup."""
+    password = update.message.text.strip()
+    context.user_data.pop('await_rt_setup_pass', None)
+
+    ts = load_tunnel_server()
+    pubkey = tunnel_get_pubkey()
+    if not ts.get("ip") or not pubkey:
+        await update.message.reply_text("❌ Сервер или ключ не настроены.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='rt_menu')]]))
+        return
+
+    ip = ts["ip"]
+    ssh_port = int(ts.get("ssh_port", 22))
+    ssh_user = ts.get("ssh_user", "root")
+
+    await update.message.reply_text(f"⏳ Настраиваю {ip}...")
+
+    # Build setup command
+    # Use partial key match to avoid adding duplicate keys
+    key_fragment = pubkey.split()[1][:50]
+    setup_cmd = (
+        "mkdir -p /root/.ssh && chmod 700 /root/.ssh ; "
+        f"grep -qF '{key_fragment}' /root/.ssh/authorized_keys 2>/dev/null || "
+        f"echo '{pubkey}' >> /root/.ssh/authorized_keys ; "
+        "chmod 600 /root/.ssh/authorized_keys ; "
+        # Remove old directives, add fresh ones
+        "sed -i '/^GatewayPorts/d; /^ClientAliveInterval/d; /^ClientAliveCountMax/d' /etc/ssh/sshd_config ; "
+        "echo 'GatewayPorts yes' >> /etc/ssh/sshd_config ; "
+        "echo 'ClientAliveInterval 30' >> /etc/ssh/sshd_config ; "
+        "echo 'ClientAliveCountMax 3' >> /etc/ssh/sshd_config ; "
+    )
+    # Add tunnel port (preserve port 22 if adding a new one)
+    if ssh_port != 22:
+        setup_cmd += (
+            f"grep -q '^Port {ssh_port}$' /etc/ssh/sshd_config || {{ "
+            f"grep -q '^Port ' /etc/ssh/sshd_config || echo 'Port 22' >> /etc/ssh/sshd_config ; "
+            f"echo 'Port {ssh_port}' >> /etc/ssh/sshd_config ; }} ; "
+        )
+    # Restart sshd
+    setup_cmd += (
+        "systemctl restart sshd 2>/dev/null || service ssh restart 2>/dev/null || "
+        "/etc/init.d/ssh restart 2>/dev/null ; echo TUNNEL_SERVER_SETUP_OK"
+    )
+
+    # Connect on port 22 for initial setup (sshd may not yet have tunnel port)
+    ok, out = ssh_exec(ip, 22, ssh_user, password, setup_cmd, cmd_timeout=30)
+    # If port 22 fails and tunnel port differs, try tunnel port
+    if not ok and ssh_port != 22:
+        ok, out = ssh_exec(ip, ssh_port, ssh_user, password, setup_cmd, cmd_timeout=30)
+
+    if ok and "TUNNEL_SERVER_SETUP_OK" in out:
+        await update.message.reply_text(
+            f"✅ <b>Сервер {ip} настроен!</b>\n\n"
+            "• authorized_keys ✓\n"
+            "• GatewayPorts yes ✓\n"
+            f"• Port {ssh_port} ✓\n"
+            "• ClientAliveInterval 30 ✓\n"
+            "• sshd перезапущен ✓\n\n"
+            "<i>Зависшие сессии теперь автоочищаются через 90 сек.</i>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='rt_menu')]]))
+    else:
+        await update.message.reply_text(
+            f"❌ <b>Ошибка настройки</b>\n\n<code>{out[:500]}</code>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='rt_menu')]]))
+
+
+def _tunnel_cleanup_port(port: int) -> Tuple[bool, str]:
+    """Kill stale SSH session holding a tunnel port on the tunnel server.
+    Uses tunnel key for auth (server must be set up first)."""
+    ts = load_tunnel_server()
+    if not ts.get("ip") or not os.path.exists(TUNNEL_KEY_FILE):
+        return False, "Сервер или ключ не настроены"
+    cmd = f"fuser -k {port}/tcp 2>/dev/null ; echo CLEANUP_OK"
+    return ssh_exec_key(
+        ts["ip"], int(ts.get("ssh_port", 22)),
+        ts.get("ssh_user", "root"), TUNNEL_KEY_FILE, cmd
+    )
 
 
 async def rtunnel_ports(update: Update, context: ContextTypes.DEFAULT_TYPE, show_filter: str = "all"):
@@ -1081,6 +1196,9 @@ async def rtunnel_deploy_one(update: Update, context: ContextTypes.DEFAULT_TYPE,
         return
 
     await safe_edit_text(q, context, f"⏳ Заливаю туннель на {cn} (порт {port})...")
+
+    # Cleanup stale port on tunnel server before deploy
+    _tunnel_cleanup_port(port)
 
     tunnel_ip = ts["ip"]
     ssh_port = ts.get("ssh_port", 22)
@@ -1240,6 +1358,9 @@ async def rtunnel_deploy_all(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 fail_count += 1
                 failed_names.append(cn)
                 continue
+
+            # Cleanup stale port on tunnel server
+            _tunnel_cleanup_port(port)
 
             tunnel_ip = ts["ip"]
             ssh_port_ts = ts.get("ssh_port", 22)
@@ -5942,6 +6063,8 @@ async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_T
     # Reverse tunnel text inputs
     if context.user_data.get('await_rt_ip'):
         await rtunnel_set_ip_handler(update, context); return
+    if context.user_data.get('await_rt_setup_pass'):
+        await rtunnel_setup_handler(update, context); return
     # GOST text inputs
     if context.user_data.get('await_gost_add'):
         await gost_add_handler(update, context); return
@@ -6444,6 +6567,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await rtunnel_key_menu(update, context)
     elif data in ('rt_key_gen', 'rt_key_regen'):
         await rtunnel_key_generate(update, context)
+    elif data == 'rt_setup':
+        await rtunnel_setup_start(update, context)
     elif data == 'rt_ports':
         await rtunnel_ports(update, context)
     elif data == 'rt_ports_notdeployed':
