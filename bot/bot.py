@@ -2094,6 +2094,46 @@ async def bulk_send_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop(k, None)
     await safe_edit_text(q, context, "Массовая отправка отменена.")
 
+# --- Bulk enable / disable — shared helpers ---
+_BULK_PAGE_SIZE = 15
+
+def _bulk_clear(context, prefix: str):
+    for k in [f'{prefix}_keys', f'{prefix}_sel', f'{prefix}_page']:
+        context.user_data.pop(k, None)
+
+def _bulk_keyboard(keys: List[str], selected: set, page: int, prefix: str):
+    """Build paginated inline keyboard for bulk enable/disable."""
+    total_pages = max(1, (len(keys) + _BULK_PAGE_SIZE - 1) // _BULK_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * _BULK_PAGE_SIZE
+    page_keys = keys[start:start + _BULK_PAGE_SIZE]
+    rows = []
+    for i, name in enumerate(page_keys):
+        idx = start + i
+        mark = "✅ " if name in selected else ""
+        rows.append([InlineKeyboardButton(f"{mark}{name}", callback_data=f"{prefix}_t_{idx}")])
+    # Navigation row
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀️", callback_data=f"{prefix}_p_{page-1}"))
+    nav.append(InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("▶️", callback_data=f"{prefix}_p_{page+1}"))
+    rows.append(nav)
+    # Select all / deselect all
+    if len(selected) == len(keys):
+        rows.append([InlineKeyboardButton("☐ Снять все", callback_data=f"{prefix}_clr")])
+    else:
+        rows.append([InlineKeyboardButton("☑ Выбрать все", callback_data=f"{prefix}_all")])
+    # Confirm / cancel
+    sel_count = len(selected)
+    confirm_label = f"✅ Подтвердить ({sel_count})" if sel_count else "✅ Подтвердить"
+    rows.append([
+        InlineKeyboardButton(confirm_label, callback_data=f"{prefix}_ok"),
+        InlineKeyboardButton("❌ Отмена", callback_data=f"{prefix}_no"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
 # --- Bulk enable ---
 async def start_bulk_enable(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
@@ -2102,61 +2142,75 @@ async def start_bulk_enable(update: Update, context: ContextTypes.DEFAULT_TYPE):
     disabled = [f[:-5] for f in files if is_client_ccd_disabled(f[:-5])]
     if not disabled:
         await safe_edit_text(q, context, "Нет заблокированных клиентов."); return
-    url = create_names_telegraph_page(disabled, "Включение клиентов", "Заблокированные клиенты")
-    if not url:
-        await safe_edit_text(q, context, "Ошибка Telegraph."); return
-    context.user_data['bulk_enable_keys'] = disabled
-    context.user_data['await_bulk_enable_numbers'] = True
-    text = ("<b>Включить клиентов</b>\n"
-            "Формат: all | 1 | 1,2 | 3-7 ...\n"
-            f"<a href=\"{url}\">Список</a>\n\nПришлите строку.")
-    await safe_edit_text(q, context, text, parse_mode="HTML",
-                         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel_bulk_enable")]]))
+    _bulk_clear(context, 'be')
+    context.user_data['be_keys'] = disabled
+    context.user_data['be_sel'] = set()
+    context.user_data['be_page'] = 0
+    kb = _bulk_keyboard(disabled, set(), 0, 'be')
+    await safe_edit_text(q, context, "<b>Включить клиентов</b>\nВыберите кнопками:",
+                         parse_mode="HTML", reply_markup=kb)
 
-async def process_bulk_enable_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get('await_bulk_enable_numbers'): return
-    names: List[str] = context.user_data.get('bulk_enable_keys', [])
-    if not names:
-        await update.message.reply_text("Список потерян.")
-        context.user_data.pop('await_bulk_enable_numbers', None); return
-    idxs, errs = parse_bulk_selection(update.message.text.strip(), len(names))
-    if errs:
-        await update.message.reply_text("Ошибки:\n" + "\n".join(errs),
-                                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel_bulk_enable")]]))
-        return
-    if not idxs:
-        await update.message.reply_text("Ничего не выбрано.",
-                                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel_bulk_enable")]]))
-        return
-    selected = [names[i - 1] for i in idxs]
-    context.user_data['bulk_enable_selected'] = selected
-    context.user_data['await_bulk_enable_numbers'] = False
-    preview = "\n".join(selected[:30])
-    if len(selected) > 30: preview += f"\n... ещё {len(selected)-30}"
-    await update.message.reply_text(
-        f"<b>Включить ({len(selected)}):</b>\n<code>{preview}</code>\nПодтвердить?",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Да", callback_data="bulk_enable_confirm")],
-            [InlineKeyboardButton("❌ Отмена", callback_data="cancel_bulk_enable")]
-        ])
-    )
+async def _bulk_enable_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    keys = context.user_data.get('be_keys', [])
+    sel = context.user_data.get('be_sel', set())
+    idx = int(q.data.split('_')[-1])
+    if 0 <= idx < len(keys):
+        name = keys[idx]
+        if name in sel:
+            sel.discard(name)
+        else:
+            sel.add(name)
+    context.user_data['be_sel'] = sel
+    page = context.user_data.get('be_page', 0)
+    kb = _bulk_keyboard(keys, sel, page, 'be')
+    await safe_edit_text(q, context, f"<b>Включить клиентов</b>\nВыбрано: {len(sel)}",
+                         parse_mode="HTML", reply_markup=kb)
+
+async def _bulk_enable_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    keys = context.user_data.get('be_keys', [])
+    sel = context.user_data.get('be_sel', set())
+    page = int(q.data.split('_')[-1])
+    context.user_data['be_page'] = page
+    kb = _bulk_keyboard(keys, sel, page, 'be')
+    await safe_edit_text(q, context, f"<b>Включить клиентов</b>\nВыбрано: {len(sel)}",
+                         parse_mode="HTML", reply_markup=kb)
+
+async def _bulk_enable_select_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    keys = context.user_data.get('be_keys', [])
+    sel = set(keys)
+    context.user_data['be_sel'] = sel
+    page = context.user_data.get('be_page', 0)
+    kb = _bulk_keyboard(keys, sel, page, 'be')
+    await safe_edit_text(q, context, f"<b>Включить клиентов</b>\nВыбрано: {len(sel)}",
+                         parse_mode="HTML", reply_markup=kb)
+
+async def _bulk_enable_clear_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    keys = context.user_data.get('be_keys', [])
+    context.user_data['be_sel'] = set()
+    page = context.user_data.get('be_page', 0)
+    kb = _bulk_keyboard(keys, set(), page, 'be')
+    await safe_edit_text(q, context, "<b>Включить клиентов</b>\nВыбрано: 0",
+                         parse_mode="HTML", reply_markup=kb)
 
 async def bulk_enable_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
-    selected: List[str] = context.user_data.get('bulk_enable_selected', [])
+    selected = context.user_data.get('be_sel', set())
     if not selected:
-        await safe_edit_text(q, context, "Пусто."); return
+        await safe_edit_text(q, context, "Ничего не выбрано.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='bulk_enable_start')]]))
+        return
     for name in selected:
         unblock_client_ccd(name)
-    for k in ['bulk_enable_selected', 'bulk_enable_keys', 'await_bulk_enable_numbers']:
-        context.user_data.pop(k, None)
+    _bulk_clear(context, 'be')
     await safe_edit_text(q, context, f"✅ Включено клиентов: {len(selected)}")
 
 async def bulk_enable_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer("Отменено")
-    for k in ['bulk_enable_selected', 'bulk_enable_keys', 'await_bulk_enable_numbers']:
-        context.user_data.pop(k, None)
+    _bulk_clear(context, 'be')
     await safe_edit_text(q, context, "Массовое включение отменено.")
 
 # --- Bulk disable ---
@@ -2167,61 +2221,75 @@ async def start_bulk_disable(update: Update, context: ContextTypes.DEFAULT_TYPE)
     active = [f[:-5] for f in files if not is_client_ccd_disabled(f[:-5])]
     if not active:
         await safe_edit_text(q, context, "Нет активных клиентов."); return
-    url = create_names_telegraph_page(active, "Отключение клиентов", "Активные клиенты")
-    if not url:
-        await safe_edit_text(q, context, "Ошибка Telegraph."); return
-    context.user_data['bulk_disable_keys'] = active
-    context.user_data['await_bulk_disable_numbers'] = True
-    text = ("<b>Отключить клиентов</b>\n"
-            "Формат: all | 1 | 1,2,7 | 3-10 ...\n"
-            f"<a href=\"{url}\">Список</a>\n\nПришлите строку.")
-    await safe_edit_text(q, context, text, parse_mode="HTML",
-                         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel_bulk_disable")]]))
+    _bulk_clear(context, 'bd')
+    context.user_data['bd_keys'] = active
+    context.user_data['bd_sel'] = set()
+    context.user_data['bd_page'] = 0
+    kb = _bulk_keyboard(active, set(), 0, 'bd')
+    await safe_edit_text(q, context, "<b>Отключить клиентов</b>\nВыберите кнопками:",
+                         parse_mode="HTML", reply_markup=kb)
 
-async def process_bulk_disable_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get('await_bulk_disable_numbers'): return
-    names: List[str] = context.user_data.get('bulk_disable_keys', [])
-    if not names:
-        await update.message.reply_text("Список потерян.")
-        context.user_data.pop('await_bulk_disable_numbers', None); return
-    idxs, errs = parse_bulk_selection(update.message.text.strip(), len(names))
-    if errs:
-        await update.message.reply_text("Ошибки:\n" + "\n".join(errs),
-                                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel_bulk_disable")]]))
-        return
-    if not idxs:
-        await update.message.reply_text("Ничего не выбрано.",
-                                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel_bulk_disable")]]))
-        return
-    selected = [names[i - 1] for i in idxs]
-    context.user_data['bulk_disable_selected'] = selected
-    context.user_data['await_bulk_disable_numbers'] = False
-    preview = "\n".join(selected[:30])
-    if len(selected) > 30: preview += f"\n... ещё {len(selected)-30}"
-    await update.message.reply_text(
-        f"<b>Отключить ({len(selected)}):</b>\n<code>{preview}</code>\nПодтвердить?",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Да", callback_data="bulk_disable_confirm")],
-            [InlineKeyboardButton("❌ Отмена", callback_data="cancel_bulk_disable")]
-        ])
-    )
+async def _bulk_disable_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    keys = context.user_data.get('bd_keys', [])
+    sel = context.user_data.get('bd_sel', set())
+    idx = int(q.data.split('_')[-1])
+    if 0 <= idx < len(keys):
+        name = keys[idx]
+        if name in sel:
+            sel.discard(name)
+        else:
+            sel.add(name)
+    context.user_data['bd_sel'] = sel
+    page = context.user_data.get('bd_page', 0)
+    kb = _bulk_keyboard(keys, sel, page, 'bd')
+    await safe_edit_text(q, context, f"<b>Отключить клиентов</b>\nВыбрано: {len(sel)}",
+                         parse_mode="HTML", reply_markup=kb)
+
+async def _bulk_disable_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    keys = context.user_data.get('bd_keys', [])
+    sel = context.user_data.get('bd_sel', set())
+    page = int(q.data.split('_')[-1])
+    context.user_data['bd_page'] = page
+    kb = _bulk_keyboard(keys, sel, page, 'bd')
+    await safe_edit_text(q, context, f"<b>Отключить клиентов</b>\nВыбрано: {len(sel)}",
+                         parse_mode="HTML", reply_markup=kb)
+
+async def _bulk_disable_select_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    keys = context.user_data.get('bd_keys', [])
+    sel = set(keys)
+    context.user_data['bd_sel'] = sel
+    page = context.user_data.get('bd_page', 0)
+    kb = _bulk_keyboard(keys, sel, page, 'bd')
+    await safe_edit_text(q, context, f"<b>Отключить клиентов</b>\nВыбрано: {len(sel)}",
+                         parse_mode="HTML", reply_markup=kb)
+
+async def _bulk_disable_clear_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    keys = context.user_data.get('bd_keys', [])
+    context.user_data['bd_sel'] = set()
+    page = context.user_data.get('bd_page', 0)
+    kb = _bulk_keyboard(keys, set(), page, 'bd')
+    await safe_edit_text(q, context, "<b>Отключить клиентов</b>\nВыбрано: 0",
+                         parse_mode="HTML", reply_markup=kb)
 
 async def bulk_disable_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
-    selected: List[str] = context.user_data.get('bulk_disable_selected', [])
+    selected = context.user_data.get('bd_sel', set())
     if not selected:
-        await safe_edit_text(q, context, "Пусто."); return
+        await safe_edit_text(q, context, "Ничего не выбрано.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='bulk_disable_start')]]))
+        return
     for name in selected:
-        block_client_ccd(name); disconnect_client_sessions(name)
-    for k in ['bulk_disable_selected', 'bulk_disable_keys', 'await_bulk_disable_numbers']:
-        context.user_data.pop(k, None)
+        block_client_ccd(name)
+    _bulk_clear(context, 'bd')
     await safe_edit_text(q, context, f"⚠️ Отключено клиентов: {len(selected)}")
 
 async def bulk_disable_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer("Отменено")
-    for k in ['bulk_disable_selected', 'bulk_disable_keys', 'await_bulk_disable_numbers']:
-        context.user_data.pop(k, None)
+    _bulk_clear(context, 'bd')
     await safe_edit_text(q, context, "Массовое отключение отменено.")
 
 # =====================================================================
@@ -5882,10 +5950,6 @@ async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_T
         await process_bulk_delete_numbers(update, context); return
     if context.user_data.get('await_bulk_send_numbers'):
         await process_bulk_send_numbers(update, context); return
-    if context.user_data.get('await_bulk_enable_numbers'):
-        await process_bulk_enable_numbers(update, context); return
-    if context.user_data.get('await_bulk_disable_numbers'):
-        await process_bulk_disable_numbers(update, context); return
     if context.user_data.get('await_renew_number'):
         await process_renew_number(update, context); return
     if context.user_data.get('await_renew_expiry'):
@@ -6285,16 +6349,32 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == 'bulk_enable_start':
         await start_bulk_enable(update, context)
-    elif data == 'bulk_enable_confirm':
+    elif data.startswith('be_t_'):
+        await _bulk_enable_toggle(update, context)
+    elif data.startswith('be_p_'):
+        await _bulk_enable_page(update, context)
+    elif data == 'be_all':
+        await _bulk_enable_select_all(update, context)
+    elif data == 'be_clr':
+        await _bulk_enable_clear_all(update, context)
+    elif data == 'be_ok':
         await bulk_enable_confirm(update, context)
-    elif data == 'cancel_bulk_enable':
+    elif data in ('be_no', 'cancel_bulk_enable'):
         await bulk_enable_cancel(update, context)
 
     elif data == 'bulk_disable_start':
         await start_bulk_disable(update, context)
-    elif data == 'bulk_disable_confirm':
+    elif data.startswith('bd_t_'):
+        await _bulk_disable_toggle(update, context)
+    elif data.startswith('bd_p_'):
+        await _bulk_disable_page(update, context)
+    elif data == 'bd_all':
+        await _bulk_disable_select_all(update, context)
+    elif data == 'bd_clr':
+        await _bulk_disable_clear_all(update, context)
+    elif data == 'bd_ok':
         await bulk_disable_confirm(update, context)
-    elif data == 'cancel_bulk_disable':
+    elif data in ('bd_no', 'cancel_bulk_disable'):
         await bulk_disable_cancel(update, context)
 
     elif data == 'keys_expiry':
