@@ -1681,6 +1681,15 @@ def _pptp_delete_client(client_name: str):
         save_pptp_clients(clients)
         print(f"[pptp-sync] deleted {client_name} from pptp_clients.json")
 
+def _tunnel_delete_client(client_name: str):
+    """Remove tunnel_port assignment from routers.json (silent, best-effort)."""
+    routers = load_routers()
+    if client_name in routers and routers[client_name].get("tunnel_port"):
+        port = routers[client_name].pop("tunnel_port", None)
+        routers[client_name].pop("tunnel_deployed", None)
+        save_routers(routers)
+        print(f"[tunnel-sync] removed tunnel_port {port} for {client_name}")
+
 def block_client_ccd(client_name):
     os.makedirs(CCD_DIR, exist_ok=True)
     with open(os.path.join(CCD_DIR, client_name), "w") as f:
@@ -1914,8 +1923,9 @@ def remove_client_files(name: str):
         client_meta.pop(name, None); save_client_meta()
     if name in traffic_usage:
         traffic_usage.pop(name, None); save_traffic_db(force=True)
-    # Also remove from PPTP
+    # Also remove from PPTP and tunnel
     _pptp_delete_client(name)
+    _tunnel_delete_client(name)
 
 # =====================================================================
 #  OPENVPN — Backup (hide archives from /root)
