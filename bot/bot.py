@@ -4498,26 +4498,52 @@ async def pptp_install_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #  PPTP CLIENTS (chap-secrets management)
 # =====================================================================
 
-async def pptp_clients_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    clients = load_pptp_clients()
-    if clients:
-        lines = [f"  <code>{cn}</code> → <code>{ip}</code>" for cn, ip in
+_PPTP_PAGE_SIZE = 20
+
+def _pptp_clients_page_kb(clients: dict, page: int):
+    """Build paginated PPTP clients list with nav buttons."""
+    lines_all = [f"  <code>{cn}</code> → <code>{ip}</code>" for cn, ip in
                  sorted(clients.items(), key=lambda x: x[1])]
-        clist = "\n".join(lines[:30])
-    else:
-        clist = "  <i>пусто</i>"
-    kb = [
+    total_pages = max(1, (len(lines_all) + _PPTP_PAGE_SIZE - 1) // _PPTP_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * _PPTP_PAGE_SIZE
+    page_lines = lines_all[start:start + _PPTP_PAGE_SIZE]
+    clist = "\n".join(page_lines) if page_lines else "  <i>пусто</i>"
+    kb = []
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("◀️", callback_data=f'pptp_cl_pg_{page-1}'))
+        nav.append(InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton("▶️", callback_data=f'pptp_cl_pg_{page+1}'))
+        kb.append(nav)
+    kb.extend([
         [InlineKeyboardButton("➕ Добавить", callback_data='pptp_cl_add'),
          InlineKeyboardButton("➕ Все роутеры", callback_data='pptp_cl_bulk')],
         [InlineKeyboardButton("🗑 Удалить", callback_data='pptp_cl_del'),
          InlineKeyboardButton("🔄 Синхр.", callback_data='pptp_cl_sync')],
         [InlineKeyboardButton("🔗 PPTP", callback_data='pptp_menu')],
-    ]
-    await safe_edit_text(q, context,
-        f"👥 <b>PPTP Клиенты</b> ({len(clients)})\n\n{clist}",
-        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+    ])
+    text = f"👥 <b>PPTP Клиенты</b> ({len(clients)})\n\n{clist}"
+    return text, InlineKeyboardMarkup(kb)
+
+async def pptp_clients_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    clients = load_pptp_clients()
+    page = context.user_data.get('pptp_cl_page', 0)
+    text, kb = _pptp_clients_page_kb(clients, page)
+    await safe_edit_text(q, context, text, parse_mode="HTML", reply_markup=kb)
+
+async def _pptp_clients_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    page = int(q.data.split('_')[-1])
+    context.user_data['pptp_cl_page'] = page
+    clients = load_pptp_clients()
+    text, kb = _pptp_clients_page_kb(clients, page)
+    await safe_edit_text(q, context, text, parse_mode="HTML", reply_markup=kb)
 
 async def pptp_cl_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show SSH routers not yet in PPTP clients for selection."""
@@ -7107,6 +7133,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await pptp_install_run(update, context)
     elif data == 'pptp_clients':
         await pptp_clients_menu(update, context)
+    elif data.startswith('pptp_cl_pg_'):
+        await _pptp_clients_page(update, context)
     elif data == 'pptp_cl_add':
         await pptp_cl_add_start(update, context)
     elif data.startswith('pptp_cl_add1:'):
