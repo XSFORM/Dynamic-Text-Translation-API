@@ -1650,16 +1650,49 @@ def is_client_ccd_disabled(client_name):
     except:
         return False
 
+def _pptp_remove_from_chap(client_name: str):
+    """Remove client from PPTP chap-secrets (silent, best-effort)."""
+    clients = load_pptp_clients()
+    if client_name not in clients:
+        return
+    cmd = f'sed -i "/^{client_name} /d" /etc/ppp/chap-secrets'
+    pptp_ssh_exec(cmd)
+    print(f"[pptp-sync] removed {client_name} from chap-secrets")
+
+def _pptp_restore_to_chap(client_name: str):
+    """Restore client to PPTP chap-secrets (silent, best-effort)."""
+    clients = load_pptp_clients()
+    if client_name not in clients:
+        return
+    ip = clients[client_name]
+    srv = load_pptp_server()
+    vpn_pass = srv.get("vpn_password", "pass123")
+    cmd = (f'grep -q "^{client_name} " /etc/ppp/chap-secrets || '
+           f'echo "{client_name} pptpd {vpn_pass} {ip}" >> /etc/ppp/chap-secrets')
+    pptp_ssh_exec(cmd)
+    print(f"[pptp-sync] restored {client_name} to chap-secrets")
+
+def _pptp_delete_client(client_name: str):
+    """Fully remove client from PPTP system (json + chap-secrets)."""
+    _pptp_remove_from_chap(client_name)
+    clients = load_pptp_clients()
+    if client_name in clients:
+        clients.pop(client_name)
+        save_pptp_clients(clients)
+        print(f"[pptp-sync] deleted {client_name} from pptp_clients.json")
+
 def block_client_ccd(client_name):
     os.makedirs(CCD_DIR, exist_ok=True)
     with open(os.path.join(CCD_DIR, client_name), "w") as f:
         f.write("disable\n")
     disconnect_client_sessions(client_name)
+    _pptp_remove_from_chap(client_name)
 
 def unblock_client_ccd(client_name):
     os.makedirs(CCD_DIR, exist_ok=True)
     with open(os.path.join(CCD_DIR, client_name), "w") as f:
         f.write("enable\n")
+    _pptp_restore_to_chap(client_name)
 
 def split_message(text, max_length=4000):
     lines = text.split('\n')
@@ -1881,6 +1914,8 @@ def remove_client_files(name: str):
         client_meta.pop(name, None); save_client_meta()
     if name in traffic_usage:
         traffic_usage.pop(name, None); save_traffic_db(force=True)
+    # Also remove from PPTP
+    _pptp_delete_client(name)
 
 # =====================================================================
 #  OPENVPN — Backup (hide archives from /root)
