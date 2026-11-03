@@ -7450,6 +7450,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await wiz_full_start(update, context)
     elif data.startswith('wiz_full_type:'):
         await wiz_full_type(update, context, data[len('wiz_full_type:'):])
+    elif data.startswith('wiz_full_gtpl:'):
+        parts = data[len('wiz_full_gtpl:'):].split(':', 1)
+        await wiz_full_gtpl_apply(update, context, int(parts[0]), parts[1])
+    elif data.startswith('wiz_full_ftpl:'):
+        parts = data[len('wiz_full_ftpl:'):].split(':', 1)
+        await wiz_full_ftpl_apply(update, context, int(parts[0]), parts[1])
     elif data == 'gost_getroot':
         await gost_getroot_start(update, context)
     # --- PPTP iptables forward ---
@@ -11521,15 +11527,35 @@ GOST_HELP_TEXT = """
     2. Вводишь IP → логин → пароль → метку
     3. Бот сам:
        • Добавляет сервер в GOST серверы
-       • Устанавливает GOST / iptables (по шаблону)
-       • Добавляет в Авто IP
+       • Берёт готовый шаблон и применяет:
+         — GOST: установит бинарник + systemd с правилами
+         — iptables: настроит PPTP/DNAT форвард
+       • Добавляет сервер в Авто IP
+
+  ⚡ Если шаблон один — применяется автоматически.
+     Если шаблонов несколько — предложит выбрать.
+     Если шаблонов нет — предложит создать.
+
+  💡 Совет: заранее создайте шаблон GOST (через
+  Шаблоны в меню) или iptables (через PPTP форвард →
+  Шаблоны), и тогда Полная настройка сделает всё
+  за один раз без лишних вопросов.
 
   Также после обычного добавления сервера (➕)
   бот предложит настроить перенаправление
-  и добавить в Авто IP.
+  и добавить в Авто IP пошагово (Yes/No).
 
   При смене IP существующего сервера бот
   автоматически предложит обновить IP в Авто IP.
+
+📋 Шаблоны GOST
+  Сохраняй настроенные правила как шаблон, чтобы
+  потом в один клик применять на новых серверах.
+  Меню: Шаблоны → Сохранить текущий / Применить / Удалить
+
+📋 Шаблоны iptables (PPTP форвард)
+  Сохраняй настройку PPTP+DNAT форварда как шаблон.
+  Меню: PPTP форвард → Шаблоны → Сохранить / Применить / Удалить
 
 🔐 Получить Root
   Для серверов с PEM-ключом (AWS, GCP, Azure):
@@ -11892,46 +11918,313 @@ async def wiz_full_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         servers = load_gost_servers()
         servers[ip] = {"ssh_user": user, "ssh_pass": pwd, "label": text, "rules": []}
         save_gost_servers(servers)
+        srv = servers[ip]
 
         if fwd_type == 'gost':
-            # Step 2: Pick GOST template
             templates = load_gost_templates()
             if not templates:
-                # No templates — just add server + install GOST + Auto IP
                 kb = [
-                    [InlineKeyboardButton("⚙️ Установить GOST", callback_data=f'gost_install:{ip}')],
-                    [InlineKeyboardButton("➕ В Авто IP", callback_data=f'wiz_aip_add:{ip}')],
+                    [InlineKeyboardButton("📋 Создать шаблон", callback_data='gtpl_menu')],
                     [InlineKeyboardButton("✅ Готово", callback_data='gost_menu')],
                 ]
                 await update.message.reply_text(
-                    f"✅ Сервер <code>{ip}</code> ({text}) добавлен.\n\n"
-                    "📋 Нет шаблонов GOST. Установите GOST и настройте правила вручную.",
+                    f"✅ Сервер <code>{ip}</code> ({escape(text)}) добавлен.\n\n"
+                    "⚠️ Нет шаблонов GOST.\n"
+                    "Создайте шаблон через меню, затем примените его на сервер.",
                     parse_mode="HTML",
                     reply_markup=InlineKeyboardMarkup(kb))
+            elif len(templates) == 1:
+                # Single template — auto-apply + auto AIP
+                await _wiz_full_gost_auto(update.message, ip, srv, templates[0])
             else:
+                # Multiple templates — picker
                 kb = []
                 for i, t in enumerate(templates):
                     name = t.get("name", f"Шаблон {i+1}")
                     n = len(t.get("rules", []))
                     kb.append([InlineKeyboardButton(
-                        f"📤 {name} ({n})", callback_data=f'wiz_gtpl:{i}:{ip}')])
-                kb.append([InlineKeyboardButton("✅ Готово", callback_data='gost_menu')])
+                        f"📤 {name} ({n})", callback_data=f'wiz_full_gtpl:{i}:{ip}')])
+                kb.append([InlineKeyboardButton("❌ Отмена", callback_data='gost_menu')])
                 await update.message.reply_text(
-                    f"✅ Сервер <code>{ip}</code> ({text}) добавлен.\n\n"
+                    f"✅ Сервер <code>{ip}</code> ({escape(text)}) добавлен.\n\n"
                     "🌐 <b>Выберите шаблон GOST:</b>\n"
                     "(установит GOST + применит правила + добавит в Авто IP)",
                     parse_mode="HTML",
                     reply_markup=InlineKeyboardMarkup(kb))
         else:
-            # iptables flow — start PPTP forward install
-            context.user_data['wiz_after_ipt'] = ip
-            context.user_data['await_pptp_fwd_backend'] = {
-                'ip': ip, 'action': 'install', 'step': 'pptp', 'ovpn_rules': []}
-            await update.message.reply_text(
-                f"✅ Сервер <code>{ip}</code> ({text}) добавлен.\n\n"
-                "🔀 <b>Настройка iptables</b>\n"
-                "Введите IP адрес <b>PPTP бэкенда</b>:",
-                parse_mode="HTML")
+            # iptables flow — use templates instead of manual input
+            templates = load_fwd_templates()
+            if not templates:
+                kb = [
+                    [InlineKeyboardButton("📋 Создать шаблон", callback_data='fwd_tpl_menu')],
+                    [InlineKeyboardButton("✅ Готово", callback_data='gost_menu')],
+                ]
+                await update.message.reply_text(
+                    f"✅ Сервер <code>{ip}</code> ({escape(text)}) добавлен.\n\n"
+                    "⚠️ Нет шаблонов iptables.\n"
+                    "Создайте шаблон через PPTP форвард → Шаблоны, затем примените.",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(kb))
+            elif len(templates) == 1:
+                # Single template — auto-apply + auto AIP
+                await _wiz_full_ipt_auto(update.message, ip, srv, templates[0])
+            else:
+                # Multiple templates — picker
+                kb = []
+                for i, t in enumerate(templates):
+                    name = t.get("name", f"Шаблон {i+1}")
+                    pptp = t.get("pptp_backend", "?")
+                    kb.append([InlineKeyboardButton(
+                        f"📤 {name} (→{pptp})", callback_data=f'wiz_full_ftpl:{i}:{ip}')])
+                kb.append([InlineKeyboardButton("❌ Отмена", callback_data='gost_menu')])
+                await update.message.reply_text(
+                    f"✅ Сервер <code>{ip}</code> ({escape(text)}) добавлен.\n\n"
+                    "🔀 <b>Выберите шаблон iptables:</b>\n"
+                    "(установит iptables правила + добавит в Авто IP)",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(kb))
+
+
+# =====================================================================
+#  "Полная настройка" — auto-apply helpers
+# =====================================================================
+
+async def _wiz_full_gost_auto(message, ip: str, srv: dict, tpl: dict):
+    """Auto-apply GOST template + add to Auto IP. Called from wiz_full or callback."""
+    rules = tpl.get("rules", [])
+    tpl_name = escape(tpl.get("name", "Шаблон"))
+    if not rules:
+        kb = [[InlineKeyboardButton("✅ Готово", callback_data='gost_menu')]]
+        await message.reply_text(
+            f"⚠️ Шаблон <b>{tpl_name}</b> пуст — нет правил для применения.",
+            parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+        return
+
+    progress = await message.reply_text(
+        f"⏳ Устанавливаю GOST + применяю <b>{tpl_name}</b> на <code>{ip}</code>...",
+        parse_mode="HTML")
+
+    # Step 1: Install GOST binary
+    install_script = (
+        "#!/bin/bash\n"
+        "apt-get update -qq && apt-get install -y -qq wget curl jq tar gzip > /dev/null 2>&1\n"
+        f"VER=$(curl -s 'https://api.github.com/repos/{GOST_REPO}/releases/latest' | jq -r '.tag_name' | sed 's/^v//')\n"
+        "ARCH=$(dpkg --print-architecture 2>/dev/null || echo amd64)\n"
+        '[ "$ARCH" = "arm64" ] && ARCH="armv8"\n'
+        '[ "$ARCH" = "armhf" ] && ARCH="armv7"\n'
+        "cd /tmp\n"
+        f"wget -q \"https://github.com/{GOST_REPO}/releases/download/v${{VER}}/gost_${{VER}}_linux_${{ARCH}}.tar.gz\" -O gost.tar.gz\n"
+        "tar -xzf gost.tar.gz && chmod +x gost && mv gost /usr/local/bin/gost\n"
+        "rm -f gost.tar.gz\n"
+        'echo "GOST_OK:$VER"\n'
+    )
+    b64 = base64.b64encode(install_script.encode()).decode()
+    start_cmd = (
+        f"echo '{b64}' | base64 -d > /tmp/gost_install.sh && "
+        "chmod +x /tmp/gost_install.sh && "
+        "bash /tmp/gost_install.sh"
+    )
+    ok, out = await asyncio.to_thread(
+        ssh_exec, ip, 22, srv["ssh_user"], srv["ssh_pass"], start_cmd, 120)
+    if not ok or "GOST_OK:" not in out:
+        ok_check, out_check = ssh_exec(ip, 22, srv["ssh_user"], srv["ssh_pass"],
+                                        f"{GOST_BIN} -V 2>/dev/null && echo GOST_EXISTS || echo NO_GOST")
+        if "GOST_EXISTS" not in out_check:
+            kb = [[InlineKeyboardButton("◀️ GOST меню", callback_data='gost_menu')]]
+            await progress.edit_text(
+                f"❌ Не удалось установить GOST на {ip}:\n<pre>{escape(out[:1000])}</pre>",
+                parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+            return
+
+    # Step 2: Apply template rules
+    servers = load_gost_servers()
+    if ip in servers:
+        servers[ip]["rules"] = list(rules)
+        save_gost_servers(servers)
+    gost_ls = " ".join(
+        f"-L={r['proto']}://:{r['local_port']}/{r['remote_ip']}:{r['remote_port']}"
+        for r in rules)
+    service_content = (
+        "[Unit]\\n"
+        "Description=GO Simple Tunnel\\n"
+        "After=network.target\\n"
+        "Wants=network.target\\n"
+        "\\n"
+        "[Service]\\n"
+        "Type=simple\\n"
+        f"ExecStart={GOST_BIN} {gost_ls}\\n"
+        "Restart=on-failure\\n"
+        "\\n"
+        "[Install]\\n"
+        "WantedBy=multi-user.target"
+    )
+    cmd = (
+        f"echo -e '{service_content}' > {GOST_SERVICE_PATH} && "
+        "systemctl daemon-reload && systemctl enable gost && systemctl restart gost && echo GOST_CONF_OK"
+    )
+    ok2, out2 = ssh_exec(ip, 22, srv["ssh_user"], srv["ssh_pass"], cmd)
+
+    r_disp = "\n".join(
+        f"  {r['proto']}://:{r['local_port']} → {r['remote_ip']}:{r['remote_port']}"
+        for r in rules)
+    if ok2 and "GOST_CONF_OK" in out2:
+        gost_status = f"✅ GOST + шаблон <b>{tpl_name}</b> применён\n<code>{r_disp}</code>"
+    else:
+        gost_status = f"⚠️ GOST установлен, ошибка шаблона:\n<pre>{escape(out2[:500])}</pre>"
+
+    # Step 3: Auto-add to Auto IP
+    aip_msg = _wizard_auto_ip_add(ip, srv)
+
+    kb = [[InlineKeyboardButton("🌐 GOST меню", callback_data='gost_menu'),
+           InlineKeyboardButton("🔄 Авто IP", callback_data='aip_menu')]]
+    await progress.edit_text(
+        f"🚀 <b>Полная настройка завершена</b>\n\n"
+        f"1️⃣ Сервер добавлен\n"
+        f"2️⃣ {gost_status}\n"
+        f"3️⃣ {aip_msg}",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def _wiz_full_ipt_auto(message, ip: str, srv: dict, tpl: dict):
+    """Auto-apply iptables/PPTP template + add to Auto IP."""
+    backend = tpl.get("pptp_backend", "")
+    ovpn_rules = tpl.get("ovpn_rules", [])
+    tpl_name = escape(tpl.get("name", "Шаблон"))
+
+    if not backend:
+        kb = [[InlineKeyboardButton("✅ Готово", callback_data='gost_menu')]]
+        await message.reply_text(
+            f"⚠️ Шаблон <b>{tpl_name}</b> не содержит PPTP бэкенд IP.",
+            parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+        return
+
+    progress = await message.reply_text(
+        f"⏳ Применяю шаблон <b>{tpl_name}</b> (iptables) на <code>{ip}</code>...",
+        parse_mode="HTML")
+
+    # Build iptables commands
+    ovpn_flush = ""
+    ovpn_add = ""
+    for r in ovpn_rules:
+        ovpn_flush += (
+            f"iptables -t nat -D PREROUTING -p {r['proto']} --dport {r['port']} "
+            f"-j DNAT --to-destination {r['ip']}:{r['port']} 2>/dev/null ; "
+        )
+        ovpn_add += (
+            f"iptables -t nat -A PREROUTING -p {r['proto']} --dport {r['port']} "
+            f"-j DNAT --to-destination {r['ip']}:{r['port']} ; "
+        )
+
+    install_cmd = (
+        "sysctl -w net.ipv4.ip_forward=1 > /dev/null 2>&1 ; "
+        "grep -q 'net.ipv4.ip_forward=1' /etc/sysctl.conf 2>/dev/null || "
+        "echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf ; "
+        "modprobe nf_nat_pptp 2>/dev/null ; "
+        "modprobe nf_conntrack_pptp 2>/dev/null ; "
+        "modprobe ip_gre 2>/dev/null ; "
+        "iptables -t nat -D PREROUTING -p tcp --dport 1723 -j DNAT --to-destination "
+        f"{backend}:1723 2>/dev/null ; "
+        "iptables -t nat -D PREROUTING -p gre ! -s "
+        f"{backend} -j DNAT --to-destination {backend} 2>/dev/null ; "
+        "iptables -t raw -D PREROUTING -p tcp --dport 1723 -j CT --helper pptp 2>/dev/null ; "
+        f"iptables -t nat -A PREROUTING -p tcp --dport 1723 -j DNAT --to-destination {backend}:1723 ; "
+        f"iptables -t nat -A PREROUTING -p gre ! -s {backend} -j DNAT --to-destination {backend} ; "
+        + ovpn_flush + ovpn_add +
+        "iptables -t nat -C POSTROUTING -j MASQUERADE 2>/dev/null || "
+        "iptables -t nat -A POSTROUTING -j MASQUERADE ; "
+        "iptables -C FORWARD -j ACCEPT 2>/dev/null || "
+        "iptables -A FORWARD -j ACCEPT ; "
+        "iptables -t raw -A PREROUTING -p tcp --dport 1723 -j CT --helper pptp 2>/dev/null ; "
+        "grep -q nf_nat_pptp /etc/modules 2>/dev/null || echo nf_nat_pptp >> /etc/modules ; "
+        "grep -q nf_conntrack_pptp /etc/modules 2>/dev/null || echo nf_conntrack_pptp >> /etc/modules ; "
+        "grep -q ip_gre /etc/modules 2>/dev/null || echo ip_gre >> /etc/modules ; "
+        "cat > /etc/rc.local << 'RCEOF'\n"
+        "#!/bin/bash\n"
+        "modprobe nf_nat_pptp\n"
+        "modprobe nf_conntrack_pptp\n"
+        "modprobe ip_gre\n"
+        "iptables -t raw -A PREROUTING -p tcp --dport 1723 -j CT --helper pptp\n"
+        "exit 0\n"
+        "RCEOF\n"
+        "chmod +x /etc/rc.local ; "
+        "systemctl enable rc-local 2>/dev/null ; "
+        "iptables -t nat -S PREROUTING 2>/dev/null | grep -q '1723' && echo PPTP_FWD_OK || echo PPTP_FWD_FAIL ; "
+        "which netfilter-persistent >/dev/null 2>&1 || "
+        "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iptables-persistent 2>/dev/null || "
+        "yum install -y -q iptables-services 2>/dev/null ; "
+        "netfilter-persistent save 2>/dev/null || "
+        "service iptables save 2>/dev/null"
+    )
+    ok, out = await asyncio.to_thread(
+        ssh_exec, ip, 22, srv["ssh_user"], srv["ssh_pass"], install_cmd, 120)
+
+    if ok and "PPTP_FWD_OK" in out:
+        # Save to gost_servers
+        servers = load_gost_servers()
+        if ip in servers:
+            servers[ip]["pptp_backend"] = backend
+            if ovpn_rules:
+                servers[ip]["ovpn_rules"] = ovpn_rules
+                servers[ip]["ovpn_backend"] = ovpn_rules[0]['ip']
+            save_gost_servers(servers)
+        ovpn_disp = "\n".join(
+            f"  DNAT {r['proto'].upper()} :{r['port']} → {r['ip']}:{r['port']}"
+            for r in ovpn_rules)
+        ipt_status = (f"✅ iptables шаблон <b>{tpl_name}</b> применён\n"
+                      f"  PPTP → <code>{backend}</code>"
+                      + (f"\n<code>{ovpn_disp}</code>" if ovpn_rules else ""))
+    else:
+        ipt_status = f"❌ Ошибка iptables:\n<pre>{escape(out[:500])}</pre>"
+
+    # Step 3: Auto-add to Auto IP
+    aip_msg = _wizard_auto_ip_add(ip, srv)
+
+    kb = [[InlineKeyboardButton("🌐 GOST меню", callback_data='gost_menu'),
+           InlineKeyboardButton("🔄 Авто IP", callback_data='aip_menu')]]
+    await progress.edit_text(
+        f"🚀 <b>Полная настройка завершена</b>\n\n"
+        f"1️⃣ Сервер добавлен\n"
+        f"2️⃣ {ipt_status}\n"
+        f"3️⃣ {aip_msg}",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def wiz_full_gtpl_apply(update: Update, context: ContextTypes.DEFAULT_TYPE, tpl_idx: int, ip: str):
+    """Callback handler: apply GOST template from 'Полная настройка' picker + auto AIP."""
+    q = update.callback_query
+    await q.answer()
+    templates = load_gost_templates()
+    if tpl_idx < 0 or tpl_idx >= len(templates):
+        await safe_edit_text(q, context, "❌ Шаблон не найден.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')]]))
+        return
+    servers = load_gost_servers()
+    srv = servers.get(ip)
+    if not srv:
+        await safe_edit_text(q, context, "❌ Сервер не найден.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')]]))
+        return
+    await safe_edit_text(q, context, "⏳ Запускаю полную настройку...", parse_mode="HTML")
+    await _wiz_full_gost_auto(q.message, ip, srv, templates[tpl_idx])
+
+
+async def wiz_full_ftpl_apply(update: Update, context: ContextTypes.DEFAULT_TYPE, tpl_idx: int, ip: str):
+    """Callback handler: apply iptables template from 'Полная настройка' picker + auto AIP."""
+    q = update.callback_query
+    await q.answer()
+    templates = load_fwd_templates()
+    if tpl_idx < 0 or tpl_idx >= len(templates):
+        await safe_edit_text(q, context, "❌ Шаблон не найден.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')]]))
+        return
+    servers = load_gost_servers()
+    srv = servers.get(ip)
+    if not srv:
+        await safe_edit_text(q, context, "❌ Сервер не найден.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')]]))
+        return
+    await safe_edit_text(q, context, "⏳ Запускаю полную настройку...", parse_mode="HTML")
+    await _wiz_full_ipt_auto(q.message, ip, srv, templates[tpl_idx])
 
 
 # =====================================================================
