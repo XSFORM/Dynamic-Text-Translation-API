@@ -5925,7 +5925,8 @@ async def _reply_kb_gost(update: Update, context: ContextTypes.DEFAULT_TYPE):
     count = len(servers)
     kb = [
         [InlineKeyboardButton(f"📋 Список серверов ({count})", callback_data='gost_list')],
-        [InlineKeyboardButton("➕ Добавить сервер", callback_data='gost_add')],
+        [InlineKeyboardButton("➕ Добавить сервер", callback_data='gost_add'),
+         InlineKeyboardButton("🚀 Полная настройка", callback_data='wiz_full_start')],
         [InlineKeyboardButton("⚙️ Установить GOST", callback_data='gost_select_install')],
         [InlineKeyboardButton("📡 Настроить правила", callback_data='gost_select_rules')],
         [InlineKeyboardButton("➕ Добавить правило", callback_data='gost_select_addrule')],
@@ -6264,6 +6265,8 @@ async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_T
         await gtpl_save_receive(update, context); return
     if context.user_data.get('await_gost_rule') or context.user_data.get('await_gost_addrule'):
         await gost_rule_handler(update, context); return
+    if context.user_data.get('await_wiz_full'):
+        await wiz_full_handler(update, context); return
     if context.user_data.get('await_gost_getroot') and context.user_data['await_gost_getroot'] != 'pem':
         await gost_getroot_handler(update, context); return
     if context.user_data.get('await_fwd_tpl_name'):
@@ -7428,6 +7431,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await gost_uninstall_cmd(update, context, data[len('gost_uninstall:'):])
     elif data == 'gost_help':
         await gost_help_send(update, context)
+    # --- Wizard flow callbacks ---
+    elif data.startswith('wiz_setup:gost:'):
+        await wiz_setup_gost(update, context, data[len('wiz_setup:gost:'):])
+    elif data.startswith('wiz_setup:ipt:'):
+        await wiz_setup_iptables(update, context, data[len('wiz_setup:ipt:'):])
+    elif data.startswith('wiz_gtpl:'):
+        parts = data[len('wiz_gtpl:'):].split(':', 1)
+        await wiz_gtpl_apply(update, context, int(parts[0]), parts[1])
+    elif data.startswith('wiz_aip_ask:'):
+        await wiz_aip_ask(update, context, data[len('wiz_aip_ask:'):])
+    elif data.startswith('wiz_aip_add:'):
+        await wiz_aip_add(update, context, data[len('wiz_aip_add:'):])
+    elif data.startswith('wiz_aip_replace:'):
+        parts = data[len('wiz_aip_replace:'):].split(':', 1)
+        await wiz_aip_replace(update, context, parts[0], parts[1])
+    elif data == 'wiz_full_start':
+        await wiz_full_start(update, context)
+    elif data.startswith('wiz_full_type:'):
+        await wiz_full_type(update, context, data[len('wiz_full_type:'):])
     elif data == 'gost_getroot':
         await gost_getroot_start(update, context)
     # --- PPTP iptables forward ---
@@ -10594,7 +10616,8 @@ async def gost_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     gtpl_count = len(load_gost_templates())
     kb = [
         [InlineKeyboardButton(f"📋 Список серверов ({count})", callback_data='gost_list')],
-        [InlineKeyboardButton("➕ Добавить сервер", callback_data='gost_add')],
+        [InlineKeyboardButton("➕ Добавить сервер", callback_data='gost_add'),
+         InlineKeyboardButton("🚀 Полная настройка", callback_data='wiz_full_start')],
         [InlineKeyboardButton("⚙️ Установить GOST", callback_data='gost_select_install')],
         [InlineKeyboardButton("📡 Настроить правила", callback_data='gost_select_rules')],
         [InlineKeyboardButton("➕ Добавить правило", callback_data='gost_select_addrule')],
@@ -10696,8 +10719,17 @@ async def gost_add_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         servers = load_gost_servers()
         servers[ip] = {"ssh_user": user, "ssh_pass": pwd, "label": text, "rules": []}
         save_gost_servers(servers)
+        # Wizard: offer next steps after adding server
+        kb = [
+            [InlineKeyboardButton("🌐 Настроить GOST", callback_data=f'wiz_setup:gost:{ip}')],
+            [InlineKeyboardButton("🔀 Настроить iptables", callback_data=f'wiz_setup:ipt:{ip}')],
+            [InlineKeyboardButton("⏭ Пропустить", callback_data='gost_menu')],
+        ]
         await update.message.reply_text(
-            f"✅ Сервер добавлен: <code>{ip}</code> ({text})", parse_mode="HTML")
+            f"✅ Сервер добавлен: <code>{ip}</code> ({text})\n\n"
+            "🔧 <b>Настроить перенаправление?</b>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(kb))
 
 
 async def gost_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE, ip: str):
@@ -10774,9 +10806,31 @@ async def gost_edit_ip_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     servers[new_ip] = entry
     save_gost_servers(servers)
     label = entry.get('label', '-')
-    await update.message.reply_text(
-        f"✅ IP изменён:\n<code>{old_ip}</code> → <code>{new_ip}</code>\n({label})",
-        parse_mode="HTML")
+    # Check if old IP was in Auto IP pool — offer to update
+    pool = load_ip_pool()
+    old_in_pool = any(e["ip"] == old_ip for e in pool)
+    if old_in_pool:
+        kb = [
+            [InlineKeyboardButton("✅ Да, обновить", callback_data=f'wiz_aip_replace:{old_ip}:{new_ip}')],
+            [InlineKeyboardButton("⏭ Нет", callback_data='gost_menu')],
+        ]
+        await update.message.reply_text(
+            f"✅ IP изменён:\n<code>{old_ip}</code> → <code>{new_ip}</code>\n({label})\n\n"
+            f"🔄 <b>Обновить IP в Авто IP?</b>\n"
+            f"Старый IP <code>{old_ip}</code> найден в пуле.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(kb))
+    else:
+        # Offer to add to Auto IP
+        kb = [
+            [InlineKeyboardButton("➕ Добавить в Авто IP", callback_data=f'wiz_aip_add:{new_ip}')],
+            [InlineKeyboardButton("⏭ Нет", callback_data='gost_menu')],
+        ]
+        await update.message.reply_text(
+            f"✅ IP изменён:\n<code>{old_ip}</code> → <code>{new_ip}</code>\n({label})\n\n"
+            f"🔄 <b>Добавить в Авто IP?</b>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(kb))
 
 
 async def gost_edit_creds_start(update: Update, context: ContextTypes.DEFAULT_TYPE, ip: str):
@@ -11461,6 +11515,22 @@ GOST_HELP_TEXT = """
   остановка сервиса → disable → удаление
   бинарника и service-файла.
 
+🚀 Полная настройка (Wizard)
+  Автоматическая настройка нового сервера за один раз:
+    1. Выбираешь тип: GOST или iptables
+    2. Вводишь IP → логин → пароль → метку
+    3. Бот сам:
+       • Добавляет сервер в GOST серверы
+       • Устанавливает GOST / iptables (по шаблону)
+       • Добавляет в Авто IP
+
+  Также после обычного добавления сервера (➕)
+  бот предложит настроить перенаправление
+  и добавить в Авто IP.
+
+  При смене IP существующего сервера бот
+  автоматически предложит обновить IP в Авто IP.
+
 🔐 Получить Root
   Для серверов с PEM-ключом (AWS, GCP, Azure):
     1. Отправляешь .pem / .key / .ppk файл в чат
@@ -11490,6 +11560,378 @@ async def gost_help_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
         document=help_bytes,
         filename="gost_help.txt",
         caption="📖 Справка — GOST Серверы")
+
+
+# =====================================================================
+#  WIZARD — setup flow (GOST/iptables + Auto IP) after adding server
+# =====================================================================
+
+def _wizard_auto_ip_add(ip: str, srv: dict) -> str:
+    """Add a GOST server to Auto IP pool. Returns status message."""
+    pool = load_ip_pool()
+    for e in pool:
+        if e["ip"] == ip:
+            return f"IP <code>{ip}</code> уже в пуле Авто IP."
+    pool.append({
+        "ip": ip,
+        "ssh_user": srv["ssh_user"],
+        "ssh_pass": srv["ssh_pass"],
+        "label": srv.get("label", ip),
+    })
+    save_ip_pool(pool)
+    return f"✅ <code>{ip}</code> добавлен в Авто IP."
+
+
+async def wiz_setup_gost(update: Update, context: ContextTypes.DEFAULT_TYPE, ip: str):
+    """Wizard step 2a: choose GOST template to apply on server, then proceed to Auto IP."""
+    q = update.callback_query
+    await q.answer()
+    templates = load_gost_templates()
+    if not templates:
+        # No templates — offer to install GOST only, then Auto IP
+        kb = [
+            [InlineKeyboardButton("⚙️ Установить GOST", callback_data=f'gost_install:{ip}')],
+            [InlineKeyboardButton("➕ Добавить в Авто IP", callback_data=f'wiz_aip_add:{ip}')],
+            [InlineKeyboardButton("⏭ Пропустить", callback_data='gost_menu')],
+        ]
+        await safe_edit_text(q, context,
+            f"📋 <b>Нет сохранённых шаблонов GOST.</b>\n\n"
+            f"Можно установить GOST на сервер, а правила настроить позже.\n"
+            f"Или сразу добавить в Авто IP.",
+            parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+        return
+    kb = []
+    for i, t in enumerate(templates):
+        name = t.get("name", f"Шаблон {i+1}")
+        n = len(t.get("rules", []))
+        kb.append([InlineKeyboardButton(f"📤 {name} ({n})", callback_data=f'wiz_gtpl:{i}:{ip}')])
+    kb.append([InlineKeyboardButton("⏭ Пропустить → Авто IP", callback_data=f'wiz_aip_ask:{ip}')])
+    kb.append([InlineKeyboardButton("⏭ Пропустить всё", callback_data='gost_menu')])
+    await safe_edit_text(q, context,
+        f"🌐 <b>Настройка GOST на {ip}</b>\n\n"
+        "Выберите шаблон для применения:\n"
+        "(установит GOST + настроит правила)",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def wiz_gtpl_apply(update: Update, context: ContextTypes.DEFAULT_TYPE, tpl_idx: int, ip: str):
+    """Wizard: apply GOST template on server, then ask about Auto IP."""
+    q = update.callback_query
+    await q.answer()
+    templates = load_gost_templates()
+    if tpl_idx < 0 or tpl_idx >= len(templates):
+        await safe_edit_text(q, context, "❌ Шаблон не найден.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')]]))
+        return
+    tpl = templates[tpl_idx]
+    rules = tpl.get("rules", [])
+    if not rules:
+        await safe_edit_text(q, context, "❌ Шаблон пуст.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')]]))
+        return
+    servers = load_gost_servers()
+    srv = servers.get(ip)
+    if not srv:
+        await safe_edit_text(q, context, "❌ Сервер не найден.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')]]))
+        return
+
+    await safe_edit_text(q, context,
+        f"⏳ Устанавливаю GOST + применяю <b>{escape(tpl.get('name', ''))}</b> на <code>{ip}</code>...",
+        parse_mode="HTML")
+
+    # Step 1: Install GOST binary
+    install_script = (
+        "#!/bin/bash\n"
+        "apt-get update -qq && apt-get install -y -qq wget curl jq tar gzip > /dev/null 2>&1\n"
+        f"VER=$(curl -s 'https://api.github.com/repos/{GOST_REPO}/releases/latest' | jq -r '.tag_name' | sed 's/^v//')\n"
+        "ARCH=$(dpkg --print-architecture 2>/dev/null || echo amd64)\n"
+        '[ "$ARCH" = "arm64" ] && ARCH="armv8"\n'
+        '[ "$ARCH" = "armhf" ] && ARCH="armv7"\n'
+        "cd /tmp\n"
+        f"wget -q \"https://github.com/{GOST_REPO}/releases/download/v${{VER}}/gost_${{VER}}_linux_${{ARCH}}.tar.gz\" -O gost.tar.gz\n"
+        "tar -xzf gost.tar.gz && chmod +x gost && mv gost /usr/local/bin/gost\n"
+        "rm -f gost.tar.gz\n"
+        'echo "GOST_OK:$VER"\n'
+    )
+    b64 = base64.b64encode(install_script.encode()).decode()
+    start_cmd = (
+        f"echo '{b64}' | base64 -d > /tmp/gost_install.sh && "
+        "chmod +x /tmp/gost_install.sh && "
+        "bash /tmp/gost_install.sh"
+    )
+    ok, out = await asyncio.to_thread(
+        ssh_exec, ip, 22, srv["ssh_user"], srv["ssh_pass"], start_cmd, 120)
+    if not ok or "GOST_OK:" not in out:
+        # Try anyway — maybe GOST already installed
+        ok_check, out_check = ssh_exec(ip, 22, srv["ssh_user"], srv["ssh_pass"],
+                                        f"{GOST_BIN} -V 2>/dev/null && echo GOST_EXISTS || echo NO_GOST")
+        if "GOST_EXISTS" not in out_check:
+            kb = [[InlineKeyboardButton("◀️ GOST меню", callback_data='gost_menu')]]
+            await q.message.edit_text(
+                f"❌ Не удалось установить GOST на {ip}:\n<pre>{escape(out[:1000])}</pre>",
+                parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+            return
+
+    # Step 2: Apply template rules
+    srv["rules"] = list(rules)
+    save_gost_servers(servers)
+    gost_ls = " ".join(
+        f"-L={r['proto']}://:{r['local_port']}/{r['remote_ip']}:{r['remote_port']}"
+        for r in rules)
+    service_content = (
+        "[Unit]\\n"
+        "Description=GO Simple Tunnel\\n"
+        "After=network.target\\n"
+        "Wants=network.target\\n"
+        "\\n"
+        "[Service]\\n"
+        "Type=simple\\n"
+        f"ExecStart={GOST_BIN} {gost_ls}\\n"
+        "Restart=on-failure\\n"
+        "\\n"
+        "[Install]\\n"
+        "WantedBy=multi-user.target"
+    )
+    cmd = (
+        f"echo -e '{service_content}' > {GOST_SERVICE_PATH} && "
+        "systemctl daemon-reload && systemctl enable gost && systemctl restart gost && echo GOST_CONF_OK"
+    )
+    ok2, out2 = ssh_exec(ip, 22, srv["ssh_user"], srv["ssh_pass"], cmd)
+
+    r_disp = "\n".join(
+        f"  {r['proto']}://:{r['local_port']} → {r['remote_ip']}:{r['remote_port']}"
+        for r in rules)
+    if ok2 and "GOST_CONF_OK" in out2:
+        status = f"✅ GOST установлен + шаблон <b>{escape(tpl.get('name', ''))}</b> применён\n\n<code>{r_disp}</code>"
+    else:
+        status = f"⚠️ GOST установлен, но ошибка при применении шаблона:\n<pre>{escape(out2[:500])}</pre>"
+
+    # Ask about Auto IP
+    kb = [
+        [InlineKeyboardButton("➕ Добавить в Авто IP", callback_data=f'wiz_aip_add:{ip}')],
+        [InlineKeyboardButton("✅ Готово", callback_data='gost_menu')],
+    ]
+    await q.message.edit_text(
+        f"{status}\n\n🔄 <b>Добавить сервер в Авто IP?</b>",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def wiz_setup_iptables(update: Update, context: ContextTypes.DEFAULT_TYPE, ip: str):
+    """Wizard step 2b: redirect to PPTP forward install, then Auto IP."""
+    q = update.callback_query
+    await q.answer()
+    servers = load_gost_servers()
+    if ip not in servers:
+        await safe_edit_text(q, context, "Сервер не найден.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')]]))
+        return
+    # Store wizard context — after iptables setup, ask about Auto IP
+    context.user_data['wiz_after_ipt'] = ip
+    # Start PPTP forward install flow
+    context.user_data['await_pptp_fwd_backend'] = {'ip': ip, 'action': 'install', 'step': 'pptp', 'ovpn_rules': []}
+    await safe_edit_text(q, context,
+        f"🔀 <b>Настройка iptables на {ip}</b>\n\n"
+        "Введите IP адрес <b>PPTP бэкенда</b> (сервер с pptpd):",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("❌ Отмена", callback_data='gost_menu')]]))
+
+
+async def wiz_aip_ask(update: Update, context: ContextTypes.DEFAULT_TYPE, ip: str):
+    """Wizard: ask if user wants to add server to Auto IP."""
+    q = update.callback_query
+    await q.answer()
+    pool = load_ip_pool()
+    already = any(e["ip"] == ip for e in pool)
+    if already:
+        kb = [[InlineKeyboardButton("✅ Уже в пуле", callback_data='gost_menu')]]
+        await safe_edit_text(q, context,
+            f"IP <code>{ip}</code> уже в пуле Авто IP.",
+            parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+        return
+    kb = [
+        [InlineKeyboardButton("➕ Да, добавить", callback_data=f'wiz_aip_add:{ip}')],
+        [InlineKeyboardButton("⏭ Нет", callback_data='gost_menu')],
+    ]
+    await safe_edit_text(q, context,
+        f"🔄 <b>Добавить <code>{ip}</code> в Авто IP?</b>",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def wiz_aip_add(update: Update, context: ContextTypes.DEFAULT_TYPE, ip: str):
+    """Wizard: add server to Auto IP using GOST server credentials."""
+    q = update.callback_query
+    await q.answer()
+    servers = load_gost_servers()
+    srv = servers.get(ip)
+    if not srv:
+        await safe_edit_text(q, context, "Сервер не найден в GOST.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')]]))
+        return
+    msg = _wizard_auto_ip_add(ip, srv)
+    kb = [[InlineKeyboardButton("🌐 GOST меню", callback_data='gost_menu'),
+           InlineKeyboardButton("🔄 Авто IP", callback_data='aip_menu')]]
+    await safe_edit_text(q, context, msg, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def wiz_aip_replace(update: Update, context: ContextTypes.DEFAULT_TYPE, old_ip: str, new_ip: str):
+    """Wizard: replace old IP with new IP in Auto IP pool."""
+    q = update.callback_query
+    await q.answer()
+    pool = load_ip_pool()
+    found = False
+    for entry in pool:
+        if entry["ip"] == old_ip:
+            entry["ip"] = new_ip
+            # Also update credentials from GOST servers if available
+            servers = load_gost_servers()
+            srv = servers.get(new_ip)
+            if srv:
+                entry["ssh_user"] = srv["ssh_user"]
+                entry["ssh_pass"] = srv["ssh_pass"]
+                entry["label"] = srv.get("label", entry.get("label", ""))
+            found = True
+            break
+    if found:
+        save_ip_pool(pool)
+        # Update current IP files if the replaced IP was active
+        current = rr_read_file(RR_IP_FILE, "").strip()
+        if current == old_ip:
+            rr_write_file(RR_IP_FILE, new_ip)
+            rr_write_file(RR_PPTP_IP_FILE, new_ip)
+        msg = f"✅ Авто IP обновлён:\n<code>{old_ip}</code> → <code>{new_ip}</code>"
+    else:
+        msg = f"IP <code>{old_ip}</code> не найден в пуле Авто IP."
+    kb = [[InlineKeyboardButton("🌐 GOST меню", callback_data='gost_menu'),
+           InlineKeyboardButton("🔄 Авто IP", callback_data='aip_menu')]]
+    await safe_edit_text(q, context, msg, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+# --- "Полная настройка" (Full Setup) flow ---
+
+async def wiz_full_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Full setup wizard: GOST or iptables? → enter server details → install + template + Auto IP."""
+    q = update.callback_query
+    await q.answer()
+    kb = [
+        [InlineKeyboardButton("🌐 GOST", callback_data='wiz_full_type:gost')],
+        [InlineKeyboardButton("🔀 iptables (PPTP форвард)", callback_data='wiz_full_type:ipt')],
+        [InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')],
+    ]
+    await safe_edit_text(q, context,
+        "🚀 <b>Полная настройка сервера</b>\n\n"
+        "Этот мастер выполнит все шаги за один раз:\n"
+        "1️⃣ Добавить сервер (IP/логин/пароль)\n"
+        "2️⃣ Установить + настроить перенаправление\n"
+        "3️⃣ Добавить в Авто IP\n\n"
+        "Выберите тип перенаправления:",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def wiz_full_type(update: Update, context: ContextTypes.DEFAULT_TYPE, fwd_type: str):
+    """Full setup: chose type, now ask for IP."""
+    q = update.callback_query
+    await q.answer()
+    _clear_awaits(context, keep='await_wiz_full')
+    context.user_data['await_wiz_full'] = 'ip'
+    context.user_data['wiz_full_type'] = fwd_type  # 'gost' or 'ipt'
+    type_label = "GOST" if fwd_type == "gost" else "iptables"
+    await safe_edit_text(q, context,
+        f"🚀 <b>Полная настройка — {type_label}</b>\n\n"
+        "Введите IP адрес нового сервера:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("❌ Отмена", callback_data='gost_menu')]]))
+
+
+async def wiz_full_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Multi-step handler for full setup wizard: ip → user → pass → label → auto-execute."""
+    step = context.user_data.get('await_wiz_full')
+    if not step:
+        return
+    text = update.message.text.strip()
+
+    if step == 'ip':
+        parts = text.split(".")
+        valid = (len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts))
+        if not valid:
+            await update.message.reply_text("Неверный IP. Повторите.")
+            return
+        servers = load_gost_servers()
+        if text in servers:
+            context.user_data.pop('await_wiz_full', None)
+            context.user_data.pop('wiz_full_type', None)
+            await update.message.reply_text(
+                f"Сервер <code>{text}</code> уже добавлен.\n"
+                "Используйте редактирование из списка серверов.",
+                parse_mode="HTML")
+            return
+        context.user_data['wiz_full_ip'] = text
+        context.user_data['await_wiz_full'] = 'user'
+        await update.message.reply_text("Введите SSH логин (root):")
+
+    elif step == 'user':
+        context.user_data['wiz_full_user'] = text
+        context.user_data['await_wiz_full'] = 'pass'
+        await update.message.reply_text("Введите SSH пароль:")
+
+    elif step == 'pass':
+        context.user_data['wiz_full_pass'] = text
+        context.user_data['await_wiz_full'] = 'label'
+        await update.message.reply_text("Введите название (метку):")
+
+    elif step == 'label':
+        ip = context.user_data.pop('wiz_full_ip')
+        user = context.user_data.pop('wiz_full_user')
+        pwd = context.user_data.pop('wiz_full_pass')
+        fwd_type = context.user_data.pop('wiz_full_type', 'gost')
+        context.user_data.pop('await_wiz_full', None)
+
+        # Step 1: Save to GOST servers
+        servers = load_gost_servers()
+        servers[ip] = {"ssh_user": user, "ssh_pass": pwd, "label": text, "rules": []}
+        save_gost_servers(servers)
+
+        if fwd_type == 'gost':
+            # Step 2: Pick GOST template
+            templates = load_gost_templates()
+            if not templates:
+                # No templates — just add server + install GOST + Auto IP
+                kb = [
+                    [InlineKeyboardButton("⚙️ Установить GOST", callback_data=f'gost_install:{ip}')],
+                    [InlineKeyboardButton("➕ В Авто IP", callback_data=f'wiz_aip_add:{ip}')],
+                    [InlineKeyboardButton("✅ Готово", callback_data='gost_menu')],
+                ]
+                await update.message.reply_text(
+                    f"✅ Сервер <code>{ip}</code> ({text}) добавлен.\n\n"
+                    "📋 Нет шаблонов GOST. Установите GOST и настройте правила вручную.",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(kb))
+            else:
+                kb = []
+                for i, t in enumerate(templates):
+                    name = t.get("name", f"Шаблон {i+1}")
+                    n = len(t.get("rules", []))
+                    kb.append([InlineKeyboardButton(
+                        f"📤 {name} ({n})", callback_data=f'wiz_gtpl:{i}:{ip}')])
+                kb.append([InlineKeyboardButton("✅ Готово", callback_data='gost_menu')])
+                await update.message.reply_text(
+                    f"✅ Сервер <code>{ip}</code> ({text}) добавлен.\n\n"
+                    "🌐 <b>Выберите шаблон GOST:</b>\n"
+                    "(установит GOST + применит правила + добавит в Авто IP)",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(kb))
+        else:
+            # iptables flow — start PPTP forward install
+            context.user_data['wiz_after_ipt'] = ip
+            context.user_data['await_pptp_fwd_backend'] = {
+                'ip': ip, 'action': 'install', 'step': 'pptp', 'ovpn_rules': []}
+            await update.message.reply_text(
+                f"✅ Сервер <code>{ip}</code> ({text}) добавлен.\n\n"
+                "🔀 <b>Настройка iptables</b>\n"
+                "Введите IP адрес <b>PPTP бэкенда</b>:",
+                parse_mode="HTML")
 
 
 # =====================================================================
@@ -12211,8 +12653,21 @@ async def pptp_fwd_apply_rules(update: Update, context: ContextTypes.DEFAULT_TYP
                       f"PPTP (TCP:1723+GRE) → <code>{backend}</code>\n"
                       + ("\n".join(f"DNAT {r['proto'].upper()} :{r['port']} → <code>{r['ip']}:{r['port']}</code>"
                          for r in ovpn_rules) if ovpn_rules else ""))
+            # Check if wizard context asks for Auto IP step
+            wiz_ip = context.user_data.pop('wiz_after_ipt', None)
+            if wiz_ip == front_ip:
+                pool = load_ip_pool()
+                already = any(e["ip"] == front_ip for e in pool)
+                if not already:
+                    result += "\n\n🔄 <b>Добавить в Авто IP?</b>"
+                    await safe_edit_text(q, context, result, parse_mode="HTML",
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("➕ Добавить в Авто IP", callback_data=f'wiz_aip_add:{front_ip}')],
+                            [InlineKeyboardButton("✅ Готово", callback_data='gost_menu')]]))
+                    return
         else:
             result = f"❌ Ошибка:\n<pre>{escape(out[:2000])}</pre>"
+            context.user_data.pop('wiz_after_ipt', None)
         await safe_edit_text(q, context, result, parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("◀️ Назад", callback_data='pptp_fwd_menu')]]))
