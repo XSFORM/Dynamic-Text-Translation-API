@@ -176,9 +176,12 @@ AUTO_IP_POOL_FILE = "/root/monitor_bot/ip_pool.json"
 AUTO_IP_STATE_FILE = "/root/monitor_bot/auto_ip_state.json"
 DEPLOY_FRONT_IP_FILE = "/root/monitor_bot/deploy_front_ip.txt"
 AUTO_IP_TM_CHECK = "217.174.235.161"       # Turkmentelecom probe IP
+AUTO_IP_NET_CONTROL = "1.1.1.1"            # neutral IP to check if front has internet
 AUTO_IP_FAIL_THRESHOLD = 3                  # consecutive ping fails before switch
+AUTO_IP_DOWN_THRESHOLD = 5                  # consecutive front_down before notification
 AUTO_IP_CHECK_INTERVAL = 60                 # seconds between checks
 auto_ip_fail_count = 0
+auto_ip_down_count = 0
 
 def _load_auto_ip_state() -> dict:
     """Returns {"ovpn": bool, "pptp": bool}."""
@@ -224,6 +227,28 @@ def ping_via_ssh(host: str, user: str, password: str, target: str) -> bool:
     if ok and ("1 received" in out or "bytes from" in out):
         return True
     return False
+
+
+def check_front_status(host: str, user: str, password: str) -> tuple:
+    """Check front server with dual ping: TM probe + neutral IP.
+    Returns: (status, detail)
+      'ok'         — TM probe reachable → IP NOT blocked
+      'blocked'    — front has internet but TM probe unreachable → likely blocked
+      'front_down' — SSH failed or front has no internet at all → not a block
+    """
+    cmd = (
+        f"ping -c 5 -W 2 {AUTO_IP_TM_CHECK} >/dev/null 2>&1 && echo PROBE_OK || echo PROBE_FAIL; "
+        f"ping -c 3 -W 2 {AUTO_IP_NET_CONTROL} >/dev/null 2>&1 && echo NET_OK || echo NET_FAIL"
+    )
+    ok, out = ssh_exec(host, 22, user, password, cmd)
+    if not ok:
+        return "front_down", out
+    if "PROBE_OK" in out:
+        return "ok", out
+    if "NET_OK" not in out:
+        return "front_down", out
+    return "blocked", out
+
 
 # =====================================================================
 #  SUBNET POOL — leased /24 management
@@ -9677,7 +9702,7 @@ async def cmd_backup_restore_apply(update: Update, context: ContextTypes.DEFAULT
 async def auto_ip_monitor(app):
     """Background task: every 60s, ping TM probe from current GOST server.
     After 5 consecutive failures — switch to next available IP from pool."""
-    global auto_ip_enabled, auto_ip_fail_count, auto_ip_state
+    global auto_ip_enabled, auto_ip_fail_count, auto_ip_down_count, auto_ip_state
     while True:
         try:
             await asyncio.sleep(AUTO_IP_CHECK_INTERVAL)
@@ -9707,26 +9732,47 @@ async def auto_ip_monitor(app):
 
             print(f"[auto_ip] checking {current_ip} (fail_count={auto_ip_fail_count})")
 
-            # Ping TM probe from current GOST server
-            ok = await asyncio.to_thread(
-                ping_via_ssh, current_entry["ip"],
-                current_entry["ssh_user"], current_entry["ssh_pass"],
-                AUTO_IP_TM_CHECK
-            )
+            # Dual check: TM probe + neutral IP (1.1.1.1)
+            try:
+                status, _detail = await asyncio.to_thread(
+                    check_front_status, current_entry["ip"],
+                    current_entry["ssh_user"], current_entry["ssh_pass"]
+                )
+            except Exception as e:
+                print(f"[auto_ip] SSH error for {current_ip}: {e}")
+                status = "front_down"
 
-            if ok:
+            if status == "ok":
                 if auto_ip_fail_count > 0:
-                    print(f"[auto_ip] Ping OK, reset fail count (was {auto_ip_fail_count})")
+                    print(f"[auto_ip] Probe OK, reset fail count (was {auto_ip_fail_count})")
                 auto_ip_fail_count = 0
+                auto_ip_down_count = 0
                 continue
 
-            auto_ip_fail_count += 1
-            print(f"[auto_ip] Ping FAIL #{auto_ip_fail_count}/{AUTO_IP_FAIL_THRESHOLD} for {current_ip}")
+            switch_reason = None  # will be set if we need to switch
 
-            if auto_ip_fail_count < AUTO_IP_FAIL_THRESHOLD:
+            if status == "front_down":
+                auto_ip_down_count += 1
+                print(f"[auto_ip] {current_ip} — front down #{auto_ip_down_count}/{AUTO_IP_DOWN_THRESHOLD}")
+                if auto_ip_down_count >= AUTO_IP_DOWN_THRESHOLD:
+                    auto_ip_down_count = 0
+                    switch_reason = "hosting"
+                else:
+                    continue
+
+            elif status == "blocked":
+                auto_ip_fail_count += 1
+                auto_ip_down_count = 0
+                print(f"[auto_ip] BLOCKED #{auto_ip_fail_count}/{AUTO_IP_FAIL_THRESHOLD} for {current_ip}")
+                if auto_ip_fail_count >= AUTO_IP_FAIL_THRESHOLD:
+                    switch_reason = "blocked"
+                else:
+                    continue
+
+            if not switch_reason:
                 continue
 
-            # --- IP blocked, find replacement (next in order, wrap around) ---
+            # --- Need to switch IP, find replacement ---
             replaced = False
             cur_idx = next((i for i, e in enumerate(pool) if e["ip"] == current_ip), -1)
             ordered = pool[cur_idx + 1:] + pool[:cur_idx]  # start after current, wrap
@@ -9747,21 +9793,25 @@ async def auto_ip_monitor(app):
                     if auto_ip_state.get("pptp"):
                         rr_write_file(RR_PPTP_IP_FILE, new_ip + "\n")
                         changed.append("PPTP")
-                        # Update current_ip for all PPTP routers
                         _rt = load_routers()
                         for _cn, _rv in _rt.items():
                             if _rv.get("vpn_type") == "pptp":
                                 _rv["current_ip"] = new_ip
                         save_routers(_rt)
-                    rr_append_history(f"AUTO: {old_ip} -> {new_ip} ({'+'.join(changed)}, blocked)")
+                    rr_append_history(f"AUTO: {old_ip} -> {new_ip} ({'+'.join(changed)}, {switch_reason})")
                     auto_ip_fail_count = 0
+                    auto_ip_down_count = 0
                     replaced = True
                     label = entry.get("label", new_ip)
+                    if switch_reason == "blocked":
+                        reason_text = "🚫 TM заблокировал"
+                    else:
+                        reason_text = "⚠️ Хостинг недоступен"
                     try:
                         await app.bot.send_message(
                             ADMIN_ID,
-                            f"🔄 <b>Авто-замена IP</b>\n"
-                            f"❌ Заблокирован: <code>{old_ip}</code>\n"
+                            f"🔄 <b>Авто-замена IP</b>\n\n"
+                            f"{reason_text}: <code>{old_ip}</code>\n"
                             f"✅ Новый IP: <code>{new_ip}</code> ({label})\n"
                             f"Обновлено: {', '.join(changed)}\n"
                             f"Роутеры подхватят через RR.",
@@ -9769,15 +9819,16 @@ async def auto_ip_monitor(app):
                         )
                     except Exception:
                         pass
-                    print(f"[auto_ip] Switched {old_ip} -> {new_ip}")
+                    print(f"[auto_ip] Switched {old_ip} -> {new_ip} (reason={switch_reason})")
                     break
 
             if not replaced:
-                auto_ip_fail_count = 0  # reset to avoid spam
+                auto_ip_fail_count = 0
+                auto_ip_down_count = 0
                 try:
                     await app.bot.send_message(
                         ADMIN_ID,
-                        "🚨 <b>ВСЕ IP ИЗ ПУЛА ЗАБЛОКИРОВАНЫ!</b>\n"
+                        "🚨 <b>ВСЕ IP ИЗ ПУЛА НЕДОСТУПНЫ!</b>\n"
                         "Ни один запасной IP не прошёл проверку.",
                         parse_mode="HTML"
                     )
