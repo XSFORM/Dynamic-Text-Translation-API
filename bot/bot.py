@@ -6006,7 +6006,8 @@ async def _reply_kb_autoip(update: Update, context: ContextTypes.DEFAULT_TYPE):
          InlineKeyboardButton("\U0001f5d1 Удалить IP", callback_data='aip_remove')],
         [InlineKeyboardButton("↕️ Порядок", callback_data='aip_reorder'),
          InlineKeyboardButton("🔄 Заменить IP", callback_data='aip_replace')],
-        [InlineKeyboardButton("📡 Пинг", callback_data='aip_ping')],
+        [InlineKeyboardButton("📡 Пинг", callback_data='aip_ping'),
+         InlineKeyboardButton("🔎 Сверить", callback_data='aip_compare')],
         [InlineKeyboardButton("\U0001f3e0 Меню", callback_data='home')],
     ]
     await update.message.reply_text("\n".join(lines),
@@ -7331,6 +7332,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await auto_ip_reorder_menu(update, context)
     elif data == 'aip_ping':
         await auto_ip_ping_all(update, context)
+    elif data == 'aip_compare':
+        await auto_ip_compare(update, context)
     elif data == 'aip_replace':
         await auto_ip_replace_menu(update, context)
     elif data.startswith('aip_rep:'):
@@ -9994,11 +9997,69 @@ async def auto_ip_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
          InlineKeyboardButton("\U0001f5d1 Удалить IP", callback_data='aip_remove')],
         [InlineKeyboardButton("↕️ Порядок", callback_data='aip_reorder'),
          InlineKeyboardButton("🔄 Заменить IP", callback_data='aip_replace')],
-        [InlineKeyboardButton("📡 Пинг", callback_data='aip_ping')],
+        [InlineKeyboardButton("📡 Пинг", callback_data='aip_ping'),
+         InlineKeyboardButton("🔎 Сверить", callback_data='aip_compare')],
         [InlineKeyboardButton("\U0001f3e0 Меню", callback_data='home')],
     ]
     await safe_edit_text(q, context, "\n".join(lines), parse_mode="HTML",
                          reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def auto_ip_compare(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Compare Auto IP pool with GOST servers — show mismatches."""
+    q = update.callback_query
+    await q.answer()
+    pool = load_ip_pool()
+    servers = load_gost_servers()
+
+    pool_ips = {e["ip"] for e in pool}
+    gost_ips = set(servers.keys())
+
+    only_pool = pool_ips - gost_ips
+    only_gost = gost_ips - pool_ips
+    common = pool_ips & gost_ips
+
+    lines = ["🔎 <b>Сверка: Авто IP ↔ GOST серверы</b>\n"]
+
+    if not only_pool and not only_gost:
+        lines.append("✅ Всё совпадает — все IP есть в обоих списках.")
+    else:
+        if only_pool:
+            lines.append("⚠️ <b>Есть в Авто IP, нет в GOST:</b>")
+            for ip in sorted(only_pool):
+                entry = next((e for e in pool if e["ip"] == ip), {})
+                label = entry.get("label", "")
+                lines.append(f"  • <code>{ip}</code> ({label})")
+            lines.append("")
+
+        if only_gost:
+            lines.append("⚠️ <b>Есть в GOST, нет в Авто IP:</b>")
+            for ip in sorted(only_gost):
+                label = servers[ip].get("label", "")
+                lines.append(f"  • <code>{ip}</code> ({label})")
+            lines.append("")
+
+    # Check credential mismatches in common IPs
+    cred_diff = []
+    for ip in sorted(common):
+        entry = next((e for e in pool if e["ip"] == ip), {})
+        srv = servers[ip]
+        if (entry.get("ssh_user", "") != srv.get("ssh_user", "") or
+                entry.get("ssh_pass", "") != srv.get("ssh_pass", "")):
+            label = srv.get("label", entry.get("label", ""))
+            cred_diff.append(f"  • <code>{ip}</code> ({label})")
+
+    if cred_diff:
+        lines.append("🔑 <b>Разные логин/пароль:</b>")
+        lines.extend(cred_diff)
+        lines.append("")
+
+    lines.append(f"\nАвто IP: {len(pool_ips)} шт.  |  GOST: {len(gost_ips)} шт.")
+
+    kb = [[InlineKeyboardButton("◀️ Назад", callback_data='aip_menu')]]
+    await safe_edit_text(q, context, "\n".join(lines), parse_mode="HTML",
+                         reply_markup=InlineKeyboardMarkup(kb))
+
 
 async def auto_ip_replace_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show list of IPs to choose which one to replace."""
