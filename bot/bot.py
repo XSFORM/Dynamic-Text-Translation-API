@@ -121,8 +121,11 @@ RR_PROTOCOL_FILE = "/var/www/html/router/protocol.txt"
 RR_PPTP_IP_FILE = "/var/www/html/current_pptp_ip.txt"
 RR_IP_FILE_AGTS = "/var/www/html/current_vpn_ip_agts.txt"
 RR_IP_FILE_TELEKOM = "/var/www/html/current_vpn_ip_telekom.txt"
+RR_PPTP_IP_FILE_AGTS = "/var/www/html/current_pptp_ip_agts.txt"
+RR_PPTP_IP_FILE_TELEKOM = "/var/www/html/current_pptp_ip_telekom.txt"
 ISP_NAMES = {"agts": "АГТС", "telekom": "Телеком", "all": "Все"}
 ISP_LIST = ["agts", "telekom"]
+ISP_PPTP_FILES = {"agts": RR_PPTP_IP_FILE_AGTS, "telekom": RR_PPTP_IP_FILE_TELEKOM}
 RR_EMERGENCY_OEC_FILE = "/var/www/html/router/emergency_oec.txt"
 RR_EMERGENCY_FLAG_FILE = "/var/www/html/router/emergency.flag"
 RR_PPTP_EMERGENCY_FILE = "/var/www/html/router/pptp_emergency.txt"
@@ -7705,11 +7708,14 @@ async def _do_ssh_deploy_multi(q_or_msg, context, targets: list, front_ip: str):
             continue
         # Determine ISP-specific IP file for this router
         isp_tag = r.get("isp", "")
-        isp_ip_files = {"agts": "current_vpn_ip_agts.txt", "telekom": "current_vpn_ip_telekom.txt"}
+        isp_vpn_files = {"agts": "current_vpn_ip_agts.txt", "telekom": "current_vpn_ip_telekom.txt"}
+        isp_pptp_files = {"agts": "current_pptp_ip_agts.txt", "telekom": "current_pptp_ip_telekom.txt"}
         isp_sed = ""
-        if isp_tag in isp_ip_files:
-            isp_file = isp_ip_files[isp_tag]
-            isp_sed = f"sed -i 's|current_vpn_ip\\.txt|{isp_file}|g' /etc/storage/update_script.sh ; "
+        if isp_tag in isp_vpn_files:
+            isp_sed = (
+                f"sed -i 's|current_vpn_ip\\.txt|{isp_vpn_files[isp_tag]}|g' /etc/storage/update_script.sh ; "
+                f"sed -i 's|current_pptp_ip\\.txt|{isp_pptp_files[isp_tag]}|g' /etc/storage/update_script.sh ; "
+            )
         deploy_cmd = (
             f'cat /dev/null > /etc/storage/started_script.sh ; '
             f'wget -q -O /tmp/us.sh http://{front_ip}/router/update_script.sh && '
@@ -8332,11 +8338,14 @@ async def _do_ssh_deploy(msg_or_update, context, cn: str, front_ip: str, edit_ms
             parse_mode="HTML")
     # ISP-specific SOURCE_URL substitution
     isp_tag = r.get("isp", "")
-    isp_ip_files = {"agts": "current_vpn_ip_agts.txt", "telekom": "current_vpn_ip_telekom.txt"}
+    isp_vpn_files = {"agts": "current_vpn_ip_agts.txt", "telekom": "current_vpn_ip_telekom.txt"}
+    isp_pptp_files = {"agts": "current_pptp_ip_agts.txt", "telekom": "current_pptp_ip_telekom.txt"}
     isp_sed = ""
-    if isp_tag in isp_ip_files:
-        isp_file = isp_ip_files[isp_tag]
-        isp_sed = f"sed -i 's|current_vpn_ip\\.txt|{isp_file}|g' /etc/storage/update_script.sh ; "
+    if isp_tag in isp_vpn_files:
+        isp_sed = (
+            f"sed -i 's|current_vpn_ip\\.txt|{isp_vpn_files[isp_tag]}|g' /etc/storage/update_script.sh ; "
+            f"sed -i 's|current_pptp_ip\\.txt|{isp_pptp_files[isp_tag]}|g' /etc/storage/update_script.sh ; "
+        )
     # Build the full deploy command (heal first, then deploy)
     deploy_cmd = (
         f'cat /dev/null > /etc/storage/started_script.sh ; '
@@ -10009,8 +10018,12 @@ async def auto_ip_monitor(app):
                         old_ip = current_ip
                         _set_current_isp_ip(isp, new_ip)
                         auto_ip_state[f"current_{isp}"] = new_ip
+                        # Also write ISP-specific PPTP file
+                        pptp_file = ISP_PPTP_FILES.get(isp)
+                        if pptp_file:
+                            rr_write_file(pptp_file, new_ip + "\n")
                         _save_auto_ip_state(auto_ip_state)
-                        # ISP mode: only update ISP-specific file, NOT general
+                        # ISP mode: only update ISP-specific files, NOT general
                         rr_append_history(f"AUTO-{isp.upper()}: {old_ip} -> {new_ip} ({switch_reason})")
                         auto_ip_fail_count[isp] = 0
                         auto_ip_down_count[isp] = 0
@@ -10427,10 +10440,17 @@ async def auto_ip_toggle_isp(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if auto_ip_state["isp_mode"]:
         # Initialize ISP files from current general IP if empty
         current_ip = rr_read_file(RR_IP_FILE, "").strip()
+        pptp_ip = rr_read_file(RR_PPTP_IP_FILE, "").strip()
         for isp in ISP_LIST:
             if not _get_current_isp_ip(isp) and current_ip:
                 _set_current_isp_ip(isp, current_ip)
                 auto_ip_state[f"current_{isp}"] = current_ip
+            # Initialize PPTP ISP files
+            pptp_file = ISP_PPTP_FILES.get(isp)
+            if pptp_file and pptp_ip:
+                existing = rr_read_file(pptp_file, "").strip()
+                if not existing:
+                    rr_write_file(pptp_file, pptp_ip + "\n")
         _save_auto_ip_state(auto_ip_state)
     await auto_ip_menu(update, context)
 
@@ -10471,12 +10491,16 @@ async def auto_ip_isp_set(update: Update, context: ContextTypes.DEFAULT_TYPE, is
     old_ip = _get_current_isp_ip(isp)
     _set_current_isp_ip(isp, ip)
     auto_ip_state[f"current_{isp}"] = ip
+    # Also write ISP-specific PPTP file
+    pptp_file = ISP_PPTP_FILES.get(isp)
+    if pptp_file:
+        rr_write_file(pptp_file, ip + "\n")
     _save_auto_ip_state(auto_ip_state)
     rr_append_history(f"ISP-{isp.upper()}: {old_ip} -> {ip}")
     await safe_edit_text(q, context,
         f"✅ <b>{ISP_NAMES.get(isp, isp)}</b> IP сменён:\n"
         f"<code>{old_ip}</code> → <code>{ip}</code>\n"
-        f"<i>Общий IP не изменён. Используйте «Сменить IP (все)» для общей замены.</i>",
+        f"<i>Обновлено: VPN + PPTP ({ISP_NAMES.get(isp, isp)}). Общий IP не изменён.</i>",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(
             [[InlineKeyboardButton("◀️ Авто IP", callback_data='aip_menu')]]))
@@ -10524,10 +10548,13 @@ async def auto_ip_all_set(update: Update, context: ContextTypes.DEFAULT_TYPE, ip
     if auto_ip_state.get("pptp"):
         rr_write_file(RR_PPTP_IP_FILE, ip + "\n")
         changed.append("PPTP")
-    # Update both ISP files
+    # Update both ISP files (VPN + PPTP)
     for isp in ISP_LIST:
         _set_current_isp_ip(isp, ip)
         auto_ip_state[f"current_{isp}"] = ip
+        pptp_file = ISP_PPTP_FILES.get(isp)
+        if pptp_file:
+            rr_write_file(pptp_file, ip + "\n")
     _save_auto_ip_state(auto_ip_state)
     rr_append_history(f"ALL: {old_ip} -> {ip} ({'+'.join(changed)})")
     await safe_edit_text(q, context,
