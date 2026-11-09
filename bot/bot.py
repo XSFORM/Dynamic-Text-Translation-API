@@ -1596,6 +1596,25 @@ def save_gost_servers(data: Dict):
         shutil.copy2(GOST_SERVERS_FILE, bak)
     os.replace(tmp, GOST_SERVERS_FILE)
 
+
+def _gost_rules_label(info: dict) -> str:
+    """Format rules count string for a GOST server entry.
+    Shows 👻 GOST count and/or 📊 iptables count."""
+    gost_n = len(info.get("rules", []))
+    ipt_n = 0
+    if info.get("pptp_backend"):
+        ipt_n += 1  # PPTP forward rule
+    ipt_n += len(info.get("ovpn_rules", []))
+    parts = []
+    if gost_n:
+        parts.append(f"👻 {gost_n}")
+    if ipt_n:
+        parts.append(f"📊 {ipt_n}")
+    if not parts:
+        return "0 правил"
+    return " | ".join(parts)
+
+
 # =====================================================================
 #  NATURAL SORT
 # =====================================================================
@@ -11768,9 +11787,9 @@ async def gost_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     groups = {"agts": [], "telekom": [], "all": []}
     for ip, info in servers.items():
         label = info.get("label", ip)
-        rules_count = len(info.get("rules", []))
+        rlabel = _gost_rules_label(info)
         isp_tag = ip_isp_map.get(ip, "all")
-        line = f"• <code>{ip}</code> — {label} ({rules_count} правил)"
+        line = f"• <code>{ip}</code> — {label} ({rlabel})"
         groups.setdefault(isp_tag, []).append((ip, info, line))
     lines = []
     has_isp = bool(groups.get("agts") or groups.get("telekom"))
@@ -11787,8 +11806,8 @@ async def gost_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         for ip, info in servers.items():
             label = info.get("label", ip)
-            rules_count = len(info.get("rules", []))
-            lines.append(f"• <code>{ip}</code> — {label} ({rules_count} правил)")
+            rlabel = _gost_rules_label(info)
+            lines.append(f"• <code>{ip}</code> — {label} ({rlabel})")
     # Build buttons in same ISP order
     kb = []
     if has_isp:
@@ -11883,12 +11902,12 @@ async def gost_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE, ip
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='gost_list')]]))
         return
     info = servers[ip]
-    rules_count = len(info.get("rules", []))
+    rlabel = _gost_rules_label(info)
     await safe_edit_text(q, context,
         f"✏️ <b>Редактирование {ip}</b>\n"
         f"Метка: {info.get('label', '-')}\n"
         f"Логин: <code>{info['ssh_user']}</code>\n"
-        f"Правил: {rules_count}\n\n"
+        f"Правил: {rlabel}\n\n"
         f"Что изменить?",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([
