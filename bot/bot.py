@@ -6072,7 +6072,7 @@ async def _reply_kb_autoip(update: Update, context: ContextTypes.DEFAULT_TYPE):
          InlineKeyboardButton("🔎 Сверить", callback_data='aip_compare')],
     ]
     if isp_mode:
-        kb.append([InlineKeyboardButton("✏️ Сменить IP (все)", callback_data='aip_switch_all')])
+        kb.append([InlineKeyboardButton("✏️ Сменить IP (общий)", callback_data='aip_switch_all')])
         kb.append([
             InlineKeyboardButton("🏢 Сменить АГТС", callback_data='aip_switch_agts'),
             InlineKeyboardButton("📡 Сменить Телеком", callback_data='aip_switch_telekom'),
@@ -10302,7 +10302,7 @@ async def auto_ip_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
          InlineKeyboardButton("🔎 Сверить", callback_data='aip_compare')],
     ]
     if isp_mode:
-        kb.append([InlineKeyboardButton("✏️ Сменить IP (все)", callback_data='aip_switch_all')])
+        kb.append([InlineKeyboardButton("✏️ Сменить IP (общий)", callback_data='aip_switch_all')])
         kb.append([
             InlineKeyboardButton("🏢 Сменить АГТС", callback_data='aip_switch_agts'),
             InlineKeyboardButton("📡 Сменить Телеком", callback_data='aip_switch_telekom'),
@@ -10517,7 +10517,7 @@ async def auto_ip_isp_set(update: Update, context: ContextTypes.DEFAULT_TYPE, is
 
 
 async def auto_ip_switch_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show picker to switch general IP (all ISPs at once)."""
+    """Show picker to switch general IP (routers without ISP tag only)."""
     q = update.callback_query
     await q.answer()
     pool = load_ip_pool()
@@ -10539,14 +10539,15 @@ async def auto_ip_switch_all(update: Update, context: ContextTypes.DEFAULT_TYPE)
             callback_data=f"aip_all_set:{ip}")])
     kb.append([InlineKeyboardButton("◀️ Назад", callback_data='aip_menu')])
     await safe_edit_text(q, context,
-        f"✏️ <b>Сменить IP (все)</b>\n"
-        f"Текущий общий: <code>{current}</code>\n\n"
-        f"Выбранный IP станет общим + АГТС + Телеком:",
+        f"✏️ <b>Сменить IP (общий)</b>\n"
+        f"Текущий: <code>{current}</code>\n\n"
+        f"Для роутеров <b>без ISP тега</b>.\n"
+        f"АГТС/Телеком не изменятся.",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
 
 async def auto_ip_all_set(update: Update, context: ContextTypes.DEFAULT_TYPE, ip: str):
-    """Set chosen IP as general + both ISP files."""
+    """Set chosen IP as general only (does NOT touch ISP files)."""
     global auto_ip_state
     q = update.callback_query
     await q.answer()
@@ -10558,20 +10559,12 @@ async def auto_ip_all_set(update: Update, context: ContextTypes.DEFAULT_TYPE, ip
     if auto_ip_state.get("pptp"):
         rr_write_file(RR_PPTP_IP_FILE, ip + "\n")
         changed.append("PPTP")
-    # Update both ISP files (VPN + PPTP)
-    for isp in ISP_LIST:
-        _set_current_isp_ip(isp, ip)
-        auto_ip_state[f"current_{isp}"] = ip
-        pptp_file = ISP_PPTP_FILES.get(isp)
-        if pptp_file:
-            rr_write_file(pptp_file, ip + "\n")
     _save_auto_ip_state(auto_ip_state)
-    rr_append_history(f"ALL: {old_ip} -> {ip} ({'+'.join(changed)})")
+    rr_append_history(f"GENERAL: {old_ip} -> {ip} ({'+'.join(changed)})")
     await safe_edit_text(q, context,
         f"✅ <b>Общий IP сменён:</b>\n"
         f"<code>{old_ip}</code> → <code>{ip}</code>\n"
-        f"Обновлено: общий + АГТС + Телеком\n"
-        f"Все роутеры подхватят через RR.",
+        f"<i>Только для роутеров без ISP тега.\nАГТС и Телеком не изменены.</i>",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(
             [[InlineKeyboardButton("◀️ Авто IP", callback_data='aip_menu')]]))
