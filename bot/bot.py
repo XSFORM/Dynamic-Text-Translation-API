@@ -9968,7 +9968,20 @@ async def auto_ip_monitor(app):
                         _set_current_isp_ip(isp, new_ip)
                         auto_ip_state[f"current_{isp}"] = new_ip
                         _save_auto_ip_state(auto_ip_state)
-                        rr_append_history(f"AUTO-{isp.upper()}: {old_ip} -> {new_ip} ({switch_reason})")
+                        # Also update general file so untagged routers get new IP too
+                        changed = []
+                        if auto_ip_state.get("ovpn"):
+                            rr_write_file(RR_IP_FILE, new_ip + "\n")
+                            changed.append("OVPN")
+                        if auto_ip_state.get("pptp"):
+                            rr_write_file(RR_PPTP_IP_FILE, new_ip + "\n")
+                            changed.append("PPTP")
+                            _rt = load_routers()
+                            for _cn, _rv in _rt.items():
+                                if _rv.get("vpn_type") == "pptp":
+                                    _rv["current_ip"] = new_ip
+                            save_routers(_rt)
+                        rr_append_history(f"AUTO-{isp.upper()}: {old_ip} -> {new_ip} ({'+'.join(changed)}, {switch_reason})")
                         auto_ip_fail_count[isp] = 0
                         auto_ip_down_count[isp] = 0
                         label_entry = next((e for e in pool if e["ip"] == new_ip), {})
@@ -9981,6 +9994,7 @@ async def auto_ip_monitor(app):
                                 f"🔄 <b>Авто-замена IP ({isp_name})</b>\n\n"
                                 f"{reason_text}: <code>{old_ip}</code>\n"
                                 f"✅ Новый IP: <code>{new_ip}</code> ({label})\n"
+                                f"Обновлено: {', '.join(changed) or 'ISP файл'}\n"
                                 f"Роутеры {isp_name} подхватят через RR.",
                                 parse_mode="HTML"
                             )
@@ -10427,8 +10441,16 @@ async def auto_ip_isp_set(update: Update, context: ContextTypes.DEFAULT_TYPE, is
     old_ip = _get_current_isp_ip(isp)
     _set_current_isp_ip(isp, ip)
     auto_ip_state[f"current_{isp}"] = ip
+    # Also update general file so untagged routers get new IP
+    changed = []
+    if auto_ip_state.get("ovpn"):
+        rr_write_file(RR_IP_FILE, ip + "\n")
+        changed.append("OVPN")
+    if auto_ip_state.get("pptp"):
+        rr_write_file(RR_PPTP_IP_FILE, ip + "\n")
+        changed.append("PPTP")
     _save_auto_ip_state(auto_ip_state)
-    rr_append_history(f"ISP-{isp.upper()}: {old_ip} -> {ip}")
+    rr_append_history(f"ISP-{isp.upper()}: {old_ip} -> {ip} ({'+'.join(changed)})")
     await safe_edit_text(q, context,
         f"✅ <b>{ISP_NAMES.get(isp, isp)}</b> IP сменён:\n"
         f"<code>{old_ip}</code> → <code>{ip}</code>\n"
