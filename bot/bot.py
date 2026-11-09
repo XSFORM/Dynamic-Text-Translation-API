@@ -544,6 +544,32 @@ def get_online_clients() -> set:
         pass
     return online
 
+
+def get_client_front_ips() -> Dict[str, str]:
+    """Parse status.log routing table → {cn: front_ip} for online OpenVPN clients."""
+    result: Dict[str, str] = {}
+    try:
+        with open(STATUS_LOG, "r") as f:
+            in_routing = False
+            for line in f:
+                line = line.strip()
+                if line.startswith("ROUTING TABLE"):
+                    in_routing = True
+                    continue
+                if line.startswith("GLOBAL STATS"):
+                    break
+                if in_routing and "," in line and not line.startswith("Virtual"):
+                    parts = line.split(",")
+                    if len(parts) >= 3:
+                        cn = parts[1]
+                        real_addr = parts[2]  # "1.2.3.4:53020"
+                        front_ip = real_addr.rsplit(":", 1)[0] if ":" in real_addr else real_addr
+                        result[cn] = front_ip
+    except FileNotFoundError:
+        pass
+    return result
+
+
 # -------- PPTP server & clients helpers --------
 
 def load_pptp_server() -> Dict:
@@ -6997,6 +7023,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await ssh_isp_bulk(update, context, data[len('ssh_isp_bulk:'):])
     elif data.startswith('ssh_isp_apply:'):
         await _ssh_isp_apply(update, context, data[len('ssh_isp_apply:'):])
+    elif data == 'ssh_isp_auto':
+        await ssh_isp_auto_detect(update, context)
+    elif data.startswith('ssh_isp_auto_apply:'):
+        await _ssh_isp_auto_apply(update, context, data[len('ssh_isp_auto_apply:'):])
     # --- CN Watch ---
     elif data == 'cn_watch_menu':
         await cn_watch_menu(update, context)
@@ -8057,6 +8087,7 @@ async def ssh_isp_tag_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb.append([
         InlineKeyboardButton(f"❌ Убрать тег ({count})", callback_data='ssh_isp_bulk:none'),
     ])
+    kb.append([InlineKeyboardButton("🔍 Авто ISP (по фронту)", callback_data='ssh_isp_auto')])
     kb.append([InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')])
     await safe_edit_text(q, context,
         f"🏷 <b>ISP теги</b> — выберите роутеры галочками\n"
@@ -8197,6 +8228,133 @@ async def _ssh_isp_apply(update: Update, context: ContextTypes.DEFAULT_TYPE, mod
         f"{icon} <b>ISP тег → {isp_label}</b>\n"
         f"Применено к <b>{len(applied)}</b> роутерам:\n"
         f"<code>{', '.join(applied)}</code>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("◀️ ISP теги", callback_data='ssh_isp_tag'),
+              InlineKeyboardButton("🏠 Меню", callback_data='ssh_routers')]]))
+
+
+async def ssh_isp_auto_detect(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Auto-detect ISP tags based on which front server each client connects through."""
+    q = update.callback_query
+    await q.answer()
+    # 1. Get CN → front IP from status.log
+    client_fronts = get_client_front_ips()
+    if not client_fronts:
+        await safe_edit_text(q, context,
+            "⚠️ Нет данных о подключениях в status.log.\n"
+            "Авто-определение работает только для онлайн клиентов.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀️ ISP теги", callback_data='ssh_isp_tag')]]))
+        return
+    # 2. Build front IP → ISP map from pool
+    pool = load_ip_pool()
+    front_isp_map = {e["ip"]: e.get("isp", "all") for e in pool}
+    # 3. Match clients
+    routers = load_routers()
+    changes = []  # (cn, old_isp, new_isp)
+    unchanged = []
+    unknown_front = []
+    for cn, front_ip in client_fronts.items():
+        if cn not in routers:
+            continue
+        isp = front_isp_map.get(front_ip)
+        if not isp or isp == "all":
+            unknown_front.append((cn, front_ip))
+            continue
+        old_isp = routers[cn].get("isp", "")
+        if old_isp == isp:
+            unchanged.append(cn)
+        else:
+            changes.append((cn, old_isp, isp))
+    if not changes:
+        parts = [f"🔍 <b>Авто ISP</b>\n\nВсе онлайн роутеры уже имеют правильные теги."]
+        if unchanged:
+            parts.append(f"✅ Совпадают: {len(unchanged)}")
+        if unknown_front:
+            parts.append(f"❓ Фронт без ISP тега: {len(unknown_front)}")
+            for cn, fip in unknown_front[:5]:
+                parts.append(f"  • {cn} → {fip}")
+        await safe_edit_text(q, context, "\n".join(parts),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀️ ISP теги", callback_data='ssh_isp_tag')]]))
+        return
+    # 4. Show proposed changes and ask for confirmation
+    context.user_data['isp_auto_changes'] = changes
+    lines = [f"🔍 <b>Авто ISP</b> — найдено <b>{len(changes)}</b> изменений:\n"]
+    for cn, old_isp, new_isp in changes:
+        old_label = ISP_NAMES.get(old_isp, "—") if old_isp else "—"
+        new_icon = {"agts": "🏢", "telekom": "📡"}.get(new_isp, "")
+        new_label = ISP_NAMES.get(new_isp, new_isp)
+        lines.append(f"• <b>{cn}</b>: {old_label} → {new_icon} {new_label}")
+    if unchanged:
+        lines.append(f"\n✅ Без изменений: {len(unchanged)}")
+    if unknown_front:
+        lines.append(f"❓ Фронт без тега: {len(unknown_front)}")
+    kb = [
+        [InlineKeyboardButton(f"🏷 Только тег ({len(changes)})", callback_data='ssh_isp_auto_apply:tag')],
+        [InlineKeyboardButton(f"🏷 + 📦 Тег + Деплой ({len(changes)})", callback_data='ssh_isp_auto_apply:deploy')],
+        [InlineKeyboardButton("◀️ Отмена", callback_data='ssh_isp_tag')],
+    ]
+    await safe_edit_text(q, context, "\n".join(lines),
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def _ssh_isp_auto_apply(update: Update, context: ContextTypes.DEFAULT_TYPE, mode: str):
+    """Apply auto-detected ISP tags. mode='tag' or 'deploy'."""
+    q = update.callback_query
+    await q.answer()
+    changes = context.user_data.pop('isp_auto_changes', [])
+    if not changes:
+        await safe_edit_text(q, context, "⚠️ Нет данных для применения.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀️ ISP теги", callback_data='ssh_isp_tag')]]))
+        return
+    routers = load_routers()
+    applied = []
+    for cn, old_isp, new_isp in changes:
+        if cn in routers:
+            routers[cn]["isp"] = new_isp
+            applied.append(cn)
+    save_routers(routers)
+
+    summary = []
+    for cn, old_isp, new_isp in changes:
+        new_icon = {"agts": "🏢", "telekom": "📡"}.get(new_isp, "")
+        summary.append(f"• {cn} → {new_icon} {ISP_NAMES.get(new_isp, new_isp)}")
+
+    if mode == 'deploy' and applied:
+        front_ip = ""
+        try:
+            with open(DEPLOY_FRONT_IP_FILE, "r") as f:
+                front_ip = f.read().strip()
+        except FileNotFoundError:
+            pass
+        if not front_ip:
+            front_ip = rr_read_file(RR_IP_FILE, "").strip()
+        if not front_ip:
+            await safe_edit_text(q, context,
+                f"🔍 <b>Авто ISP</b>\n"
+                f"Теги обновлены: <b>{len(applied)}</b>\n\n" +
+                "\n".join(summary) +
+                "\n\n⚠️ Не удалось определить фронт IP для деплоя.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("◀️ ISP теги", callback_data='ssh_isp_tag')]]))
+            return
+        await safe_edit_text(q, context,
+            f"🔍 <b>Авто ISP</b>\n"
+            f"Теги обновлены: <b>{len(applied)}</b>\n\n"
+            f"📦 Деплой через <code>{front_ip}</code>...",
+            parse_mode="HTML")
+        await _do_ssh_deploy_multi(q, context, applied, front_ip)
+        return
+
+    await safe_edit_text(q, context,
+        f"🔍 <b>Авто ISP</b>\n"
+        f"Теги обновлены: <b>{len(applied)}</b>\n\n" +
+        "\n".join(summary),
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(
             [[InlineKeyboardButton("◀️ ISP теги", callback_data='ssh_isp_tag'),
