@@ -6061,6 +6061,7 @@ async def _reply_kb_autoip(update: Update, context: ContextTypes.DEFAULT_TYPE):
          InlineKeyboardButton("🔎 Сверить", callback_data='aip_compare')],
     ]
     if isp_mode:
+        kb.append([InlineKeyboardButton("✏️ Сменить IP (все)", callback_data='aip_switch_all')])
         kb.append([
             InlineKeyboardButton("🏢 Сменить АГТС", callback_data='aip_switch_agts'),
             InlineKeyboardButton("📡 Сменить Телеком", callback_data='aip_switch_telekom'),
@@ -7411,6 +7412,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await auto_ip_move(update, context, idx, direction)
     elif data == 'aip_toggle_isp':
         await auto_ip_toggle_isp(update, context)
+    elif data == 'aip_switch_all':
+        await auto_ip_switch_all(update, context)
+    elif data.startswith('aip_all_set:'):
+        ip = data[len('aip_all_set:'):]
+        await auto_ip_all_set(update, context, ip)
     elif data == 'aip_switch_agts':
         await auto_ip_switch_isp(update, context, "agts")
     elif data == 'aip_switch_telekom':
@@ -7660,7 +7666,10 @@ async def ssh_deploy_multi_select(update: Update, context: ContextTypes.DEFAULT_
     for cn in sorted(routers.keys(), key=_natural_key):
         status = "🟢" if cn in online else "🔴"
         check = "☑️" if cn in selected else "☐"
-        kb.append([InlineKeyboardButton(f"{check} {status} {cn}", callback_data=f'ssh_deploy_toggle:{cn}')])
+        isp = routers[cn].get("isp", "")
+        isp_icon = {"agts": "🏢", "telekom": "📡"}.get(isp, "")
+        isp_part = f" {isp_icon}" if isp_icon else ""
+        kb.append([InlineKeyboardButton(f"{check} {status}{isp_part} {cn}", callback_data=f'ssh_deploy_toggle:{cn}')])
     count = len(selected)
     kb.append([InlineKeyboardButton(f"✅ Готово ({count})", callback_data='ssh_deploy_multi_done')])
     kb.append([InlineKeyboardButton("◀️ Назад", callback_data='ssh_select_deploy')])
@@ -7760,7 +7769,10 @@ async def ssh_cmd_multi_select(update: Update, context: ContextTypes.DEFAULT_TYP
     for cn in sorted(routers.keys(), key=_natural_key):
         status = "🟢" if cn in online else "🔴"
         check = "☑️" if cn in selected else "☐"
-        kb.append([InlineKeyboardButton(f"{check} {status} {cn}", callback_data=f'ssh_cmd_toggle:{cn}')])
+        isp = routers[cn].get("isp", "")
+        isp_icon = {"agts": "🏢", "telekom": "📡"}.get(isp, "")
+        isp_part = f" {isp_icon}" if isp_icon else ""
+        kb.append([InlineKeyboardButton(f"{check} {status}{isp_part} {cn}", callback_data=f'ssh_cmd_toggle:{cn}')])
     count = len(selected)
     kb.append([InlineKeyboardButton(f"✅ Готово ({count})", callback_data='ssh_cmd_multi_done')])
     kb.append([InlineKeyboardButton("◀️ Назад", callback_data='ssh_select_cmd')])
@@ -7873,9 +7885,11 @@ async def ssh_isp_tag_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         info = routers[cn]
         isp = info.get("isp", "")
         isp_label = ISP_NAMES.get(isp, "—") if isp else "—"
+        isp_icon = {"agts": "🏢", "telekom": "📡"}.get(isp, "")
         status = "🟢" if cn in online else "🔴"
+        label = f"{status} {cn} [{isp_label}]" if not isp_icon else f"{status} {isp_icon} {cn} [{isp_label}]"
         kb.append([InlineKeyboardButton(
-            f"{status} {cn} [{isp_label}]",
+            label,
             callback_data=f"ssh_isp_pick:{cn}")])
     kb.append([InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')])
     await safe_edit_text(q, context,
@@ -7967,7 +7981,10 @@ async def ssh_select_router(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     kb = []
     for cn in sorted(routers.keys(), key=_natural_key):
         status = "🟢" if cn in online else "🔴"
-        kb.append([InlineKeyboardButton(f"{status} {cn}", callback_data=f'{action}:{cn}')])
+        isp = routers[cn].get("isp", "")
+        isp_icon = {"agts": "🏢", "telekom": "📡"}.get(isp, "")
+        prefix = f"{status} {isp_icon} " if isp_icon else f"{status} "
+        kb.append([InlineKeyboardButton(f"{prefix}{cn}", callback_data=f'{action}:{cn}')])
     kb.append([InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')])
     titles = {
         'ssh_status': '🔍 Выберите роутер для статуса',
@@ -8004,8 +8021,14 @@ async def ssh_ver_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     routers = load_routers()
-    kb = [[InlineKeyboardButton(cn, callback_data=f'ssh_ver_one:{cn}')]
-          for cn in sorted(routers.keys(), key=_natural_key)]
+    online = get_online_clients()
+    kb = []
+    for cn in sorted(routers.keys(), key=_natural_key):
+        isp = routers[cn].get("isp", "")
+        isp_icon = {"agts": "🏢", "telekom": "📡"}.get(isp, "")
+        status = "🟢" if cn in online else "🔴"
+        prefix = f"{status} {isp_icon} " if isp_icon else f"{status} "
+        kb.append([InlineKeyboardButton(f"{prefix}{cn}", callback_data=f'ssh_ver_one:{cn}')])
     kb.append([InlineKeyboardButton("◀ Назад", callback_data='ssh_check_ver')])
     await safe_edit_text(q, context,
         "📋 Выберите роутер:",
@@ -8189,7 +8212,10 @@ async def ssh_chpass_multi_select(update: Update, context: ContextTypes.DEFAULT_
         if cn not in online:
             continue
         mark = "☑️" if cn in sel else "⬜"
-        kb.append([InlineKeyboardButton(f"{mark} {cn}", callback_data=f'ssh_chpass_toggle:{cn}')])
+        isp = routers[cn].get("isp", "")
+        isp_icon = {"agts": "🏢", "telekom": "📡"}.get(isp, "")
+        isp_part = f" {isp_icon}" if isp_icon else ""
+        kb.append([InlineKeyboardButton(f"{mark}{isp_part} {cn}", callback_data=f'ssh_chpass_toggle:{cn}')])
     count = len(sel)
     kb.append([InlineKeyboardButton(f"✅ Готово ({count})", callback_data='ssh_chpass_multi_done')])
     kb.append([InlineKeyboardButton("◀️ Назад", callback_data='ssh_chpass_menu')])
@@ -10250,6 +10276,7 @@ async def auto_ip_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
          InlineKeyboardButton("🔎 Сверить", callback_data='aip_compare')],
     ]
     if isp_mode:
+        kb.append([InlineKeyboardButton("✏️ Сменить IP (все)", callback_data='aip_switch_all')])
         kb.append([
             InlineKeyboardButton("🏢 Сменить АГТС", callback_data='aip_switch_agts'),
             InlineKeyboardButton("📡 Сменить Телеком", callback_data='aip_switch_telekom'),
@@ -10455,6 +10482,64 @@ async def auto_ip_isp_set(update: Update, context: ContextTypes.DEFAULT_TYPE, is
         f"✅ <b>{ISP_NAMES.get(isp, isp)}</b> IP сменён:\n"
         f"<code>{old_ip}</code> → <code>{ip}</code>\n"
         f"Роутеры {ISP_NAMES.get(isp, isp)} подхватят через RR.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("◀️ Авто IP", callback_data='aip_menu')]]))
+
+
+async def auto_ip_switch_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show picker to switch general IP (all ISPs at once)."""
+    q = update.callback_query
+    await q.answer()
+    pool = load_ip_pool()
+    if not pool:
+        await safe_edit_text(q, context, "Пул пуст.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀️ Назад", callback_data='aip_menu')]]))
+        return
+    current = rr_read_file(RR_IP_FILE).strip()
+    kb = []
+    for entry in pool:
+        ip = entry["ip"]
+        label = entry.get("label", "")
+        isp_tag = entry.get("isp", "all")
+        isp_label = ISP_NAMES.get(isp_tag, isp_tag)
+        marker = " ◀️" if ip == current else ""
+        kb.append([InlineKeyboardButton(
+            f"{ip} ({label}) [{isp_label}]{marker}",
+            callback_data=f"aip_all_set:{ip}")])
+    kb.append([InlineKeyboardButton("◀️ Назад", callback_data='aip_menu')])
+    await safe_edit_text(q, context,
+        f"✏️ <b>Сменить IP (все)</b>\n"
+        f"Текущий общий: <code>{current}</code>\n\n"
+        f"Выбранный IP станет общим + АГТС + Телеком:",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def auto_ip_all_set(update: Update, context: ContextTypes.DEFAULT_TYPE, ip: str):
+    """Set chosen IP as general + both ISP files."""
+    global auto_ip_state
+    q = update.callback_query
+    await q.answer()
+    old_ip = rr_read_file(RR_IP_FILE).strip()
+    changed = []
+    if auto_ip_state.get("ovpn"):
+        rr_write_file(RR_IP_FILE, ip + "\n")
+        changed.append("OVPN")
+    if auto_ip_state.get("pptp"):
+        rr_write_file(RR_PPTP_IP_FILE, ip + "\n")
+        changed.append("PPTP")
+    # Update both ISP files
+    for isp in ISP_LIST:
+        _set_current_isp_ip(isp, ip)
+        auto_ip_state[f"current_{isp}"] = ip
+    _save_auto_ip_state(auto_ip_state)
+    rr_append_history(f"ALL: {old_ip} -> {ip} ({'+'.join(changed)})")
+    await safe_edit_text(q, context,
+        f"✅ <b>Общий IP сменён:</b>\n"
+        f"<code>{old_ip}</code> → <code>{ip}</code>\n"
+        f"Обновлено: общий + АГТС + Телеком\n"
+        f"Все роутеры подхватят через RR.",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(
             [[InlineKeyboardButton("◀️ Авто IP", callback_data='aip_menu')]]))
