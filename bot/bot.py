@@ -7884,13 +7884,15 @@ async def ssh_list_routers(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     online = get_online_clients()
     lines = []
+    max_cn = max((len(cn) for cn in routers), default=0)
     for cn, info in sorted(routers.items(), key=lambda x: _natural_key(x[0])):
         ip = get_router_ip(cn)
         status = "🟢" if cn in online else "🔴"
-        ip_str = ip or "—"
+        ip_str = (ip or "—").ljust(12)
         isp = info.get("isp", "")
         isp_icon = {"agts": "🏢", "telekom": "📡"}.get(isp, "")
-        lines.append(f"{status} <b>{cn}</b>  {ip_str} {isp_icon}")
+        cn_padded = cn.ljust(max_cn)
+        lines.append(f"{status} <code>{cn_padded}</code> {ip_str} {isp_icon}")
     text = "📋 <b>Роутеры:</b>\n\n" + "\n".join(lines)
     kb = [[InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')]]
     await safe_edit_text(q, context, text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
