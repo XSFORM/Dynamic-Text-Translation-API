@@ -6887,11 +6887,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await ssh_add_start(update, context)
     elif data == 'ssh_isp_tag':
         await ssh_isp_tag_menu(update, context)
-    elif data.startswith('ssh_isp_pick:'):
-        await ssh_isp_pick(update, context, data[len('ssh_isp_pick:'):])
-    elif data.startswith('ssh_isp_set:'):
-        parts = data[len('ssh_isp_set:'):].split(':', 1)
-        await ssh_isp_set(update, context, parts[0], parts[1])
+    elif data.startswith('ssh_isp_toggle:'):
+        await ssh_isp_toggle(update, context, data[len('ssh_isp_toggle:'):])
+    elif data == 'ssh_isp_sel_all':
+        await ssh_isp_sel_all(update, context)
+    elif data == 'ssh_isp_sel_none':
+        await ssh_isp_sel_none(update, context)
+    elif data == 'ssh_isp_sel_untagged':
+        await ssh_isp_sel_untagged(update, context)
+    elif data.startswith('ssh_isp_bulk:'):
+        await ssh_isp_bulk(update, context, data[len('ssh_isp_bulk:'):])
     elif data == 'ssh_ping_all':
         await ssh_ping_all(update, context)
     elif data == 'ssh_check_ver':
@@ -7892,7 +7897,7 @@ async def ssh_list_routers(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def ssh_isp_tag_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show routers to set ISP tag."""
+    """Show routers with multi-select checkboxes for bulk ISP tagging."""
     q = update.callback_query
     await q.answer()
     routers = load_routers()
@@ -7902,61 +7907,118 @@ async def ssh_isp_tag_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [[InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')]]))
         return
     online = get_online_clients()
+    selected = context.user_data.get('isp_tag_selected', [])
+    # Count by current ISP
+    cnt_agts = sum(1 for r in routers.values() if r.get("isp") == "agts")
+    cnt_telekom = sum(1 for r in routers.values() if r.get("isp") == "telekom")
+    cnt_none = sum(1 for r in routers.values() if not r.get("isp"))
     kb = []
     for cn in sorted(routers.keys(), key=_natural_key):
         info = routers[cn]
         isp = info.get("isp", "")
-        isp_label = ISP_NAMES.get(isp, "—") if isp else "—"
         isp_icon = {"agts": "🏢", "telekom": "📡"}.get(isp, "")
+        isp_label = ISP_NAMES.get(isp, "—") if isp else "—"
         status = "🟢" if cn in online else "🔴"
-        label = f"{status} {cn} [{isp_label}]" if not isp_icon else f"{status} {isp_icon} {cn} [{isp_label}]"
-        kb.append([InlineKeyboardButton(
-            label,
-            callback_data=f"ssh_isp_pick:{cn}")])
+        check = "☑️" if cn in selected else "☐"
+        parts = [check, status]
+        if isp_icon:
+            parts.append(isp_icon)
+        parts.append(cn)
+        parts.append(f"[{isp_label}]")
+        kb.append([InlineKeyboardButton(" ".join(parts), callback_data=f"ssh_isp_toggle:{cn}")])
+    count = len(selected)
+    # Quick select buttons
+    kb.append([
+        InlineKeyboardButton("✅ Все", callback_data='ssh_isp_sel_all'),
+        InlineKeyboardButton("☐ Сброс", callback_data='ssh_isp_sel_none'),
+        InlineKeyboardButton("🔘 Без тега", callback_data='ssh_isp_sel_untagged'),
+    ])
+    # Apply buttons
+    kb.append([
+        InlineKeyboardButton(f"🏢 АГТС ({count})", callback_data='ssh_isp_bulk:agts'),
+        InlineKeyboardButton(f"📡 Телеком ({count})", callback_data='ssh_isp_bulk:telekom'),
+    ])
+    kb.append([
+        InlineKeyboardButton(f"❌ Убрать тег ({count})", callback_data='ssh_isp_bulk:none'),
+    ])
     kb.append([InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')])
     await safe_edit_text(q, context,
-        "🏷 <b>ISP тег роутера</b>\nВыберите роутер:",
+        f"🏷 <b>ISP теги</b> — выберите роутеры галочками\n"
+        f"Выбрано: <b>{count}</b> | 🏢 АГТС: {cnt_agts} | 📡 Телеком: {cnt_telekom} | Без тега: {cnt_none}",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
 
-async def ssh_isp_pick(update: Update, context: ContextTypes.DEFAULT_TYPE, cn: str):
-    """Show ISP options for a router."""
+async def ssh_isp_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE, cn: str):
+    """Toggle router selection for ISP tagging."""
     q = update.callback_query
     await q.answer()
-    routers = load_routers()
-    if cn not in routers:
-        await safe_edit_text(q, context, f"Роутер {cn} не найден.")
-        return
-    current_isp = routers[cn].get("isp", "")
-    current_label = ISP_NAMES.get(current_isp, "—") if current_isp else "—"
-    kb = [
-        [InlineKeyboardButton("🏢 АГТС", callback_data=f"ssh_isp_set:{cn}:agts"),
-         InlineKeyboardButton("📡 Телеком", callback_data=f"ssh_isp_set:{cn}:telekom")],
-        [InlineKeyboardButton("❌ Убрать тег", callback_data=f"ssh_isp_set:{cn}:none")],
-        [InlineKeyboardButton("◀️ Назад", callback_data='ssh_isp_tag')],
-    ]
-    await safe_edit_text(q, context,
-        f"🏷 ISP тег для <b>{cn}</b>\nТекущий: {current_label}",
-        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
-
-
-async def ssh_isp_set(update: Update, context: ContextTypes.DEFAULT_TYPE, cn: str, isp: str):
-    """Apply ISP tag to a router."""
-    q = update.callback_query
-    await q.answer()
-    routers = load_routers()
-    if cn not in routers:
-        await safe_edit_text(q, context, f"Роутер {cn} не найден.")
-        return
-    if isp == "none":
-        routers[cn].pop("isp", None)
-        isp_label = "убран"
+    sel = context.user_data.get('isp_tag_selected', [])
+    if cn in sel:
+        sel.remove(cn)
     else:
-        routers[cn]["isp"] = isp
-        isp_label = ISP_NAMES.get(isp, isp)
+        sel.append(cn)
+    context.user_data['isp_tag_selected'] = sel
+    await ssh_isp_tag_menu(update, context)
+
+
+async def ssh_isp_sel_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Select all routers for ISP tagging."""
+    q = update.callback_query
+    await q.answer()
+    routers = load_routers()
+    context.user_data['isp_tag_selected'] = list(routers.keys())
+    await ssh_isp_tag_menu(update, context)
+
+
+async def ssh_isp_sel_none(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Deselect all routers."""
+    q = update.callback_query
+    await q.answer()
+    context.user_data['isp_tag_selected'] = []
+    await ssh_isp_tag_menu(update, context)
+
+
+async def ssh_isp_sel_untagged(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Select only routers without ISP tag."""
+    q = update.callback_query
+    await q.answer()
+    routers = load_routers()
+    context.user_data['isp_tag_selected'] = [cn for cn, r in routers.items() if not r.get("isp")]
+    await ssh_isp_tag_menu(update, context)
+
+
+async def ssh_isp_bulk(update: Update, context: ContextTypes.DEFAULT_TYPE, isp: str):
+    """Apply ISP tag to all selected routers at once."""
+    q = update.callback_query
+    await q.answer()
+    selected = context.user_data.get('isp_tag_selected', [])
+    if not selected:
+        await safe_edit_text(q, context, "⚠️ Ни один роутер не выбран.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀️ ISP теги", callback_data='ssh_isp_tag')]]))
+        return
+    routers = load_routers()
+    applied = []
+    for cn in selected:
+        if cn not in routers:
+            continue
+        if isp == "none":
+            routers[cn].pop("isp", None)
+        else:
+            routers[cn]["isp"] = isp
+        applied.append(cn)
     save_routers(routers)
+    context.user_data['isp_tag_selected'] = []
+    if isp == "none":
+        isp_label = "убран"
+        icon = "❌"
+    else:
+        isp_label = ISP_NAMES.get(isp, isp)
+        icon = {"agts": "🏢", "telekom": "📡"}.get(isp, "🏷")
     await safe_edit_text(q, context,
-        f"✅ <b>{cn}</b> → ISP: <b>{isp_label}</b>",
+        f"{icon} <b>ISP тег → {isp_label}</b>\n"
+        f"Применено к <b>{len(applied)}</b> роутерам:\n"
+        f"<code>{', '.join(applied)}</code>",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(
             [[InlineKeyboardButton("◀️ ISP теги", callback_data='ssh_isp_tag'),
