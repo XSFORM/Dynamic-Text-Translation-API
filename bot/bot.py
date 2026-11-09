@@ -8463,17 +8463,14 @@ async def _cn_watch_check(app):
                         f'echo OK ; }} || echo FAIL'
                     )
                     ip = get_router_ip(cn)
+                    user = r.get("user", "admin")
                     pw = r.get("password", "admin")
+                    port = r.get("port", 22)
                     result = "❌ Не удалось"
                     try:
-                        proc = await asyncio.create_subprocess_exec(
-                            "sshpass", "-p", pw, "ssh", "-o", "StrictHostKeyChecking=no",
-                            "-o", "ConnectTimeout=15", f"admin@{ip}",
-                            deploy_cmd,
-                            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-                        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
-                        out = stdout.decode(errors="replace").strip()
-                        if "OK" in out:
+                        ok, out = await asyncio.get_event_loop().run_in_executor(
+                            None, ssh_exec, ip, port, user, pw, deploy_cmd, 60)
+                        if ok and "OK" in out:
                             result = "✅ Деплой успешен"
                         else:
                             result = f"❌ {out[:100]}"
