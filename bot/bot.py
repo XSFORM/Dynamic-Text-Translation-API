@@ -5990,11 +5990,9 @@ async def _reply_kb_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML", disable_web_page_preview=True,
         reply_markup=InlineKeyboardMarkup(kb))
 
-async def _reply_kb_ssh(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle '🖥 SSH Роутеры' reply keyboard button."""
-    routers = load_routers()
-    count = len(routers)
-    kb = [
+def _ssh_menu_kb(count: int) -> list:
+    """Shared SSH Роутеры keyboard buttons."""
+    return [
         [InlineKeyboardButton(f"📋 Список роутеров ({count})", callback_data='ssh_list')],
         [InlineKeyboardButton("➕ Добавить", callback_data='ssh_add'),
          InlineKeyboardButton("✏️ Редактировать", callback_data='ssh_select_edit')],
@@ -6009,11 +6007,25 @@ async def _reply_kb_ssh(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🔑 Сменить пароль", callback_data='ssh_chpass_menu')],
         [InlineKeyboardButton("📝 Конфиг OpenVPN", callback_data='oec_menu')],
         [InlineKeyboardButton("🔗 Обратный туннель", callback_data='rt_menu')],
+        [InlineKeyboardButton("🏷 ISP тег роутера", callback_data='ssh_isp_tag')],
+        [InlineKeyboardButton("👁 Ожидание онлайн", callback_data='cn_watch_menu')],
         [InlineKeyboardButton("🏠 В главное меню", callback_data='home')],
     ]
+
+
+def _ssh_menu_text(count: int) -> str:
+    watch = load_cn_watch()
+    watch_info = f" | 👁 На контроле: {len(watch)}" if watch else ""
+    return f"🖥 <b>SSH Роутеры</b>\n\nСохранено роутеров: {count}{watch_info}"
+
+
+async def _reply_kb_ssh(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle '🖥 SSH Роутеры' reply keyboard button."""
+    routers = load_routers()
+    count = len(routers)
     await update.message.reply_text(
-        f"🖥 <b>SSH Роутеры</b>\n\nСохранено роутеров: {count}",
-        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+        _ssh_menu_text(count),
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(_ssh_menu_kb(count)))
 
 async def _reply_kb_gost(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle '🌐 GOST Серверы' reply keyboard button."""
@@ -7924,32 +7936,9 @@ async def ssh_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     routers = load_routers()
     count = len(routers)
-    kb = [
-        [InlineKeyboardButton(f"📋 Список роутеров ({count})", callback_data='ssh_list')],
-        [InlineKeyboardButton("➕ Добавить", callback_data='ssh_add'),
-         InlineKeyboardButton("✏️ Редактировать", callback_data='ssh_select_edit')],
-        [InlineKeyboardButton("🗑️ Удалить", callback_data='ssh_select_delete')],
-        [InlineKeyboardButton("📡 Пинг всех", callback_data='ssh_ping_all')],
-        [InlineKeyboardButton("🔍 Статус роутера", callback_data='ssh_select_status')],
-        [InlineKeyboardButton("📦 Залить скрипт", callback_data='ssh_select_deploy'),
-         InlineKeyboardButton("📋 Версия", callback_data='ssh_check_ver')],
-        [InlineKeyboardButton("🩹 Лечение", callback_data='ssh_select_heal')],
-        [InlineKeyboardButton("🔁 Перезагрузка", callback_data='ssh_select_reboot')],
-        [InlineKeyboardButton("💻 Команда", callback_data='ssh_select_cmd')],
-        [InlineKeyboardButton("🔑 Сменить пароль", callback_data='ssh_chpass_menu')],
-        [InlineKeyboardButton("📝 Конфиг OpenVPN", callback_data='oec_menu')],
-        [InlineKeyboardButton("🔗 Обратный туннель", callback_data='rt_menu')],
-        [InlineKeyboardButton("🏷 ISP тег роутера", callback_data='ssh_isp_tag')],
-        [InlineKeyboardButton("👁 Ожидание онлайн", callback_data='cn_watch_menu')],
-        [InlineKeyboardButton("🏠 В главное меню", callback_data='home')],
-    ]
-    # CN watch count
-    watch = load_cn_watch()
-    watch_info = f" | 👁 На контроле: {len(watch)}" if watch else ""
     await safe_edit_text(q, context,
-        "🖥 <b>SSH Роутеры</b>\n\n"
-        f"Сохранено роутеров: {count}{watch_info}",
-        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+        _ssh_menu_text(count),
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(_ssh_menu_kb(count)))
 
 async def ssh_list_routers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
