@@ -4306,6 +4306,7 @@ async def pptp_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ip = read_pptp_ip() or "(не задан)"
     clients = load_pptp_clients()
     pptp_synced = auto_ip_state.get("pptp", False)
+    isp_mode = auto_ip_state.get("isp_mode", False)
     kb = []
     if not pptp_synced:
         kb.append([InlineKeyboardButton("✏️ Сменить IP", callback_data='pptp_set_ip')])
@@ -4320,9 +4321,14 @@ async def pptp_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         note = "<i>IP синхронизирован с OVPN (Авто IP)</i>"
     else:
         note = "<i>IP отдельный от OVPN (Авто IP PPTP выкл)</i>"
+    isp_info = ""
+    if isp_mode and pptp_synced:
+        pptp_agts = rr_read_file(RR_PPTP_IP_FILE_AGTS, "").strip() or "—"
+        pptp_telekom = rr_read_file(RR_PPTP_IP_FILE_TELEKOM, "").strip() or "—"
+        isp_info = f"\n🏢 АГТС PPTP: <code>{pptp_agts}</code>\n📡 Телеком PPTP: <code>{pptp_telekom}</code>"
     await safe_edit_text(q, context,
         f"🔗 <b>PPTP</b>\n\n"
-        f"IP: <code>{ip}</code>\n"
+        f"IP (общий): <code>{ip}</code>{isp_info}\n"
         f"Домены: общие с OpenVPN\n"
         f"{note}",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
@@ -6026,8 +6032,10 @@ async def _reply_kb_autoip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if isp_mode:
         ip_agts = _get_current_isp_ip("agts") or "—"
         ip_telekom = _get_current_isp_ip("telekom") or "—"
-        lines.append(f"🏢 АГТС IP: <code>{ip_agts}</code>")
-        lines.append(f"📡 Телеком IP: <code>{ip_telekom}</code>")
+        pptp_agts = rr_read_file(RR_PPTP_IP_FILE_AGTS, "").strip() or "—"
+        pptp_telekom = rr_read_file(RR_PPTP_IP_FILE_TELEKOM, "").strip() or "—"
+        lines.append(f"🏢 АГТС: <code>{ip_agts}</code> (PPTP: <code>{pptp_agts}</code>)")
+        lines.append(f"📡 Телеком: <code>{ip_telekom}</code> (PPTP: <code>{pptp_telekom}</code>)")
         lines.append("🔀 Режим ISP: <b>ВКЛ</b>")
     else:
         lines.append("🔀 Режим ISP: ВЫКЛ")
@@ -10254,8 +10262,10 @@ async def auto_ip_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if isp_mode:
         ip_agts = _get_current_isp_ip("agts") or "—"
         ip_telekom = _get_current_isp_ip("telekom") or "—"
-        lines.append(f"🏢 АГТС IP: <code>{ip_agts}</code>")
-        lines.append(f"📡 Телеком IP: <code>{ip_telekom}</code>")
+        pptp_agts = rr_read_file(RR_PPTP_IP_FILE_AGTS, "").strip() or "—"
+        pptp_telekom = rr_read_file(RR_PPTP_IP_FILE_TELEKOM, "").strip() or "—"
+        lines.append(f"🏢 АГТС: <code>{ip_agts}</code> (PPTP: <code>{pptp_agts}</code>)")
+        lines.append(f"📡 Телеком: <code>{ip_telekom}</code> (PPTP: <code>{pptp_telekom}</code>)")
         lines.append("🔀 Режим ISP: <b>ВКЛ</b>")
     else:
         lines.append("🔀 Режим ISP: ВЫКЛ")
