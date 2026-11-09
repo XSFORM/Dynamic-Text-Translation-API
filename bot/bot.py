@@ -119,6 +119,10 @@ RR_BEACON_LOG = "/var/log/nginx/access.log"
 RR_DOMAIN_LIST_FILE = "/var/www/html/router/domain_list.txt"
 RR_PROTOCOL_FILE = "/var/www/html/router/protocol.txt"
 RR_PPTP_IP_FILE = "/var/www/html/current_pptp_ip.txt"
+RR_IP_FILE_AGTS = "/var/www/html/current_vpn_ip_agts.txt"
+RR_IP_FILE_TELEKOM = "/var/www/html/current_vpn_ip_telekom.txt"
+ISP_NAMES = {"agts": "АГТС", "telekom": "Телеком", "all": "Все"}
+ISP_LIST = ["agts", "telekom"]
 RR_EMERGENCY_OEC_FILE = "/var/www/html/router/emergency_oec.txt"
 RR_EMERGENCY_FLAG_FILE = "/var/www/html/router/emergency.flag"
 RR_PPTP_EMERGENCY_FILE = "/var/www/html/router/pptp_emergency.txt"
@@ -180,22 +184,26 @@ AUTO_IP_NET_CONTROL = "1.1.1.1"            # neutral IP to check if front has in
 AUTO_IP_FAIL_THRESHOLD = 3                  # consecutive ping fails before switch
 AUTO_IP_DOWN_THRESHOLD = 5                  # consecutive front_down before notification
 AUTO_IP_CHECK_INTERVAL = 60                 # seconds between checks
-auto_ip_fail_count = 0
-auto_ip_down_count = 0
+auto_ip_fail_count = {"agts": 0, "telekom": 0}
+auto_ip_down_count = {"agts": 0, "telekom": 0}
 
 def _load_auto_ip_state() -> dict:
-    """Returns {"ovpn": bool, "pptp": bool}."""
+    """Returns {"ovpn": bool, "pptp": bool, "isp_mode": bool, "current_agts": str, "current_telekom": str}."""
+    defaults = {"ovpn": False, "pptp": False, "isp_mode": False,
+                "current_agts": "", "current_telekom": ""}
     if os.path.exists(AUTO_IP_STATE_FILE):
         try:
             with open(AUTO_IP_STATE_FILE) as f:
                 d = json.load(f)
                 # Migration: old format {"enabled": bool} → new
                 if "enabled" in d and "ovpn" not in d:
-                    return {"ovpn": d["enabled"], "pptp": False}
-                return {"ovpn": d.get("ovpn", False), "pptp": d.get("pptp", False)}
+                    d = {"ovpn": d["enabled"], "pptp": False}
+                for k, v in defaults.items():
+                    d.setdefault(k, v)
+                return d
         except Exception:
             pass
-    return {"ovpn": False, "pptp": False}
+    return dict(defaults)
 
 def _save_auto_ip_state(state: dict):
     try:
@@ -219,6 +227,28 @@ def load_ip_pool() -> list:
 def save_ip_pool(pool: list) -> None:
     with open(AUTO_IP_POOL_FILE, "w") as f:
         json.dump(pool, f, indent=2, ensure_ascii=False)
+
+def _isp_ip_file(isp: str) -> str:
+    """Return the RR IP file path for a given ISP."""
+    if isp == "agts":
+        return RR_IP_FILE_AGTS
+    elif isp == "telekom":
+        return RR_IP_FILE_TELEKOM
+    return RR_IP_FILE
+
+def _get_current_isp_ip(isp: str) -> str:
+    """Read current IP for an ISP from its file."""
+    path = _isp_ip_file(isp)
+    return rr_read_file(path, "").strip()
+
+def _set_current_isp_ip(isp: str, ip: str):
+    """Write current IP for an ISP to its file."""
+    path = _isp_ip_file(isp)
+    rr_write_file(path, ip + "\n")
+
+def _pool_for_isp(pool: list, isp: str) -> list:
+    """Filter pool entries available for a given ISP."""
+    return [e for e in pool if e.get("isp", "all") in (isp, "all")]
 
 def ping_via_ssh(host: str, user: str, password: str, target: str) -> bool:
     """SSH into host and ping target. Returns True if ping succeeds."""
@@ -5983,33 +6013,60 @@ async def _reply_kb_autoip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pptp_ip = rr_read_file(RR_PPTP_IP_FILE, "").strip()
     ovpn_st = "🟢" if auto_ip_state["ovpn"] else "🔴"
     pptp_st = "🟢" if auto_ip_state["pptp"] else "🔴"
+    isp_mode = auto_ip_state.get("isp_mode", False)
     lines = [
         f"<b>🔄 Авто IP</b>",
         f"OVPN: {ovpn_st}  PPTP: {pptp_st}",
-        f"OpenVPN IP: <code>{current_ip}</code>",
+        f"OpenVPN IP (общий): <code>{current_ip}</code>",
         f"PPTP IP: <code>{pptp_ip}</code>",
-        "",
     ]
+    if isp_mode:
+        ip_agts = _get_current_isp_ip("agts") or "—"
+        ip_telekom = _get_current_isp_ip("telekom") or "—"
+        lines.append(f"🏢 АГТС IP: <code>{ip_agts}</code>")
+        lines.append(f"📡 Телеком IP: <code>{ip_telekom}</code>")
+        lines.append("🔀 Режим ISP: <b>ВКЛ</b>")
+    else:
+        lines.append("🔀 Режим ISP: ВЫКЛ")
+    lines.append("")
     if pool:
         for i, entry in enumerate(pool, 1):
             marker = " ◀️" if entry["ip"] == current_ip else ""
+            isp_tag = entry.get("isp", "all")
+            isp_label = ISP_NAMES.get(isp_tag, isp_tag)
             label = entry.get("label", "")
-            lines.append(f"{i}. <code>{entry['ip']}</code> ({label}){marker}")
+            # show ISP-specific markers in ISP mode
+            if isp_mode:
+                isp_markers = []
+                if entry["ip"] == auto_ip_state.get("current_agts"):
+                    isp_markers.append("🏢")
+                if entry["ip"] == auto_ip_state.get("current_telekom"):
+                    isp_markers.append("📡")
+                marker = " " + "".join(isp_markers) if isp_markers else ""
+            lines.append(f"{i}. <code>{entry['ip']}</code> ({label}) [{isp_label}]{marker}")
     else:
         lines.append("Пул пуст.")
     ovpn_btn = "🔴 OVPN выкл" if auto_ip_state["ovpn"] else "🟢 OVPN вкл"
     pptp_btn = "🔴 PPTP выкл" if auto_ip_state["pptp"] else "🟢 PPTP вкл"
+    isp_btn = "🔀 ISP выкл" if isp_mode else "🔀 ISP вкл"
     kb = [
         [InlineKeyboardButton(ovpn_btn, callback_data='aip_toggle_ovpn'),
          InlineKeyboardButton(pptp_btn, callback_data='aip_toggle_pptp')],
+        [InlineKeyboardButton(isp_btn, callback_data='aip_toggle_isp')],
         [InlineKeyboardButton("➕ Добавить IP", callback_data='aip_add'),
          InlineKeyboardButton("\U0001f5d1 Удалить IP", callback_data='aip_remove')],
         [InlineKeyboardButton("↕️ Порядок", callback_data='aip_reorder'),
          InlineKeyboardButton("🔄 Заменить IP", callback_data='aip_replace')],
         [InlineKeyboardButton("📡 Пинг", callback_data='aip_ping'),
          InlineKeyboardButton("🔎 Сверить", callback_data='aip_compare')],
-        [InlineKeyboardButton("\U0001f3e0 Меню", callback_data='home')],
     ]
+    if isp_mode:
+        kb.append([
+            InlineKeyboardButton("🏢 Сменить АГТС", callback_data='aip_switch_agts'),
+            InlineKeyboardButton("📡 Сменить Телеком", callback_data='aip_switch_telekom'),
+        ])
+        kb.append([InlineKeyboardButton("🏷 Тег ISP", callback_data='aip_set_isp')])
+    kb.append([InlineKeyboardButton("\U0001f3e0 Меню", callback_data='home')])
     await update.message.reply_text("\n".join(lines),
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
@@ -6816,6 +6873,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await ssh_list_routers(update, context)
     elif data == 'ssh_add':
         await ssh_add_start(update, context)
+    elif data == 'ssh_isp_tag':
+        await ssh_isp_tag_menu(update, context)
+    elif data.startswith('ssh_isp_pick:'):
+        await ssh_isp_pick(update, context, data[len('ssh_isp_pick:'):])
+    elif data.startswith('ssh_isp_set:'):
+        parts = data[len('ssh_isp_set:'):].split(':', 1)
+        await ssh_isp_set(update, context, parts[0], parts[1])
     elif data == 'ssh_ping_all':
         await ssh_ping_all(update, context)
     elif data == 'ssh_check_ver':
@@ -7345,6 +7409,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         idx = int(parts[0])
         direction = parts[1]
         await auto_ip_move(update, context, idx, direction)
+    elif data == 'aip_toggle_isp':
+        await auto_ip_toggle_isp(update, context)
+    elif data == 'aip_switch_agts':
+        await auto_ip_switch_isp(update, context, "agts")
+    elif data == 'aip_switch_telekom':
+        await auto_ip_switch_isp(update, context, "telekom")
+    elif data.startswith('aip_isp_set:'):
+        # aip_isp_set:ISP:IP
+        parts = data[len('aip_isp_set:'):].split(':', 1)
+        await auto_ip_isp_set(update, context, parts[0], parts[1])
+    elif data == 'aip_set_isp':
+        await auto_ip_set_isp_tag(update, context)
+    elif data.startswith('aip_tag_pick:'):
+        idx = int(data[len('aip_tag_pick:'):])
+        await auto_ip_tag_pick(update, context, idx)
+    elif data.startswith('aip_tag_set:'):
+        # aip_tag_set:IDX:ISP
+        parts = data[len('aip_tag_set:'):].split(':', 1)
+        await auto_ip_tag_set(update, context, int(parts[0]), parts[1])
 
     # --- GOST callbacks ---
     elif data == 'gost_menu':
@@ -7745,6 +7828,7 @@ async def ssh_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🔑 Сменить пароль", callback_data='ssh_chpass_menu')],
         [InlineKeyboardButton("📝 Конфиг OpenVPN", callback_data='oec_menu')],
         [InlineKeyboardButton("🔗 Обратный туннель", callback_data='rt_menu')],
+        [InlineKeyboardButton("🏷 ISP тег роутера", callback_data='ssh_isp_tag')],
         [InlineKeyboardButton("🏠 В главное меню", callback_data='home')],
     ]
     await safe_edit_text(q, context,
@@ -7765,10 +7849,83 @@ async def ssh_list_routers(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ip = get_router_ip(cn)
         status = "🟢" if cn in online else "🔴"
         ip_str = ip or "—"
-        lines.append(f"{status} <b>{cn}</b>  {ip_str}")
+        isp = info.get("isp", "")
+        isp_icon = {"agts": "🏢", "telekom": "📡"}.get(isp, "")
+        lines.append(f"{status} <b>{cn}</b>  {ip_str} {isp_icon}")
     text = "📋 <b>Роутеры:</b>\n\n" + "\n".join(lines)
     kb = [[InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')]]
     await safe_edit_text(q, context, text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def ssh_isp_tag_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show routers to set ISP tag."""
+    q = update.callback_query
+    await q.answer()
+    routers = load_routers()
+    if not routers:
+        await safe_edit_text(q, context, "Список роутеров пуст.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')]]))
+        return
+    online = get_online_clients()
+    kb = []
+    for cn in sorted(routers.keys(), key=_natural_key):
+        info = routers[cn]
+        isp = info.get("isp", "")
+        isp_label = ISP_NAMES.get(isp, "—") if isp else "—"
+        status = "🟢" if cn in online else "🔴"
+        kb.append([InlineKeyboardButton(
+            f"{status} {cn} [{isp_label}]",
+            callback_data=f"ssh_isp_pick:{cn}")])
+    kb.append([InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')])
+    await safe_edit_text(q, context,
+        "🏷 <b>ISP тег роутера</b>\nВыберите роутер:",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def ssh_isp_pick(update: Update, context: ContextTypes.DEFAULT_TYPE, cn: str):
+    """Show ISP options for a router."""
+    q = update.callback_query
+    await q.answer()
+    routers = load_routers()
+    if cn not in routers:
+        await safe_edit_text(q, context, f"Роутер {cn} не найден.")
+        return
+    current_isp = routers[cn].get("isp", "")
+    current_label = ISP_NAMES.get(current_isp, "—") if current_isp else "—"
+    kb = [
+        [InlineKeyboardButton("🏢 АГТС", callback_data=f"ssh_isp_set:{cn}:agts"),
+         InlineKeyboardButton("📡 Телеком", callback_data=f"ssh_isp_set:{cn}:telekom")],
+        [InlineKeyboardButton("❌ Убрать тег", callback_data=f"ssh_isp_set:{cn}:none")],
+        [InlineKeyboardButton("◀️ Назад", callback_data='ssh_isp_tag')],
+    ]
+    await safe_edit_text(q, context,
+        f"🏷 ISP тег для <b>{cn}</b>\nТекущий: {current_label}",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def ssh_isp_set(update: Update, context: ContextTypes.DEFAULT_TYPE, cn: str, isp: str):
+    """Apply ISP tag to a router."""
+    q = update.callback_query
+    await q.answer()
+    routers = load_routers()
+    if cn not in routers:
+        await safe_edit_text(q, context, f"Роутер {cn} не найден.")
+        return
+    if isp == "none":
+        routers[cn].pop("isp", None)
+        isp_label = "убран"
+    else:
+        routers[cn]["isp"] = isp
+        isp_label = ISP_NAMES.get(isp, isp)
+    save_routers(routers)
+    await safe_edit_text(q, context,
+        f"✅ <b>{cn}</b> → ISP: <b>{isp_label}</b>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("◀️ ISP теги", callback_data='ssh_isp_tag'),
+              InlineKeyboardButton("🏠 Меню", callback_data='ssh_routers')]]))
+
 
 async def ssh_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -9702,9 +9859,86 @@ async def cmd_backup_restore_apply(update: Update, context: ContextTypes.DEFAULT
 # =====================================================================
 #  AUTO IP — background monitor
 # =====================================================================
+
+async def _auto_ip_check_single(app, pool: list, current_ip: str, isp_label: str = ""):
+    """Check a single current IP and switch if needed.
+    Returns (new_ip, switch_reason) or (None, None) if no switch needed.
+    isp_label is for ISP mode context in log messages (e.g. 'agts', 'telekom', or '' for legacy)."""
+    global auto_ip_fail_count, auto_ip_down_count, auto_ip_state
+    fc_key = isp_label or "agts"  # use agts key for legacy single mode too
+    if fc_key not in auto_ip_fail_count:
+        auto_ip_fail_count[fc_key] = 0
+    if fc_key not in auto_ip_down_count:
+        auto_ip_down_count[fc_key] = 0
+
+    current_entry = None
+    for entry in pool:
+        if entry["ip"] == current_ip:
+            current_entry = entry
+            break
+    if not current_entry:
+        print(f"[auto_ip/{fc_key}] {current_ip} not in pool, skip")
+        return None, None
+
+    print(f"[auto_ip/{fc_key}] checking {current_ip} (fail={auto_ip_fail_count[fc_key]})")
+
+    try:
+        status, _detail = await asyncio.to_thread(
+            check_front_status, current_entry["ip"],
+            current_entry["ssh_user"], current_entry["ssh_pass"]
+        )
+    except Exception as e:
+        print(f"[auto_ip/{fc_key}] SSH error for {current_ip}: {e}")
+        status = "front_down"
+
+    if status == "ok":
+        if auto_ip_fail_count[fc_key] > 0:
+            print(f"[auto_ip/{fc_key}] Probe OK, reset fail count (was {auto_ip_fail_count[fc_key]})")
+        auto_ip_fail_count[fc_key] = 0
+        auto_ip_down_count[fc_key] = 0
+        return None, None
+
+    switch_reason = None
+
+    if status == "front_down":
+        auto_ip_down_count[fc_key] += 1
+        print(f"[auto_ip/{fc_key}] {current_ip} — front down #{auto_ip_down_count[fc_key]}/{AUTO_IP_DOWN_THRESHOLD}")
+        if auto_ip_down_count[fc_key] >= AUTO_IP_DOWN_THRESHOLD:
+            auto_ip_down_count[fc_key] = 0
+            switch_reason = "hosting"
+        else:
+            return None, None
+
+    elif status == "blocked":
+        auto_ip_fail_count[fc_key] += 1
+        auto_ip_down_count[fc_key] = 0
+        print(f"[auto_ip/{fc_key}] BLOCKED #{auto_ip_fail_count[fc_key]}/{AUTO_IP_FAIL_THRESHOLD} for {current_ip}")
+        if auto_ip_fail_count[fc_key] >= AUTO_IP_FAIL_THRESHOLD:
+            switch_reason = "blocked"
+        else:
+            return None, None
+
+    if not switch_reason:
+        return None, None
+
+    # Find replacement
+    cur_idx = next((i for i, e in enumerate(pool) if e["ip"] == current_ip), -1)
+    ordered = pool[cur_idx + 1:] + pool[:cur_idx]
+    for entry in ordered:
+        alt_ok = await asyncio.to_thread(
+            ping_via_ssh, entry["ip"],
+            entry["ssh_user"], entry["ssh_pass"],
+            AUTO_IP_TM_CHECK
+        )
+        if alt_ok:
+            return entry["ip"], switch_reason
+    return None, switch_reason  # no replacement found but reason set
+
+
 async def auto_ip_monitor(app):
-    """Background task: every 60s, ping TM probe from current GOST server.
-    After 5 consecutive failures — switch to next available IP from pool."""
+    """Background task: every 60s check front IPs.
+    In ISP mode — checks each ISP independently.
+    In legacy mode — checks the single general IP."""
     global auto_ip_enabled, auto_ip_fail_count, auto_ip_down_count, auto_ip_state
     while True:
         try:
@@ -9717,78 +9951,64 @@ async def auto_ip_monitor(app):
                 print("[auto_ip] pool empty, skip")
                 continue
 
-            current_ip = rr_read_file(RR_IP_FILE, "").strip()
-            if not current_ip:
-                print("[auto_ip] current_ip empty, skip")
-                continue
+            isp_mode = auto_ip_state.get("isp_mode", False)
 
-            # Find current entry in pool
-            current_entry = None
-            for entry in pool:
-                if entry["ip"] == current_ip:
-                    current_entry = entry
-                    break
-
-            if not current_entry:
-                print(f"[auto_ip] {current_ip} not in pool, skip")
-                continue
-
-            print(f"[auto_ip] checking {current_ip} (fail_count={auto_ip_fail_count})")
-
-            # Dual check: TM probe + neutral IP (1.1.1.1)
-            try:
-                status, _detail = await asyncio.to_thread(
-                    check_front_status, current_entry["ip"],
-                    current_entry["ssh_user"], current_entry["ssh_pass"]
-                )
-            except Exception as e:
-                print(f"[auto_ip] SSH error for {current_ip}: {e}")
-                status = "front_down"
-
-            if status == "ok":
-                if auto_ip_fail_count > 0:
-                    print(f"[auto_ip] Probe OK, reset fail count (was {auto_ip_fail_count})")
-                auto_ip_fail_count = 0
-                auto_ip_down_count = 0
-                continue
-
-            switch_reason = None  # will be set if we need to switch
-
-            if status == "front_down":
-                auto_ip_down_count += 1
-                print(f"[auto_ip] {current_ip} — front down #{auto_ip_down_count}/{AUTO_IP_DOWN_THRESHOLD}")
-                if auto_ip_down_count >= AUTO_IP_DOWN_THRESHOLD:
-                    auto_ip_down_count = 0
-                    switch_reason = "hosting"
-                else:
+            if isp_mode:
+                # Check each ISP independently
+                for isp in ISP_LIST:
+                    current_ip = _get_current_isp_ip(isp)
+                    if not current_ip:
+                        continue
+                    isp_pool = _pool_for_isp(pool, isp)
+                    if not isp_pool:
+                        continue
+                    new_ip, switch_reason = await _auto_ip_check_single(app, isp_pool, current_ip, isp)
+                    if new_ip and switch_reason:
+                        old_ip = current_ip
+                        _set_current_isp_ip(isp, new_ip)
+                        auto_ip_state[f"current_{isp}"] = new_ip
+                        _save_auto_ip_state(auto_ip_state)
+                        rr_append_history(f"AUTO-{isp.upper()}: {old_ip} -> {new_ip} ({switch_reason})")
+                        auto_ip_fail_count[isp] = 0
+                        auto_ip_down_count[isp] = 0
+                        label_entry = next((e for e in pool if e["ip"] == new_ip), {})
+                        label = label_entry.get("label", new_ip)
+                        isp_name = ISP_NAMES.get(isp, isp)
+                        reason_text = "🚫 TM заблокировал" if switch_reason == "blocked" else "⚠️ Хостинг недоступен"
+                        try:
+                            await app.bot.send_message(
+                                ADMIN_ID,
+                                f"🔄 <b>Авто-замена IP ({isp_name})</b>\n\n"
+                                f"{reason_text}: <code>{old_ip}</code>\n"
+                                f"✅ Новый IP: <code>{new_ip}</code> ({label})\n"
+                                f"Роутеры {isp_name} подхватят через RR.",
+                                parse_mode="HTML"
+                            )
+                        except Exception:
+                            pass
+                        print(f"[auto_ip/{isp}] Switched {old_ip} -> {new_ip} (reason={switch_reason})")
+                    elif not new_ip and switch_reason:
+                        # All pool IPs for this ISP are down
+                        auto_ip_fail_count[isp] = 0
+                        auto_ip_down_count[isp] = 0
+                        try:
+                            await app.bot.send_message(
+                                ADMIN_ID,
+                                f"🚨 <b>ВСЕ IP {ISP_NAMES.get(isp, isp).upper()} НЕДОСТУПНЫ!</b>\n"
+                                f"Ни один запасной IP не прошёл проверку.",
+                                parse_mode="HTML"
+                            )
+                        except Exception:
+                            pass
+            else:
+                # Legacy single-IP mode
+                current_ip = rr_read_file(RR_IP_FILE, "").strip()
+                if not current_ip:
+                    print("[auto_ip] current_ip empty, skip")
                     continue
-
-            elif status == "blocked":
-                auto_ip_fail_count += 1
-                auto_ip_down_count = 0
-                print(f"[auto_ip] BLOCKED #{auto_ip_fail_count}/{AUTO_IP_FAIL_THRESHOLD} for {current_ip}")
-                if auto_ip_fail_count >= AUTO_IP_FAIL_THRESHOLD:
-                    switch_reason = "blocked"
-                else:
-                    continue
-
-            if not switch_reason:
-                continue
-
-            # --- Need to switch IP, find replacement ---
-            replaced = False
-            cur_idx = next((i for i, e in enumerate(pool) if e["ip"] == current_ip), -1)
-            ordered = pool[cur_idx + 1:] + pool[:cur_idx]  # start after current, wrap
-            for entry in ordered:
-                # Check if replacement is alive
-                alt_ok = await asyncio.to_thread(
-                    ping_via_ssh, entry["ip"],
-                    entry["ssh_user"], entry["ssh_pass"],
-                    AUTO_IP_TM_CHECK
-                )
-                if alt_ok:
+                new_ip, switch_reason = await _auto_ip_check_single(app, pool, current_ip, "")
+                if new_ip and switch_reason:
                     old_ip = current_ip
-                    new_ip = entry["ip"]
                     changed = []
                     if auto_ip_state.get("ovpn"):
                         rr_write_file(RR_IP_FILE, new_ip + "\n")
@@ -9802,14 +10022,11 @@ async def auto_ip_monitor(app):
                                 _rv["current_ip"] = new_ip
                         save_routers(_rt)
                     rr_append_history(f"AUTO: {old_ip} -> {new_ip} ({'+'.join(changed)}, {switch_reason})")
-                    auto_ip_fail_count = 0
-                    auto_ip_down_count = 0
-                    replaced = True
-                    label = entry.get("label", new_ip)
-                    if switch_reason == "blocked":
-                        reason_text = "🚫 TM заблокировал"
-                    else:
-                        reason_text = "⚠️ Хостинг недоступен"
+                    auto_ip_fail_count["agts"] = 0
+                    auto_ip_down_count["agts"] = 0
+                    label_entry = next((e for e in pool if e["ip"] == new_ip), {})
+                    label = label_entry.get("label", new_ip)
+                    reason_text = "🚫 TM заблокировал" if switch_reason == "blocked" else "⚠️ Хостинг недоступен"
                     try:
                         await app.bot.send_message(
                             ADMIN_ID,
@@ -9823,20 +10040,18 @@ async def auto_ip_monitor(app):
                     except Exception:
                         pass
                     print(f"[auto_ip] Switched {old_ip} -> {new_ip} (reason={switch_reason})")
-                    break
-
-            if not replaced:
-                auto_ip_fail_count = 0
-                auto_ip_down_count = 0
-                try:
-                    await app.bot.send_message(
-                        ADMIN_ID,
-                        "🚨 <b>ВСЕ IP ИЗ ПУЛА НЕДОСТУПНЫ!</b>\n"
-                        "Ни один запасной IP не прошёл проверку.",
-                        parse_mode="HTML"
-                    )
-                except Exception:
-                    pass
+                elif not new_ip and switch_reason:
+                    auto_ip_fail_count["agts"] = 0
+                    auto_ip_down_count["agts"] = 0
+                    try:
+                        await app.bot.send_message(
+                            ADMIN_ID,
+                            "🚨 <b>ВСЕ IP ИЗ ПУЛА НЕДОСТУПНЫ!</b>\n"
+                            "Ни один запасной IP не прошёл проверку.",
+                            parse_mode="HTML"
+                        )
+                    except Exception:
+                        pass
 
         except Exception as e:
             import traceback
@@ -9970,37 +10185,63 @@ async def auto_ip_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pool = load_ip_pool()
     current_ip = rr_read_file(RR_IP_FILE, "").strip()
     pptp_ip = rr_read_file(RR_PPTP_IP_FILE, "").strip()
+    isp_mode = auto_ip_state.get("isp_mode", False)
 
     ovpn_st = "🟢" if auto_ip_state["ovpn"] else "🔴"
     pptp_st = "🟢" if auto_ip_state["pptp"] else "🔴"
     lines = [
         f"<b>🔄 Авто IP</b>",
         f"OVPN: {ovpn_st}  PPTP: {pptp_st}",
-        f"OpenVPN IP: <code>{current_ip}</code>",
+        f"OpenVPN IP (общий): <code>{current_ip}</code>",
         f"PPTP IP: <code>{pptp_ip}</code>",
-        "",
     ]
+    if isp_mode:
+        ip_agts = _get_current_isp_ip("agts") or "—"
+        ip_telekom = _get_current_isp_ip("telekom") or "—"
+        lines.append(f"🏢 АГТС IP: <code>{ip_agts}</code>")
+        lines.append(f"📡 Телеком IP: <code>{ip_telekom}</code>")
+        lines.append("🔀 Режим ISP: <b>ВКЛ</b>")
+    else:
+        lines.append("🔀 Режим ISP: ВЫКЛ")
+    lines.append("")
     if pool:
         for i, entry in enumerate(pool, 1):
             marker = " ◀️" if entry["ip"] == current_ip else ""
+            isp_tag = entry.get("isp", "all")
+            isp_label = ISP_NAMES.get(isp_tag, isp_tag)
             label = entry.get("label", "")
-            lines.append(f"{i}. <code>{entry['ip']}</code> ({label}){marker}")
+            if isp_mode:
+                isp_markers = []
+                if entry["ip"] == auto_ip_state.get("current_agts"):
+                    isp_markers.append("🏢")
+                if entry["ip"] == auto_ip_state.get("current_telekom"):
+                    isp_markers.append("📡")
+                marker = " " + "".join(isp_markers) if isp_markers else ""
+            lines.append(f"{i}. <code>{entry['ip']}</code> ({label}) [{isp_label}]{marker}")
     else:
         lines.append("Пул пуст.")
 
     ovpn_btn = "🔴 OVPN выкл" if auto_ip_state["ovpn"] else "🟢 OVPN вкл"
     pptp_btn = "🔴 PPTP выкл" if auto_ip_state["pptp"] else "🟢 PPTP вкл"
+    isp_btn = "🔀 ISP выкл" if isp_mode else "🔀 ISP вкл"
     kb = [
         [InlineKeyboardButton(ovpn_btn, callback_data='aip_toggle_ovpn'),
          InlineKeyboardButton(pptp_btn, callback_data='aip_toggle_pptp')],
+        [InlineKeyboardButton(isp_btn, callback_data='aip_toggle_isp')],
         [InlineKeyboardButton("➕ Добавить IP", callback_data='aip_add'),
          InlineKeyboardButton("\U0001f5d1 Удалить IP", callback_data='aip_remove')],
         [InlineKeyboardButton("↕️ Порядок", callback_data='aip_reorder'),
          InlineKeyboardButton("🔄 Заменить IP", callback_data='aip_replace')],
         [InlineKeyboardButton("📡 Пинг", callback_data='aip_ping'),
          InlineKeyboardButton("🔎 Сверить", callback_data='aip_compare')],
-        [InlineKeyboardButton("\U0001f3e0 Меню", callback_data='home')],
     ]
+    if isp_mode:
+        kb.append([
+            InlineKeyboardButton("🏢 Сменить АГТС", callback_data='aip_switch_agts'),
+            InlineKeyboardButton("📡 Сменить Телеком", callback_data='aip_switch_telekom'),
+        ])
+        kb.append([InlineKeyboardButton("🏷 Тег ISP", callback_data='aip_set_isp')])
+    kb.append([InlineKeyboardButton("\U0001f3e0 Меню", callback_data='home')])
     await safe_edit_text(q, context, "\n".join(lines), parse_mode="HTML",
                          reply_markup=InlineKeyboardMarkup(kb))
 
@@ -10131,6 +10372,138 @@ async def auto_ip_replace_receive(update: Update, context: ContextTypes.DEFAULT_
     await update.message.reply_text(
         f"✅ IP заменён:\n<code>{old_ip}</code> → <code>{new_ip}</code>{name}\n\nЛогин/пароль/название сохранены.",
         parse_mode="HTML")
+
+async def auto_ip_toggle_isp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggle ISP separation mode."""
+    global auto_ip_state
+    q = update.callback_query
+    await q.answer()
+    auto_ip_state["isp_mode"] = not auto_ip_state.get("isp_mode", False)
+    _save_auto_ip_state(auto_ip_state)
+    if auto_ip_state["isp_mode"]:
+        # Initialize ISP files from current general IP if empty
+        current_ip = rr_read_file(RR_IP_FILE, "").strip()
+        for isp in ISP_LIST:
+            if not _get_current_isp_ip(isp) and current_ip:
+                _set_current_isp_ip(isp, current_ip)
+                auto_ip_state[f"current_{isp}"] = current_ip
+        _save_auto_ip_state(auto_ip_state)
+    await auto_ip_menu(update, context)
+
+
+async def auto_ip_switch_isp(update: Update, context: ContextTypes.DEFAULT_TYPE, isp: str):
+    """Show picker to switch IP for a specific ISP."""
+    q = update.callback_query
+    await q.answer()
+    pool = load_ip_pool()
+    avail = _pool_for_isp(pool, isp)
+    if not avail:
+        await safe_edit_text(q, context,
+            f"Нет IP в пуле для {ISP_NAMES.get(isp, isp)}.\n"
+            f"Добавьте IP или поставьте тег '{ISP_NAMES.get(isp, isp)}' / 'Все'.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀️ Назад", callback_data='aip_menu')]]))
+        return
+    current = _get_current_isp_ip(isp)
+    kb = []
+    for entry in avail:
+        ip = entry["ip"]
+        label = entry.get("label", "")
+        marker = " ◀️ (текущий)" if ip == current else ""
+        kb.append([InlineKeyboardButton(
+            f"{ip} ({label}){marker}",
+            callback_data=f"aip_isp_set:{isp}:{ip}")])
+    kb.append([InlineKeyboardButton("◀️ Назад", callback_data='aip_menu')])
+    await safe_edit_text(q, context,
+        f"Выберите IP для <b>{ISP_NAMES.get(isp, isp)}</b>:",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def auto_ip_isp_set(update: Update, context: ContextTypes.DEFAULT_TYPE, isp: str, ip: str):
+    """Set current IP for a specific ISP."""
+    global auto_ip_state
+    q = update.callback_query
+    await q.answer()
+    old_ip = _get_current_isp_ip(isp)
+    _set_current_isp_ip(isp, ip)
+    auto_ip_state[f"current_{isp}"] = ip
+    _save_auto_ip_state(auto_ip_state)
+    rr_append_history(f"ISP-{isp.upper()}: {old_ip} -> {ip}")
+    await safe_edit_text(q, context,
+        f"✅ <b>{ISP_NAMES.get(isp, isp)}</b> IP сменён:\n"
+        f"<code>{old_ip}</code> → <code>{ip}</code>\n"
+        f"Роутеры {ISP_NAMES.get(isp, isp)} подхватят через RR.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("◀️ Авто IP", callback_data='aip_menu')]]))
+
+
+async def auto_ip_set_isp_tag(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show pool entries to tag with ISP."""
+    q = update.callback_query
+    await q.answer()
+    pool = load_ip_pool()
+    if not pool:
+        await safe_edit_text(q, context, "Пул пуст.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀️ Назад", callback_data='aip_menu')]]))
+        return
+    kb = []
+    for i, entry in enumerate(pool):
+        ip = entry["ip"]
+        isp = entry.get("isp", "all")
+        label = entry.get("label", "")
+        isp_label = ISP_NAMES.get(isp, isp)
+        kb.append([InlineKeyboardButton(
+            f"{ip} ({label}) [{isp_label}]",
+            callback_data=f"aip_tag_pick:{i}")])
+    kb.append([InlineKeyboardButton("◀️ Назад", callback_data='aip_menu')])
+    await safe_edit_text(q, context,
+        "🏷 <b>Тег ISP</b>\nВыберите сервер для изменения тега:",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def auto_ip_tag_pick(update: Update, context: ContextTypes.DEFAULT_TYPE, idx: int):
+    """Show ISP options for a pool entry."""
+    q = update.callback_query
+    await q.answer()
+    pool = load_ip_pool()
+    if idx >= len(pool):
+        await safe_edit_text(q, context, "Ошибка: индекс вне пула.")
+        return
+    entry = pool[idx]
+    ip = entry["ip"]
+    label = entry.get("label", "")
+    kb = [
+        [InlineKeyboardButton("🏢 АГТС", callback_data=f"aip_tag_set:{idx}:agts"),
+         InlineKeyboardButton("📡 Телеком", callback_data=f"aip_tag_set:{idx}:telekom")],
+        [InlineKeyboardButton("🌐 Все", callback_data=f"aip_tag_set:{idx}:all")],
+        [InlineKeyboardButton("◀️ Назад", callback_data='aip_set_isp')],
+    ]
+    await safe_edit_text(q, context,
+        f"🏷 Тег для <code>{ip}</code> ({label}):",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def auto_ip_tag_set(update: Update, context: ContextTypes.DEFAULT_TYPE, idx: int, isp: str):
+    """Apply ISP tag to a pool entry."""
+    q = update.callback_query
+    await q.answer()
+    pool = load_ip_pool()
+    if idx >= len(pool):
+        await safe_edit_text(q, context, "Ошибка: индекс вне пула.")
+        return
+    pool[idx]["isp"] = isp
+    save_ip_pool(pool)
+    ip = pool[idx]["ip"]
+    label = pool[idx].get("label", "")
+    isp_label = ISP_NAMES.get(isp, isp)
+    await safe_edit_text(q, context,
+        f"✅ <code>{ip}</code> ({label}) → тег: <b>{isp_label}</b>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("◀️ Авто IP", callback_data='aip_menu')]]))
+
 
 async def auto_ip_ping_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Ping all IPs in the pool once and show results."""
