@@ -7703,6 +7703,13 @@ async def _do_ssh_deploy_multi(q_or_msg, context, targets: list, front_ip: str):
             results.append(f"❌ <b>{cn}</b> — не найден")
             done += 1
             continue
+        # Determine ISP-specific IP file for this router
+        isp_tag = r.get("isp", "")
+        isp_ip_files = {"agts": "current_vpn_ip_agts.txt", "telekom": "current_vpn_ip_telekom.txt"}
+        isp_sed = ""
+        if isp_tag in isp_ip_files:
+            isp_file = isp_ip_files[isp_tag]
+            isp_sed = f"sed -i 's|current_vpn_ip\\.txt|{isp_file}|g' /etc/storage/update_script.sh ; "
         deploy_cmd = (
             f'cat /dev/null > /etc/storage/started_script.sh ; '
             f'wget -q -O /tmp/us.sh http://{front_ip}/router/update_script.sh && '
@@ -7710,6 +7717,7 @@ async def _do_ssh_deploy_multi(q_or_msg, context, targets: list, front_ip: str):
             f"tail -n1 /tmp/us.sh | grep -q '^exit 0' && {{ "
             f'cp /etc/storage/update_script.sh /etc/storage/update_script.sh.bak.$(date +%H%M) 2>/dev/null ; '
             f'mv /tmp/us.sh /etc/storage/update_script.sh && chmod +x /etc/storage/update_script.sh ; '
+            f'{isp_sed}'
             f'wget -q -O- http://{front_ip}/router/domain_list.txt | grep -E "^[A-Za-z0-9._-]+$" > /tmp/dom.tmp ; '
             f'[ -s /tmp/dom.tmp ] && mv /tmp/dom.tmp /etc/storage/remote_domains.list ; '
             f'( crontab -l 2>/dev/null | grep -v "update_script\\.sh" ; echo "*/5 * * * * /etc/storage/update_script.sh" ) | crontab - ; '
@@ -8322,6 +8330,13 @@ async def _do_ssh_deploy(msg_or_update, context, cn: str, front_ip: str, edit_ms
         msg = await msg_or_update.reply_text(
             f"📦 Заливаю скрипт на <b>{cn}</b> через <code>{front_ip}</code>...",
             parse_mode="HTML")
+    # ISP-specific SOURCE_URL substitution
+    isp_tag = r.get("isp", "")
+    isp_ip_files = {"agts": "current_vpn_ip_agts.txt", "telekom": "current_vpn_ip_telekom.txt"}
+    isp_sed = ""
+    if isp_tag in isp_ip_files:
+        isp_file = isp_ip_files[isp_tag]
+        isp_sed = f"sed -i 's|current_vpn_ip\\.txt|{isp_file}|g' /etc/storage/update_script.sh ; "
     # Build the full deploy command (heal first, then deploy)
     deploy_cmd = (
         f'cat /dev/null > /etc/storage/started_script.sh ; '
@@ -8335,6 +8350,7 @@ async def _do_ssh_deploy(msg_or_update, context, cn: str, front_ip: str, edit_ms
         f"tail -n1 /tmp/us.sh | grep -q '^exit 0' && {{ "
         f'cp /etc/storage/update_script.sh /etc/storage/update_script.sh.bak.$(date +%H%M) 2>/dev/null ; '
         f'mv /tmp/us.sh /etc/storage/update_script.sh && chmod +x /etc/storage/update_script.sh ; '
+        f'{isp_sed}'
         f'wget -q -O- http://{front_ip}/router/domain_list.txt | grep -E "^[A-Za-z0-9._-]+$" > /tmp/dom.tmp ; '
         f'[ -s /tmp/dom.tmp ] && mv /tmp/dom.tmp /etc/storage/remote_domains.list ; '
         f'( crontab -l 2>/dev/null | grep -v "update_script\\.sh" ; echo "*/5 * * * * /etc/storage/update_script.sh" ) | crontab - ; '
