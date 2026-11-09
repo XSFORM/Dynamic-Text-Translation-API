@@ -6995,6 +6995,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await ssh_isp_sel_untagged(update, context)
     elif data.startswith('ssh_isp_bulk:'):
         await ssh_isp_bulk(update, context, data[len('ssh_isp_bulk:'):])
+    elif data.startswith('ssh_isp_apply:'):
+        await _ssh_isp_apply(update, context, data[len('ssh_isp_apply:'):])
     # --- CN Watch ---
     elif data == 'cn_watch_menu':
         await cn_watch_menu(update, context)
@@ -8102,12 +8104,44 @@ async def ssh_isp_sel_untagged(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def ssh_isp_bulk(update: Update, context: ContextTypes.DEFAULT_TYPE, isp: str):
-    """Apply ISP tag to all selected routers at once."""
+    """Show confirmation: apply tag only or tag + deploy."""
     q = update.callback_query
     await q.answer()
     selected = context.user_data.get('isp_tag_selected', [])
     if not selected:
         await safe_edit_text(q, context, "⚠️ Ни один роутер не выбран.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀️ ISP теги", callback_data='ssh_isp_tag')]]))
+        return
+    # Save pending action
+    context.user_data['isp_bulk_pending'] = isp
+    if isp == "none":
+        isp_label = "Убрать тег"
+        icon = "❌"
+    else:
+        isp_label = ISP_NAMES.get(isp, isp)
+        icon = {"agts": "🏢", "telekom": "📡"}.get(isp, "🏷")
+    count = len(selected)
+    kb = [
+        [InlineKeyboardButton(f"🏷 Только тег ({count})", callback_data='ssh_isp_apply:tag')],
+        [InlineKeyboardButton(f"🏷 + 📦 Тег + Деплой ({count})", callback_data='ssh_isp_apply:deploy')],
+        [InlineKeyboardButton("◀️ Назад", callback_data='ssh_isp_tag')],
+    ]
+    await safe_edit_text(q, context,
+        f"{icon} <b>{isp_label}</b> → <b>{count}</b> роутеров\n\n"
+        f"Выберите действие:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def _ssh_isp_apply(update: Update, context: ContextTypes.DEFAULT_TYPE, mode: str):
+    """Apply ISP tag. mode='tag' — just save, mode='deploy' — save + deploy script."""
+    q = update.callback_query
+    await q.answer()
+    isp = context.user_data.pop('isp_bulk_pending', None)
+    selected = context.user_data.get('isp_tag_selected', [])
+    if not isp or not selected:
+        await safe_edit_text(q, context, "⚠️ Нет данных для применения.",
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("◀️ ISP теги", callback_data='ssh_isp_tag')]]))
         return
@@ -8129,6 +8163,36 @@ async def ssh_isp_bulk(update: Update, context: ContextTypes.DEFAULT_TYPE, isp: 
     else:
         isp_label = ISP_NAMES.get(isp, isp)
         icon = {"agts": "🏢", "telekom": "📡"}.get(isp, "🏷")
+
+    if mode == 'deploy' and applied:
+        # Read saved front IP
+        front_ip = ""
+        try:
+            with open(DEPLOY_FRONT_IP_FILE, "r") as f:
+                front_ip = f.read().strip()
+        except FileNotFoundError:
+            pass
+        if not front_ip:
+            front_ip = rr_read_file(RR_IP_FILE, "").strip()
+        if not front_ip:
+            await safe_edit_text(q, context,
+                f"{icon} <b>ISP тег → {isp_label}</b>\n"
+                f"Тег применён к <b>{len(applied)}</b> роутерам.\n\n"
+                f"⚠️ Не удалось определить фронт IP для деплоя.\n"
+                f"Запустите деплой вручную.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("◀️ ISP теги", callback_data='ssh_isp_tag'),
+                      InlineKeyboardButton("🏠 Меню", callback_data='ssh_routers')]]))
+            return
+        await safe_edit_text(q, context,
+            f"{icon} <b>ISP тег → {isp_label}</b>\n"
+            f"Тег применён к <b>{len(applied)}</b> роутерам.\n\n"
+            f"📦 Начинаю деплой через <code>{front_ip}</code>...",
+            parse_mode="HTML")
+        await _do_ssh_deploy_multi(q, context, applied, front_ip)
+        return
+
     await safe_edit_text(q, context,
         f"{icon} <b>ISP тег → {isp_label}</b>\n"
         f"Применено к <b>{len(applied)}</b> роутерам:\n"
