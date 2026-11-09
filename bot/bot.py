@@ -182,6 +182,8 @@ def anon_id_to_cn(anon_id: str) -> str:
 AUTO_IP_POOL_FILE = "/root/monitor_bot/ip_pool.json"
 AUTO_IP_STATE_FILE = "/root/monitor_bot/auto_ip_state.json"
 DEPLOY_FRONT_IP_FILE = "/root/monitor_bot/deploy_front_ip.txt"
+NOTES_FILE = "/root/monitor_bot/notes.json"
+CN_WATCH_FILE = "/root/monitor_bot/cn_watch.json"
 AUTO_IP_TM_CHECK = "217.174.235.161"       # Turkmentelecom probe IP
 AUTO_IP_NET_CONTROL = "1.1.1.1"            # neutral IP to check if front has internet
 AUTO_IP_FAIL_THRESHOLD = 3                  # consecutive ping fails before switch
@@ -217,6 +219,35 @@ def _save_auto_ip_state(state: dict):
 
 auto_ip_state = _load_auto_ip_state()
 auto_ip_enabled = auto_ip_state["ovpn"] or auto_ip_state["pptp"]  # compat
+
+# --- Notes ---
+def load_notes() -> list:
+    if os.path.exists(NOTES_FILE):
+        try:
+            with open(NOTES_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return []
+
+def save_notes(notes: list):
+    with open(NOTES_FILE, "w") as f:
+        json.dump(notes, f, indent=2, ensure_ascii=False)
+
+# --- CN Online Watch ---
+def load_cn_watch() -> list:
+    """Returns list of {"cn": str, "mode": "notify"|"deploy", "added": str}."""
+    if os.path.exists(CN_WATCH_FILE):
+        try:
+            with open(CN_WATCH_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return []
+
+def save_cn_watch(watch: list):
+    with open(CN_WATCH_FILE, "w") as f:
+        json.dump(watch, f, indent=2, ensure_ascii=False)
 
 def load_ip_pool() -> list:
     if os.path.exists(AUTO_IP_POOL_FILE):
@@ -5895,6 +5926,7 @@ def _kb_system():
         [InlineKeyboardButton("🚨 Тревога", callback_data='block_alert'),
          InlineKeyboardButton("⚡ Перезагрузка", callback_data='restart_menu')],
         [InlineKeyboardButton("📥 Git Pull", callback_data='git_pull')],
+        [InlineKeyboardButton("📝 Заметки", callback_data='notes_menu')],
         [InlineKeyboardButton("◀️ Главное меню", callback_data='home')],
     ])
 
@@ -6176,6 +6208,13 @@ async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_T
         await create_key_handler(update, context); return
     if context.user_data.get('await_remote_input'):
         await process_remote_input(update, context); return
+    # Notes text inputs
+    if context.user_data.get('await_note_add'):
+        context.user_data.pop('await_note_add', None)
+        await note_add_text(update, context); return
+    if context.user_data.get('await_note_edit') is not None:
+        idx = context.user_data.pop('await_note_edit')
+        await note_edit_text(update, context, idx); return
     # SSH Routers text inputs
     # await_ssh_add stays active for multi-add; skip if ANY other await is active
     _other_awaits = [k for k in context.user_data if k.startswith('await_') and k != 'await_ssh_add']
@@ -6897,6 +6936,39 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await ssh_isp_sel_untagged(update, context)
     elif data.startswith('ssh_isp_bulk:'):
         await ssh_isp_bulk(update, context, data[len('ssh_isp_bulk:'):])
+    # --- CN Watch ---
+    elif data == 'cn_watch_menu':
+        await cn_watch_menu(update, context)
+    elif data == 'cn_watch_add':
+        await cn_watch_add(update, context)
+    elif data.startswith('cn_watch_toggle:'):
+        await cn_watch_toggle(update, context, data[len('cn_watch_toggle:'):])
+    elif data.startswith('cn_watch_apply:'):
+        await cn_watch_apply(update, context, data[len('cn_watch_apply:'):])
+    elif data.startswith('cn_watch_detail:'):
+        await cn_watch_detail(update, context, int(data[len('cn_watch_detail:'):]))
+    elif data.startswith('cn_watch_mode:'):
+        parts = data[len('cn_watch_mode:'):].split(':', 1)
+        await cn_watch_mode_change(update, context, int(parts[0]), parts[1])
+    elif data.startswith('cn_watch_del:'):
+        await cn_watch_del(update, context, int(data[len('cn_watch_del:'):]))
+    elif data == 'cn_watch_clear':
+        await cn_watch_clear(update, context)
+    # --- Notes ---
+    elif data == 'notes_menu':
+        await notes_menu(update, context)
+    elif data == 'note_add':
+        await note_add_start(update, context)
+    elif data.startswith('note_view:'):
+        await note_view(update, context, int(data[len('note_view:'):]))
+    elif data.startswith('note_edit:'):
+        await note_edit_start(update, context, int(data[len('note_edit:'):]))
+    elif data.startswith('note_del:'):
+        await note_delete(update, context, int(data[len('note_del:'):]))
+    elif data == 'note_clear_confirm':
+        await note_clear_confirm(update, context)
+    elif data == 'note_clear_yes':
+        await note_clear_yes(update, context)
     elif data == 'ssh_ping_all':
         await ssh_ping_all(update, context)
     elif data == 'ssh_check_ver':
@@ -7868,11 +7940,15 @@ async def ssh_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📝 Конфиг OpenVPN", callback_data='oec_menu')],
         [InlineKeyboardButton("🔗 Обратный туннель", callback_data='rt_menu')],
         [InlineKeyboardButton("🏷 ISP тег роутера", callback_data='ssh_isp_tag')],
+        [InlineKeyboardButton("👁 Ожидание онлайн", callback_data='cn_watch_menu')],
         [InlineKeyboardButton("🏠 В главное меню", callback_data='home')],
     ]
+    # CN watch count
+    watch = load_cn_watch()
+    watch_info = f" | 👁 На контроле: {len(watch)}" if watch else ""
     await safe_edit_text(q, context,
         "🖥 <b>SSH Роутеры</b>\n\n"
-        f"Сохранено роутеров: {count}",
+        f"Сохранено роутеров: {count}{watch_info}",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
 async def ssh_list_routers(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8025,6 +8101,394 @@ async def ssh_isp_bulk(update: Update, context: ContextTypes.DEFAULT_TYPE, isp: 
         reply_markup=InlineKeyboardMarkup(
             [[InlineKeyboardButton("◀️ ISP теги", callback_data='ssh_isp_tag'),
               InlineKeyboardButton("🏠 Меню", callback_data='ssh_routers')]]))
+
+
+# =====================================================================
+#  NOTES (Заметки)
+# =====================================================================
+async def notes_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    notes = load_notes()
+    kb = []
+    if notes:
+        for i, note in enumerate(notes):
+            short = note["text"][:40] + ("…" if len(note["text"]) > 40 else "")
+            kb.append([InlineKeyboardButton(f"📄 {short}", callback_data=f"note_view:{i}")])
+    kb.append([InlineKeyboardButton("➕ Добавить заметку", callback_data='note_add')])
+    if notes:
+        kb.append([InlineKeyboardButton("🗑 Удалить все", callback_data='note_clear_confirm')])
+    kb.append([InlineKeyboardButton("◀️ Назад", callback_data='menu_system')])
+    count = len(notes)
+    await safe_edit_text(q, context,
+        f"📝 <b>Заметки</b>\n\nВсего: {count}",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def note_view(update: Update, context: ContextTypes.DEFAULT_TYPE, idx: int):
+    q = update.callback_query
+    await q.answer()
+    notes = load_notes()
+    if idx >= len(notes):
+        await safe_edit_text(q, context, "Заметка не найдена.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='notes_menu')]]))
+        return
+    note = notes[idx]
+    text = escape(note["text"])
+    ts = note.get("ts", "")
+    kb = [
+        [InlineKeyboardButton("✏️ Редактировать", callback_data=f"note_edit:{idx}"),
+         InlineKeyboardButton("🗑 Удалить", callback_data=f"note_del:{idx}")],
+        [InlineKeyboardButton("◀️ Заметки", callback_data='notes_menu')],
+    ]
+    await safe_edit_text(q, context,
+        f"📄 <b>Заметка #{idx+1}</b>  <i>{ts}</i>\n\n{text}",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def note_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    context.user_data.pop('await_note_edit', None)
+    context.user_data['await_note_add'] = True
+    await safe_edit_text(q, context,
+        "📝 Напишите текст заметки:",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("❌ Отмена", callback_data='notes_menu')]]))
+
+
+async def note_add_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle note text from user message."""
+    text = update.message.text.strip()
+    if not text:
+        await update.message.reply_text("Пустая заметка, попробуйте ещё раз.")
+        return
+    from datetime import datetime
+    notes = load_notes()
+    notes.append({"text": text, "ts": datetime.now().strftime("%d.%m.%Y %H:%M")})
+    save_notes(notes)
+    await update.message.reply_text(
+        f"✅ Заметка #{len(notes)} сохранена.",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("📝 Заметки", callback_data='notes_menu')]]))
+
+
+async def note_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE, idx: int):
+    q = update.callback_query
+    await q.answer()
+    notes = load_notes()
+    if idx >= len(notes):
+        await safe_edit_text(q, context, "Заметка не найдена.")
+        return
+    context.user_data.pop('await_note_add', None)
+    context.user_data['await_note_edit'] = idx
+    await safe_edit_text(q, context,
+        f"✏️ Текущий текст:\n<code>{escape(notes[idx]['text'][:500])}</code>\n\n"
+        f"Отправьте новый текст:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("❌ Отмена", callback_data=f'note_view:{idx}')]]))
+
+
+async def note_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE, idx: int):
+    text = update.message.text.strip()
+    if not text:
+        await update.message.reply_text("Пустой текст.")
+        return
+    from datetime import datetime
+    notes = load_notes()
+    if idx >= len(notes):
+        await update.message.reply_text("Заметка не найдена.")
+        return
+    notes[idx]["text"] = text
+    notes[idx]["ts"] = datetime.now().strftime("%d.%m.%Y %H:%M") + " (ред.)"
+    save_notes(notes)
+    await update.message.reply_text(
+        f"✅ Заметка #{idx+1} обновлена.",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("📝 Заметки", callback_data='notes_menu')]]))
+
+
+async def note_delete(update: Update, context: ContextTypes.DEFAULT_TYPE, idx: int):
+    q = update.callback_query
+    await q.answer()
+    notes = load_notes()
+    if idx < len(notes):
+        notes.pop(idx)
+        save_notes(notes)
+    await safe_edit_text(q, context, "🗑 Заметка удалена.",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("📝 Заметки", callback_data='notes_menu')]]))
+
+
+async def note_clear_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await safe_edit_text(q, context, "⚠️ Удалить <b>все</b> заметки?",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Да, удалить", callback_data='note_clear_yes'),
+             InlineKeyboardButton("❌ Нет", callback_data='notes_menu')]]))
+
+
+async def note_clear_yes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    save_notes([])
+    await safe_edit_text(q, context, "🗑 Все заметки удалены.",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("📝 Заметки", callback_data='notes_menu')]]))
+
+
+# =====================================================================
+#  CN ONLINE WATCH (Ожидание онлайн)
+# =====================================================================
+async def cn_watch_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    watch = load_cn_watch()
+    kb = []
+    if watch:
+        for i, w in enumerate(watch):
+            cn = w["cn"]
+            mode = "📦" if w.get("mode") == "deploy" else "🔔"
+            kb.append([InlineKeyboardButton(
+                f"{mode} {cn}", callback_data=f"cn_watch_detail:{i}")])
+    kb.append([InlineKeyboardButton("➕ Добавить", callback_data='cn_watch_add')])
+    if watch:
+        kb.append([InlineKeyboardButton("🗑 Очистить список", callback_data='cn_watch_clear')])
+    kb.append([InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')])
+    mode_legend = "🔔 = уведомить  📦 = уведомить + авто-деплой"
+    await safe_edit_text(q, context,
+        f"👁 <b>Ожидание онлайн</b>\n\n"
+        f"На контроле: <b>{len(watch)}</b>\n"
+        f"<i>{mode_legend}</i>",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def cn_watch_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show multi-select of offline routers to add to watch."""
+    q = update.callback_query
+    await q.answer()
+    routers = load_routers()
+    online = get_online_clients()
+    watch = load_cn_watch()
+    watched_cns = {w["cn"] for w in watch}
+    selected = context.user_data.get('cn_watch_selected', [])
+    kb = []
+    for cn in sorted(routers.keys(), key=_natural_key):
+        if cn in watched_cns:
+            continue  # already watched
+        status = "🟢" if cn in online else "🔴"
+        check = "☑️" if cn in selected else "☐"
+        kb.append([InlineKeyboardButton(
+            f"{check} {status} {cn}", callback_data=f"cn_watch_toggle:{cn}")])
+    if not kb:
+        await safe_edit_text(q, context, "Нет роутеров для добавления.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀️ Назад", callback_data='cn_watch_menu')]]))
+        return
+    count = len(selected)
+    kb.append([
+        InlineKeyboardButton(f"🔔 Уведомить ({count})", callback_data='cn_watch_apply:notify'),
+        InlineKeyboardButton(f"📦 + Деплой ({count})", callback_data='cn_watch_apply:deploy'),
+    ])
+    kb.append([InlineKeyboardButton("◀️ Назад", callback_data='cn_watch_menu')])
+    await safe_edit_text(q, context,
+        f"👁 Выберите роутеры для отслеживания:\n"
+        f"Выбрано: <b>{count}</b>",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def cn_watch_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE, cn: str):
+    q = update.callback_query
+    await q.answer()
+    sel = context.user_data.get('cn_watch_selected', [])
+    if cn in sel:
+        sel.remove(cn)
+    else:
+        sel.append(cn)
+    context.user_data['cn_watch_selected'] = sel
+    await cn_watch_add(update, context)
+
+
+async def cn_watch_apply(update: Update, context: ContextTypes.DEFAULT_TYPE, mode: str):
+    q = update.callback_query
+    await q.answer()
+    selected = context.user_data.get('cn_watch_selected', [])
+    if not selected:
+        await safe_edit_text(q, context, "⚠️ Ни один роутер не выбран.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀️ Назад", callback_data='cn_watch_add')]]))
+        return
+    from datetime import datetime
+    watch = load_cn_watch()
+    watched_cns = {w["cn"] for w in watch}
+    for cn in selected:
+        if cn not in watched_cns:
+            watch.append({"cn": cn, "mode": mode,
+                          "added": datetime.now().strftime("%d.%m.%Y %H:%M")})
+    save_cn_watch(watch)
+    context.user_data['cn_watch_selected'] = []
+    mode_label = "🔔 уведомление" if mode == "notify" else "📦 уведомление + авто-деплой"
+    await safe_edit_text(q, context,
+        f"✅ Добавлено <b>{len(selected)}</b> роутеров\n"
+        f"Режим: {mode_label}",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("👁 Список", callback_data='cn_watch_menu'),
+              InlineKeyboardButton("🏠 Меню", callback_data='ssh_routers')]]))
+
+
+async def cn_watch_detail(update: Update, context: ContextTypes.DEFAULT_TYPE, idx: int):
+    q = update.callback_query
+    await q.answer()
+    watch = load_cn_watch()
+    if idx >= len(watch):
+        await safe_edit_text(q, context, "Не найдено.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀️ Назад", callback_data='cn_watch_menu')]]))
+        return
+    w = watch[idx]
+    mode_label = "📦 Уведомить + авто-деплой" if w["mode"] == "deploy" else "🔔 Только уведомить"
+    online = get_online_clients()
+    status = "🟢 Онлайн" if w["cn"] in online else "🔴 Оффлайн"
+    # Toggle mode
+    other_mode = "notify" if w["mode"] == "deploy" else "deploy"
+    other_label = "🔔 Только уведомить" if other_mode == "notify" else "📦 + Авто-деплой"
+    kb = [
+        [InlineKeyboardButton(f"🔄 → {other_label}", callback_data=f"cn_watch_mode:{idx}:{other_mode}")],
+        [InlineKeyboardButton("🗑 Убрать из списка", callback_data=f"cn_watch_del:{idx}")],
+        [InlineKeyboardButton("◀️ Назад", callback_data='cn_watch_menu')],
+    ]
+    await safe_edit_text(q, context,
+        f"👁 <b>{w['cn']}</b>\n\n"
+        f"Статус: {status}\n"
+        f"Режим: {mode_label}\n"
+        f"Добавлен: {w.get('added', '—')}",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def cn_watch_mode_change(update: Update, context: ContextTypes.DEFAULT_TYPE, idx: int, mode: str):
+    q = update.callback_query
+    await q.answer()
+    watch = load_cn_watch()
+    if idx < len(watch):
+        watch[idx]["mode"] = mode
+        save_cn_watch(watch)
+    await cn_watch_detail(update, context, idx)
+
+
+async def cn_watch_del(update: Update, context: ContextTypes.DEFAULT_TYPE, idx: int):
+    q = update.callback_query
+    await q.answer()
+    watch = load_cn_watch()
+    removed = ""
+    if idx < len(watch):
+        removed = watch[idx]["cn"]
+        watch.pop(idx)
+        save_cn_watch(watch)
+    await safe_edit_text(q, context,
+        f"🗑 <b>{removed}</b> убран из списка.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("👁 Список", callback_data='cn_watch_menu')]]))
+
+
+async def cn_watch_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    save_cn_watch([])
+    await safe_edit_text(q, context, "🗑 Список очищен.",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("◀️ Назад", callback_data='cn_watch_menu')]]))
+
+
+async def _cn_watch_check(app):
+    """Called from auto_ip_monitor loop to check watched CNs."""
+    watch = load_cn_watch()
+    if not watch:
+        return
+    online = get_online_clients()
+    changed = False
+    for w in list(watch):
+        cn = w["cn"]
+        if cn in online:
+            mode = w.get("mode", "notify")
+            if mode == "deploy":
+                # Auto-deploy
+                routers = load_routers()
+                r = routers.get(cn)
+                front_ip = ""
+                try:
+                    with open(DEPLOY_FRONT_IP_FILE) as f:
+                        front_ip = f.read().strip()
+                except Exception:
+                    pass
+                if r and front_ip:
+                    isp_tag = r.get("isp", "")
+                    isp_vpn_files = {"agts": "current_vpn_ip_agts.txt", "telekom": "current_vpn_ip_telekom.txt"}
+                    isp_pptp_files = {"agts": "current_pptp_ip_agts.txt", "telekom": "current_pptp_ip_telekom.txt"}
+                    isp_sed = ""
+                    if isp_tag in isp_vpn_files:
+                        isp_sed = (
+                            f"sed -i 's|current_vpn_ip\\.txt|{isp_vpn_files[isp_tag]}|g' /etc/storage/update_script.sh ; "
+                            f"sed -i 's|current_pptp_ip\\.txt|{isp_pptp_files[isp_tag]}|g' /etc/storage/update_script.sh ; "
+                        )
+                    deploy_cmd = (
+                        f'wget -q -O /tmp/us.sh http://{front_ip}/router/update_script.sh && '
+                        f'[ "$(grep -c is_reserved_ipv4 /tmp/us.sh)" -ge 3 ] && '
+                        f"tail -n1 /tmp/us.sh | grep -q '^exit 0' && {{ "
+                        f'cp /etc/storage/update_script.sh /etc/storage/update_script.sh.bak.$(date +%H%M) 2>/dev/null ; '
+                        f'mv /tmp/us.sh /etc/storage/update_script.sh && chmod +x /etc/storage/update_script.sh ; '
+                        f'{isp_sed}'
+                        f'mtd_storage.sh save ; '
+                        f'echo OK ; }} || echo FAIL'
+                    )
+                    ip = get_router_ip(cn)
+                    pw = r.get("password", "admin")
+                    result = "❌ Не удалось"
+                    try:
+                        proc = await asyncio.create_subprocess_exec(
+                            "sshpass", "-p", pw, "ssh", "-o", "StrictHostKeyChecking=no",
+                            "-o", "ConnectTimeout=15", f"admin@{ip}",
+                            deploy_cmd,
+                            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
+                        out = stdout.decode(errors="replace").strip()
+                        if "OK" in out:
+                            result = "✅ Деплой успешен"
+                        else:
+                            result = f"❌ {out[:100]}"
+                    except Exception as e:
+                        result = f"❌ {str(e)[:100]}"
+                    try:
+                        await app.bot.send_message(ADMIN_ID,
+                            f"👁 <b>{cn}</b> появился онлайн!\n\n"
+                            f"📦 Авто-деплой: {result}",
+                            parse_mode="HTML")
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        await app.bot.send_message(ADMIN_ID,
+                            f"👁 <b>{cn}</b> появился онлайн!\n"
+                            f"⚠️ Авто-деплой невозможен (нет front IP или роутера).",
+                            parse_mode="HTML")
+                    except Exception:
+                        pass
+            else:
+                # Notify only
+                try:
+                    await app.bot.send_message(ADMIN_ID,
+                        f"👁 <b>{cn}</b> появился онлайн!",
+                        parse_mode="HTML")
+                except Exception:
+                    pass
+            watch.remove(w)
+            changed = True
+    if changed:
+        save_cn_watch(watch)
 
 
 async def ssh_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -10066,6 +10530,11 @@ async def auto_ip_monitor(app):
     while True:
         try:
             await asyncio.sleep(AUTO_IP_CHECK_INTERVAL)
+            # CN Online Watch — always runs regardless of auto IP state
+            try:
+                await _cn_watch_check(app)
+            except Exception as e:
+                print(f"[cn_watch] error: {e}")
             if not auto_ip_state.get("ovpn") and not auto_ip_state.get("pptp"):
                 continue
 
