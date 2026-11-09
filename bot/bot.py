@@ -6059,14 +6059,52 @@ async def _reply_kb_gost(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🌐 <b>GOST Серверы</b> — управление\nСерверов: <b>{count}</b>",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
-async def _reply_kb_autoip(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle '🔄 Авто IP' reply keyboard button."""
+def _auto_ip_pool_lines(pool: list, current_ip: str, isp_mode: bool) -> list:
+    """Build pool display lines, grouped by ISP in ISP mode."""
+    lines = []
+    if not pool:
+        lines.append("Пул пуст.")
+        return lines
+    if isp_mode:
+        groups = {"agts": [], "telekom": [], "all": []}
+        for i, entry in enumerate(pool, 1):
+            isp_tag = entry.get("isp", "all")
+            label = entry.get("label", "")
+            isp_markers = []
+            if entry["ip"] == auto_ip_state.get("current_agts"):
+                isp_markers.append("🏢")
+            if entry["ip"] == auto_ip_state.get("current_telekom"):
+                isp_markers.append("📡")
+            marker = " " + "".join(isp_markers) if isp_markers else ""
+            line = f"{i}. <code>{entry['ip']}</code> ({label}){marker}"
+            groups.setdefault(isp_tag, []).append(line)
+        if groups.get("agts"):
+            lines.append("━━━ 🏢 <b>АГТС</b> ━━━")
+            lines.extend(groups["agts"])
+        if groups.get("telekom"):
+            lines.append("━━━ 📡 <b>Телеком</b> ━━━")
+            lines.extend(groups["telekom"])
+        if groups.get("all"):
+            lines.append("━━━ 🌐 <b>Все</b> ━━━")
+            lines.extend(groups["all"])
+    else:
+        for i, entry in enumerate(pool, 1):
+            marker = " ◀️" if entry["ip"] == current_ip else ""
+            isp_tag = entry.get("isp", "all")
+            isp_label = ISP_NAMES.get(isp_tag, isp_tag)
+            label = entry.get("label", "")
+            lines.append(f"{i}. <code>{entry['ip']}</code> ({label}) [{isp_label}]{marker}")
+    return lines
+
+
+def _auto_ip_text_and_kb() -> tuple:
+    """Build shared text and keyboard for Auto IP menu."""
     pool = load_ip_pool()
     current_ip = rr_read_file(RR_IP_FILE, "").strip()
     pptp_ip = rr_read_file(RR_PPTP_IP_FILE, "").strip()
+    isp_mode = auto_ip_state.get("isp_mode", False)
     ovpn_st = "🟢" if auto_ip_state["ovpn"] else "🔴"
     pptp_st = "🟢" if auto_ip_state["pptp"] else "🔴"
-    isp_mode = auto_ip_state.get("isp_mode", False)
     lines = [
         f"<b>🔄 Авто IP</b>",
         f"OVPN: {ovpn_st}  PPTP: {pptp_st}",
@@ -6084,23 +6122,7 @@ async def _reply_kb_autoip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         lines.append("🔀 Режим ISP: ВЫКЛ")
     lines.append("")
-    if pool:
-        for i, entry in enumerate(pool, 1):
-            marker = " ◀️" if entry["ip"] == current_ip else ""
-            isp_tag = entry.get("isp", "all")
-            isp_label = ISP_NAMES.get(isp_tag, isp_tag)
-            label = entry.get("label", "")
-            # show ISP-specific markers in ISP mode
-            if isp_mode:
-                isp_markers = []
-                if entry["ip"] == auto_ip_state.get("current_agts"):
-                    isp_markers.append("🏢")
-                if entry["ip"] == auto_ip_state.get("current_telekom"):
-                    isp_markers.append("📡")
-                marker = " " + "".join(isp_markers) if isp_markers else ""
-            lines.append(f"{i}. <code>{entry['ip']}</code> ({label}) [{isp_label}]{marker}")
-    else:
-        lines.append("Пул пуст.")
+    lines.extend(_auto_ip_pool_lines(pool, current_ip, isp_mode))
     ovpn_btn = "🔴 OVPN выкл" if auto_ip_state["ovpn"] else "🟢 OVPN вкл"
     pptp_btn = "🔴 PPTP выкл" if auto_ip_state["pptp"] else "🟢 PPTP вкл"
     isp_btn = "🔀 ISP выкл" if isp_mode else "🔀 ISP вкл"
@@ -6123,7 +6145,13 @@ async def _reply_kb_autoip(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
         kb.append([InlineKeyboardButton("🏷 Тег ISP", callback_data='aip_set_isp')])
     kb.append([InlineKeyboardButton("\U0001f3e0 Меню", callback_data='home')])
-    await update.message.reply_text("\n".join(lines),
+    return "\n".join(lines), kb
+
+
+async def _reply_kb_autoip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle '🔄 Авто IP' reply keyboard button."""
+    text, kb = _auto_ip_text_and_kb()
+    await update.message.reply_text(text,
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
 async def _reply_kb_gitpull(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -10768,70 +10796,8 @@ async def domain_monitor(app):
 async def auto_ip_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    pool = load_ip_pool()
-    current_ip = rr_read_file(RR_IP_FILE, "").strip()
-    pptp_ip = rr_read_file(RR_PPTP_IP_FILE, "").strip()
-    isp_mode = auto_ip_state.get("isp_mode", False)
-
-    ovpn_st = "🟢" if auto_ip_state["ovpn"] else "🔴"
-    pptp_st = "🟢" if auto_ip_state["pptp"] else "🔴"
-    lines = [
-        f"<b>🔄 Авто IP</b>",
-        f"OVPN: {ovpn_st}  PPTP: {pptp_st}",
-        f"OpenVPN IP (общий): <code>{current_ip}</code>",
-        f"PPTP IP: <code>{pptp_ip}</code>",
-    ]
-    if isp_mode:
-        ip_agts = _get_current_isp_ip("agts") or "—"
-        ip_telekom = _get_current_isp_ip("telekom") or "—"
-        pptp_agts = rr_read_file(RR_PPTP_IP_FILE_AGTS, "").strip() or "—"
-        pptp_telekom = rr_read_file(RR_PPTP_IP_FILE_TELEKOM, "").strip() or "—"
-        lines.append(f"🏢 АГТС: <code>{ip_agts}</code> (PPTP: <code>{pptp_agts}</code>)")
-        lines.append(f"📡 Телеком: <code>{ip_telekom}</code> (PPTP: <code>{pptp_telekom}</code>)")
-        lines.append("🔀 Режим ISP: <b>ВКЛ</b>")
-    else:
-        lines.append("🔀 Режим ISP: ВЫКЛ")
-    lines.append("")
-    if pool:
-        for i, entry in enumerate(pool, 1):
-            marker = " ◀️" if entry["ip"] == current_ip else ""
-            isp_tag = entry.get("isp", "all")
-            isp_label = ISP_NAMES.get(isp_tag, isp_tag)
-            label = entry.get("label", "")
-            if isp_mode:
-                isp_markers = []
-                if entry["ip"] == auto_ip_state.get("current_agts"):
-                    isp_markers.append("🏢")
-                if entry["ip"] == auto_ip_state.get("current_telekom"):
-                    isp_markers.append("📡")
-                marker = " " + "".join(isp_markers) if isp_markers else ""
-            lines.append(f"{i}. <code>{entry['ip']}</code> ({label}) [{isp_label}]{marker}")
-    else:
-        lines.append("Пул пуст.")
-
-    ovpn_btn = "🔴 OVPN выкл" if auto_ip_state["ovpn"] else "🟢 OVPN вкл"
-    pptp_btn = "🔴 PPTP выкл" if auto_ip_state["pptp"] else "🟢 PPTP вкл"
-    isp_btn = "🔀 ISP выкл" if isp_mode else "🔀 ISP вкл"
-    kb = [
-        [InlineKeyboardButton(ovpn_btn, callback_data='aip_toggle_ovpn'),
-         InlineKeyboardButton(pptp_btn, callback_data='aip_toggle_pptp')],
-        [InlineKeyboardButton(isp_btn, callback_data='aip_toggle_isp')],
-        [InlineKeyboardButton("➕ Добавить IP", callback_data='aip_add'),
-         InlineKeyboardButton("\U0001f5d1 Удалить IP", callback_data='aip_remove')],
-        [InlineKeyboardButton("↕️ Порядок", callback_data='aip_reorder'),
-         InlineKeyboardButton("🔄 Заменить IP", callback_data='aip_replace')],
-        [InlineKeyboardButton("📡 Пинг", callback_data='aip_ping'),
-         InlineKeyboardButton("🔎 Сверить", callback_data='aip_compare')],
-    ]
-    if isp_mode:
-        kb.append([InlineKeyboardButton("✏️ Сменить IP (общий)", callback_data='aip_switch_all')])
-        kb.append([
-            InlineKeyboardButton("🏢 Сменить АГТС", callback_data='aip_switch_agts'),
-            InlineKeyboardButton("📡 Сменить Телеком", callback_data='aip_switch_telekom'),
-        ])
-        kb.append([InlineKeyboardButton("🏷 Тег ISP", callback_data='aip_set_isp')])
-    kb.append([InlineKeyboardButton("\U0001f3e0 Меню", callback_data='home')])
-    await safe_edit_text(q, context, "\n".join(lines), parse_mode="HTML",
+    text, kb = _auto_ip_text_and_kb()
+    await safe_edit_text(q, context, text, parse_mode="HTML",
                          reply_markup=InlineKeyboardMarkup(kb))
 
 
