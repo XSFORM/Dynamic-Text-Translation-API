@@ -11764,16 +11764,49 @@ async def gost_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [[InlineKeyboardButton("➕ Добавить", callback_data='gost_add'),
                   InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')]]))
         return
-    lines = []
+    # Build ISP map from Auto IP pool
+    pool = load_ip_pool()
+    ip_isp_map = {e["ip"]: e.get("isp", "all") for e in pool}
+    # Group servers by ISP
+    groups = {"agts": [], "telekom": [], "all": []}
     for ip, info in servers.items():
         label = info.get("label", ip)
         rules_count = len(info.get("rules", []))
-        lines.append(f"• <code>{ip}</code> — {label} ({rules_count} правил)")
+        isp_tag = ip_isp_map.get(ip, "all")
+        line = f"• <code>{ip}</code> — {label} ({rules_count} правил)"
+        groups.setdefault(isp_tag, []).append((ip, info, line))
+    lines = []
+    has_isp = bool(groups.get("agts") or groups.get("telekom"))
+    if has_isp:
+        if groups.get("agts"):
+            lines.append("━━━ 🏢 <b>АГТС</b> ━━━")
+            lines.extend(item[2] for item in groups["agts"])
+        if groups.get("telekom"):
+            lines.append("━━━ 📡 <b>Телеком</b> ━━━")
+            lines.extend(item[2] for item in groups["telekom"])
+        if groups.get("all"):
+            lines.append("━━━ 🌐 <b>Все</b> ━━━")
+            lines.extend(item[2] for item in groups["all"])
+    else:
+        for ip, info in servers.items():
+            label = info.get("label", ip)
+            rules_count = len(info.get("rules", []))
+            lines.append(f"• <code>{ip}</code> — {label} ({rules_count} правил)")
+    # Build buttons in same ISP order
     kb = []
-    for ip, info in servers.items():
-        label = info.get("label", ip)
-        kb.append([InlineKeyboardButton(f"✏️ {ip} ({label})", callback_data=f'gost_edit:{ip}'),
-                   InlineKeyboardButton("🗑️", callback_data=f'gost_del:{ip}')])
+    if has_isp:
+        for tag in ["agts", "telekom", "all"]:
+            for ip, info, _ in groups.get(tag, []):
+                label = info.get("label", ip)
+                isp_icon = {"agts": "🏢", "telekom": "📡"}.get(tag, "")
+                btn_label = f"✏️ {isp_icon} {ip} ({label})" if isp_icon else f"✏️ {ip} ({label})"
+                kb.append([InlineKeyboardButton(btn_label, callback_data=f'gost_edit:{ip}'),
+                           InlineKeyboardButton("🗑️", callback_data=f'gost_del:{ip}')])
+    else:
+        for ip, info in servers.items():
+            label = info.get("label", ip)
+            kb.append([InlineKeyboardButton(f"✏️ {ip} ({label})", callback_data=f'gost_edit:{ip}'),
+                       InlineKeyboardButton("🗑️", callback_data=f'gost_del:{ip}')])
     kb.append([InlineKeyboardButton("◀️ Назад", callback_data='gost_menu')])
     await safe_edit_text(q, context,
         "📋 <b>GOST серверы:</b>\n\n" + "\n".join(lines),
