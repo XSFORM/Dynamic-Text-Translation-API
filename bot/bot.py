@@ -8717,7 +8717,7 @@ async def _do_speedtest(q_or_msg, context, targets: list):
     cancel_key = f"speed_cancel_{id(msg)}"
     context.user_data[cancel_key] = False
 
-    SPEED_TIMEOUT = 30 if size_mb == 1 else 90
+    SPEED_TIMEOUT = 60 if size_mb == 1 else 90
 
     for cn in targets:
         if context.user_data.get(cancel_key):
