@@ -694,8 +694,9 @@ def ssh_exec(ip: str, port: int, user: str, password: str, command: str,
 
 def ssh_exec_via_jump(jump_ip: str, jump_port: int, jump_user: str, jump_pass: str,
                       target_ip: str, target_port: int, target_user: str, target_pass: str,
-                      command: str) -> Tuple[bool, str]:
+                      command: str, cmd_timeout: int = None) -> Tuple[bool, str]:
     """SSH to target router through a jump host (e.g. PPTP server -> router on 172.16.0.x)."""
+    _timeout = cmd_timeout or SSH_CMD_TIMEOUT
     jump_client = paramiko.SSHClient()
     jump_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     try:
@@ -710,8 +711,8 @@ def ssh_exec_via_jump(jump_ip: str, jump_port: int, jump_user: str, jump_pass: s
             target_client.connect(target_ip, port=target_port, username=target_user,
                                   password=target_pass, sock=channel,
                                   timeout=SSH_TIMEOUT, look_for_keys=False, allow_agent=False)
-            stdin, stdout, stderr = target_client.exec_command(command, timeout=SSH_CMD_TIMEOUT)
-            stdout.channel.settimeout(SSH_CMD_TIMEOUT)
+            stdin, stdout, stderr = target_client.exec_command(command, timeout=_timeout)
+            stdout.channel.settimeout(_timeout)
             try:
                 out = stdout.read().decode("utf-8", errors="replace").strip()
             except socket.timeout:
@@ -736,7 +737,7 @@ def ssh_exec_via_jump(jump_ip: str, jump_port: int, jump_user: str, jump_pass: s
         jump_client.close()
 
 
-def router_ssh_exec(cn: str, command: str) -> Tuple[bool, str]:
+def router_ssh_exec(cn: str, command: str, cmd_timeout: int = None) -> Tuple[bool, str]:
     """Universal SSH to router — auto-detect PPTP (jump host) vs OpenVPN (direct).
 
     For PPTP routers: SSH via PPTP server as jump host → 172.16.0.x
@@ -760,14 +761,14 @@ def router_ssh_exec(cn: str, command: str) -> Tuple[bool, str]:
             srv.get("user", "root"), srv.get("password", ""),
             pptp_ip, int(r.get("port", 22)),
             r.get("user", "admin"), r.get("password", ""),
-            command)
+            command, cmd_timeout=cmd_timeout)
     else:
         ip = get_router_ip(cn)
         if not ip:
             return False, "Нет VPN IP"
         return ssh_exec(ip, int(r.get("port", 22)),
                         r.get("user", "admin"), r.get("password", ""),
-                        command)
+                        command, cmd_timeout=cmd_timeout)
 
 
 def ssh_exec_key(ip: str, port: int, user: str, key_path: str, command: str,
@@ -8570,7 +8571,7 @@ async def _do_speedtest(q_or_msg, context, targets: list):
     done = 0
     last_edit = 0
     for cn in targets:
-        ok, out = await asyncio.to_thread(router_ssh_exec, cn, speed_cmd)
+        ok, out = await asyncio.to_thread(router_ssh_exec, cn, speed_cmd, cmd_timeout=120)
         if ok and out.strip():
             speed = _parse_speed(out)
             results.append(f"📶 <b>{cn}</b>: {speed}")
