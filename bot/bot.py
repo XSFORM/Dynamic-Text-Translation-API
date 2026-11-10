@@ -8414,16 +8414,26 @@ def _ensure_speedtest_file():
 
 
 def _parse_speed(output: str) -> str:
-    """Parse curl speed output → human-readable string."""
-    # curl -w "%{speed_download}" returns bytes/sec as float
+    """Parse curl or wget speed output → human-readable Mbps string."""
     try:
-        # Find the speed value — last line or specific pattern
         lines = output.strip().split("\n")
         for line in reversed(lines):
             line = line.strip()
+            # wget fallback: "wget_time:SECONDS"
+            if line.startswith("wget_time:"):
+                secs = int(line.split(":")[1])
+                if secs <= 0:
+                    secs = 1
+                bps = (SPEEDTEST_SIZE_MB * 1048576) / secs
+                mbps = bps * 8 / 1_000_000
+                if mbps >= 10:
+                    return f"~{mbps:.0f} Mbps"
+                else:
+                    return f"~{mbps:.1f} Mbps"
+            # curl: bytes/sec as float
             if line.replace(".", "").replace(",", "").isdigit():
                 bps = float(line.replace(",", "."))
-                mbps = bps * 8 / 1_000_000  # bytes/sec → Mbit/s
+                mbps = bps * 8 / 1_000_000
                 if mbps >= 10:
                     return f"{mbps:.0f} Mbps"
                 else:
@@ -8548,8 +8558,12 @@ async def _do_speedtest(q_or_msg, context, targets: list):
         msg = await q_or_msg.reply_text(f"📶 Спидтест... 0/{total}")
 
     speed_cmd = (
+        f'if command -v curl >/dev/null 2>&1; then '
         f'curl -o /dev/null -s -w "%{{speed_download}}" '
-        f'http://{backend_vpn_ip}/speedtest.bin'
+        f'http://{backend_vpn_ip}/speedtest.bin; '
+        f'else '
+        f'S=$(date +%s); wget -q -O /dev/null http://{backend_vpn_ip}/speedtest.bin 2>/dev/null; '
+        f'E=$(date +%s); echo "wget_time:$((E-S))"; fi'
     )
 
     results = []
