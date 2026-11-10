@@ -135,6 +135,8 @@ RR_BACKUP_PASSWORD = BACKUP_PASSWORD.encode() if BACKUP_PASSWORD else _OLD_BACKU
 RR_HMAC_KEY_FILE = "/var/lib/remote_refresh/hmac_key"
 RR_SCRIPT_FILE = "/var/www/html/router/update_script.sh"
 RR_ROUTER_ID_MAP_FILE = "/var/lib/remote_refresh/router_id_map.json"
+SPEEDTEST_FILE = "/var/www/html/speedtest.bin"
+SPEEDTEST_SIZE_MB = 5
 
 # =====================================================================
 #  ROUTER ID MAP — anonymous hex IDs ↔ CN names
@@ -6052,6 +6054,7 @@ def _ssh_menu_kb(count: int) -> list:
         [InlineKeyboardButton("🔑 Сменить пароль", callback_data='ssh_chpass_menu')],
         [InlineKeyboardButton("📝 Конфиг OpenVPN", callback_data='oec_menu')],
         [InlineKeyboardButton("🔗 Обратный туннель", callback_data='rt_menu')],
+        [InlineKeyboardButton("📶 Спидтест", callback_data='ssh_speed_menu')],
         [InlineKeyboardButton("🏷 ISP тег роутера", callback_data='ssh_isp_tag')],
         [InlineKeyboardButton("👁 Ожидание онлайн", callback_data='cn_watch_menu')],
         [InlineKeyboardButton("🏠 В главное меню", callback_data='home')],
@@ -7027,6 +7030,44 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await ssh_isp_auto_detect(update, context)
     elif data.startswith('ssh_isp_auto_apply:'):
         await _ssh_isp_auto_apply(update, context, data[len('ssh_isp_auto_apply:'):])
+    # --- Speedtest ---
+    elif data == 'ssh_speed_menu':
+        await ssh_speed_menu(update, context)
+    elif data == 'ssh_speed_one':
+        await ssh_speed_select(update, context)
+    elif data == 'ssh_speed_multi':
+        context.user_data['speed_selected'] = []
+        await ssh_speed_multi_select(update, context)
+    elif data.startswith('ssh_speed_toggle:'):
+        cn = data[len('ssh_speed_toggle:'):]
+        sel = context.user_data.get('speed_selected', [])
+        if cn in sel:
+            sel.remove(cn)
+        else:
+            sel.append(cn)
+        context.user_data['speed_selected'] = sel
+        await ssh_speed_multi_select(update, context)
+    elif data == 'ssh_speed_multi_go':
+        targets = context.user_data.pop('speed_selected', [])
+        if targets:
+            await _do_speedtest(update.callback_query, context, targets)
+        else:
+            await safe_edit_text(update.callback_query, context, "⚠️ Ни один роутер не выбран.",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("◀️ Назад", callback_data='ssh_speed_menu')]]))
+    elif data.startswith('ssh_speed_run:'):
+        cn = data[len('ssh_speed_run:'):]
+        await _do_speedtest(update.callback_query, context, [cn])
+    elif data == 'ssh_speed_all':
+        routers = load_routers()
+        online = get_online_clients()
+        targets = [cn for cn in sorted(routers.keys(), key=_natural_key) if cn in online]
+        if targets:
+            await _do_speedtest(update.callback_query, context, targets)
+        else:
+            await safe_edit_text(update.callback_query, context, "Нет онлайн роутеров.",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("◀️ Назад", callback_data='ssh_speed_menu')]]))
     # --- CN Watch ---
     elif data == 'cn_watch_menu':
         await cn_watch_menu(update, context)
@@ -8359,6 +8400,185 @@ async def _ssh_isp_auto_apply(update: Update, context: ContextTypes.DEFAULT_TYPE
         reply_markup=InlineKeyboardMarkup(
             [[InlineKeyboardButton("◀️ ISP теги", callback_data='ssh_isp_tag'),
               InlineKeyboardButton("🏠 Меню", callback_data='ssh_routers')]]))
+
+
+# =====================================================================
+#  SPEEDTEST — VPN tunnel speed test
+# =====================================================================
+
+def _ensure_speedtest_file():
+    """Create speedtest file on backend if missing."""
+    if not os.path.exists(SPEEDTEST_FILE):
+        os.system(f"dd if=/dev/urandom of={SPEEDTEST_FILE} bs=1M count={SPEEDTEST_SIZE_MB} 2>/dev/null")
+    return os.path.exists(SPEEDTEST_FILE)
+
+
+def _parse_speed(output: str) -> str:
+    """Parse curl speed output → human-readable string."""
+    # curl -w "%{speed_download}" returns bytes/sec as float
+    try:
+        # Find the speed value — last line or specific pattern
+        lines = output.strip().split("\n")
+        for line in reversed(lines):
+            line = line.strip()
+            if line.replace(".", "").replace(",", "").isdigit():
+                bps = float(line.replace(",", "."))
+                if bps > 1048576:
+                    return f"{bps / 1048576:.1f} MB/s"
+                elif bps > 1024:
+                    return f"{bps / 1024:.0f} KB/s"
+                else:
+                    return f"{bps:.0f} B/s"
+    except Exception:
+        pass
+    return output.strip()[-60:] if output else "—"
+
+
+async def ssh_speed_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Speed test target selection: one / several / all online."""
+    q = update.callback_query
+    await q.answer()
+    routers = load_routers()
+    if not routers:
+        await safe_edit_text(q, context, "Список роутеров пуст.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')]]))
+        return
+    online = get_online_clients()
+    online_count = sum(1 for cn in routers if cn in online)
+    kb = [
+        [InlineKeyboardButton("🖥 Один роутер", callback_data='ssh_speed_one')],
+        [InlineKeyboardButton("☑️ Несколько роутеров", callback_data='ssh_speed_multi')],
+        [InlineKeyboardButton(f"🌐 Все онлайн ({online_count})", callback_data='ssh_speed_all')],
+        [InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')],
+    ]
+    await safe_edit_text(q, context,
+        f"📶 <b>Спидтест VPN</b>\n\n"
+        f"Скачивает {SPEEDTEST_SIZE_MB} MB файл с бэкенда через VPN тоннель.\n"
+        f"Показывает скорость загрузки каждого роутера.\n\n"
+        f"Онлайн: <b>{online_count}</b> / {len(routers)}",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def ssh_speed_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show router picker for speed test (one router)."""
+    q = update.callback_query
+    await q.answer()
+    routers = load_routers()
+    online = get_online_clients()
+    kb = []
+    for cn in sorted(routers.keys(), key=_natural_key):
+        if cn not in online:
+            continue
+        isp = routers[cn].get("isp", "")
+        isp_icon = {"agts": " 🏢", "telekom": " 📡"}.get(isp, "")
+        kb.append([InlineKeyboardButton(f"🟢{isp_icon} {cn}", callback_data=f'ssh_speed_run:{cn}')])
+    if not kb:
+        await safe_edit_text(q, context, "Нет онлайн роутеров.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀️ Назад", callback_data='ssh_speed_menu')]]))
+        return
+    kb.append([InlineKeyboardButton("◀️ Назад", callback_data='ssh_speed_menu')])
+    await safe_edit_text(q, context, "📶 Выберите роутер для спидтеста:",
+        reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def ssh_speed_multi_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Multi-select routers for speed test."""
+    q = update.callback_query
+    await q.answer()
+    routers = load_routers()
+    online = get_online_clients()
+    selected = context.user_data.get('speed_selected', [])
+    kb = []
+    for cn in sorted(routers.keys(), key=_natural_key):
+        if cn not in online:
+            continue
+        check = "☑️" if cn in selected else "☐"
+        isp = routers[cn].get("isp", "")
+        isp_icon = {"agts": " 🏢", "telekom": " 📡"}.get(isp, "")
+        kb.append([InlineKeyboardButton(f"{check} 🟢{isp_icon} {cn}", callback_data=f'ssh_speed_toggle:{cn}')])
+    if not kb:
+        await safe_edit_text(q, context, "Нет онлайн роутеров.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀️ Назад", callback_data='ssh_speed_menu')]]))
+        return
+    count = len(selected)
+    kb.append([InlineKeyboardButton(f"▶️ Старт ({count})", callback_data='ssh_speed_multi_go')])
+    kb.append([InlineKeyboardButton("◀️ Назад", callback_data='ssh_speed_menu')])
+    await safe_edit_text(q, context,
+        f"📶 Выберите роутеры для спидтеста:\nВыбрано: <b>{count}</b>",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def _do_speedtest(q_or_msg, context, targets: list):
+    """Run speed test on a list of routers."""
+    # Ensure test file exists
+    if not _ensure_speedtest_file():
+        text = "❌ Не удалось создать тестовый файл на бэкенде."
+        if hasattr(q_or_msg, 'message'):
+            await safe_edit_text(q_or_msg, context, text)
+        else:
+            await q_or_msg.reply_text(text)
+        return
+
+    # Get backend VPN IP (server endpoint in tunnel)
+    backend_vpn_ip = ""
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["ip", "-4", "addr", "show", "tun0"],
+            capture_output=True, text=True, timeout=5)
+        for line in result.stdout.split("\n"):
+            line = line.strip()
+            if line.startswith("inet "):
+                backend_vpn_ip = line.split()[1].split("/")[0]
+                break
+    except Exception:
+        pass
+    if not backend_vpn_ip:
+        backend_vpn_ip = "10.9.0.1"  # fallback
+
+    total = len(targets)
+    if hasattr(q_or_msg, 'message'):
+        msg = q_or_msg.message
+        await safe_edit_text(q_or_msg, context,
+            f"📶 Спидтест... 0/{total}",
+            parse_mode="HTML")
+    else:
+        msg = await q_or_msg.reply_text(f"📶 Спидтест... 0/{total}")
+
+    speed_cmd = (
+        f'curl -o /dev/null -s -w "%{{speed_download}}" '
+        f'http://{backend_vpn_ip}/speedtest.bin'
+    )
+
+    results = []
+    done = 0
+    last_edit = 0
+    for cn in targets:
+        ok, out = await asyncio.to_thread(router_ssh_exec, cn, speed_cmd)
+        if ok and out.strip():
+            speed = _parse_speed(out)
+            results.append(f"📶 <b>{cn}</b>: {speed}")
+        else:
+            short = out.strip()[:80] if out else "—"
+            results.append(f"❌ <b>{cn}</b>: {escape(short)}")
+        done += 1
+        now_t = time.time()
+        if total > 2 and (done % 3 == 0 or done == total) and now_t - last_edit >= 2:
+            try:
+                await msg.edit_text(f"📶 Спидтест... {done}/{total}")
+                last_edit = now_t
+            except Exception:
+                pass
+
+    report = "\n".join(results)
+    # Sort by speed for readability
+    await msg.edit_text(
+        f"📶 <b>Спидтест завершён</b>: {done}/{total}\n"
+        f"Файл: {SPEEDTEST_SIZE_MB} MB через VPN ({backend_vpn_ip})\n\n{report}",
+        parse_mode="HTML")
 
 
 # =====================================================================
