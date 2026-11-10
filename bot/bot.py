@@ -7069,6 +7069,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_edit_text(update.callback_query, context, "Нет онлайн роутеров.",
                 reply_markup=InlineKeyboardMarkup(
                     [[InlineKeyboardButton("◀️ Назад", callback_data='ssh_speed_menu')]]))
+    elif data.startswith('ssh_speed_cancel:'):
+        cancel_key = data[len('ssh_speed_cancel:'):]
+        context.user_data[cancel_key] = True
+        await update.callback_query.answer("⏹ Отмена...")
     # --- CN Watch ---
     elif data == 'cn_watch_menu':
         await cn_watch_menu(update, context)
@@ -8569,26 +8573,62 @@ async def _do_speedtest(q_or_msg, context, targets: list):
 
     results = []
     done = 0
-    last_edit = 0
+    cancel_key = f"speed_cancel_{id(msg)}"
+    context.user_data[cancel_key] = False
+
+    SPEED_TIMEOUT = 90  # max seconds per router
+
     for cn in targets:
-        ok, out = await asyncio.to_thread(router_ssh_exec, cn, speed_cmd, cmd_timeout=120)
-        if ok and out.strip():
+        if context.user_data.get(cancel_key):
+            results.append(f"⏹ <b>{cn}</b>: отменено")
+            done += 1
+            continue
+
+        # Run SSH in background, update timer every 3 sec
+        loop = asyncio.get_event_loop()
+        ssh_future = loop.run_in_executor(
+            None, router_ssh_exec, cn, speed_cmd, SPEED_TIMEOUT)
+        start_t = time.time()
+        last_edit = 0
+        cancel_kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("⏹ Отмена", callback_data=f"ssh_speed_cancel:{cancel_key}")]
+        ])
+        while True:
+            try:
+                ok, out = await asyncio.wait_for(asyncio.shield(ssh_future), timeout=3)
+                break  # got result
+            except asyncio.TimeoutError:
+                pass  # still running — update timer
+            if context.user_data.get(cancel_key):
+                # User pressed cancel — can't kill thread but stop waiting
+                ok, out = False, "отменено"
+                break
+            elapsed = int(time.time() - start_t)
+            if elapsed - last_edit >= 3:
+                try:
+                    await msg.edit_text(
+                        f"📶 <b>{cn}</b> — загрузка... {elapsed}с\n"
+                        f"({done}/{total} готово)",
+                        parse_mode="HTML",
+                        reply_markup=cancel_kb)
+                    last_edit = elapsed
+                except Exception:
+                    pass
+
+        if context.user_data.get(cancel_key) and out != "отменено":
+            pass  # got result before cancel processed — use it
+        if ok and out.strip() and out != "отменено":
             speed = _parse_speed(out)
             results.append(f"📶 <b>{cn}</b>: {speed}")
+        elif out == "отменено":
+            results.append(f"⏹ <b>{cn}</b>: отменено")
         else:
             short = out.strip()[:80] if out else "—"
             results.append(f"❌ <b>{cn}</b>: {escape(short)}")
         done += 1
-        now_t = time.time()
-        if total > 2 and (done % 3 == 0 or done == total) and now_t - last_edit >= 2:
-            try:
-                await msg.edit_text(f"📶 Спидтест... {done}/{total}")
-                last_edit = now_t
-            except Exception:
-                pass
 
+    context.user_data.pop(cancel_key, None)
     report = "\n".join(results)
-    # Sort by speed for readability
     await msg.edit_text(
         f"📶 <b>Спидтест завершён</b>: {done}/{total}\n"
         f"Файл: {SPEEDTEST_SIZE_MB} MB через VPN ({backend_vpn_ip})\n\n{report}",
