@@ -7034,12 +7034,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # --- Speedtest ---
     elif data == 'ssh_speed_menu':
         await ssh_speed_menu(update, context)
-    elif data.startswith('ssh_speed_src:'):
-        src_key = data[len('ssh_speed_src:'):]
-        context.user_data['speed_source'] = src_key
-        await ssh_speed_targets(update, context)
-    elif data == 'ssh_speed_targets':
-        await ssh_speed_targets(update, context)
     elif data == 'ssh_speed_one':
         await ssh_speed_select(update, context)
     elif data == 'ssh_speed_multi':
@@ -7061,7 +7055,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await safe_edit_text(update.callback_query, context, "⚠️ Ни один роутер не выбран.",
                 reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("◀️ Назад", callback_data='ssh_speed_targets')]]))
+                    [[InlineKeyboardButton("◀️ Назад", callback_data='ssh_speed_menu')]]))
     elif data.startswith('ssh_speed_run:'):
         cn = data[len('ssh_speed_run:'):]
         await _do_speedtest(update.callback_query, context, [cn])
@@ -7074,7 +7068,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await safe_edit_text(update.callback_query, context, "Нет онлайн роутеров.",
                 reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("◀️ Назад", callback_data='ssh_speed_targets')]]))
+                    [[InlineKeyboardButton("◀️ Назад", callback_data='ssh_speed_menu')]]))
 
     elif data.startswith('ssh_speed_cancel:'):
         cancel_key = data[len('ssh_speed_cancel:'):]
@@ -8418,11 +8412,6 @@ async def _ssh_isp_auto_apply(update: Update, context: ContextTypes.DEFAULT_TYPE
 #  SPEEDTEST — VPN tunnel speed test
 # =====================================================================
 
-SPEEDTEST_PROXY_TARGETS = {
-    "yandex": "http://mirror.yandex.ru/anonimity/tor/tor-0.4.8.16.tar.gz",
-    "speedee": "http://speed.ee/speedtest/random4000x4000.jpg",
-}
-SPEEDTEST_PROXY_MARKER = "# speedtest-proxy-locations"
 
 
 def _ensure_speedtest_file():
@@ -8431,59 +8420,6 @@ def _ensure_speedtest_file():
         os.system(f"dd if=/dev/urandom of={SPEEDTEST_FILE} bs=1M count={SPEEDTEST_SIZE_MB} 2>/dev/null")
     return os.path.exists(SPEEDTEST_FILE)
 
-
-def _ensure_speedtest_proxy():
-    """Inject speedtest proxy locations into nginx server block."""
-    # Check if already configured
-    for conf_path in ["/etc/nginx/sites-enabled/default",
-                      "/etc/nginx/conf.d/default.conf",
-                      "/etc/nginx/nginx.conf"]:
-        if not os.path.exists(conf_path):
-            continue
-        try:
-            with open(conf_path, "r") as f:
-                content = f.read()
-        except Exception:
-            continue
-        if SPEEDTEST_PROXY_MARKER in content:
-            return True  # already injected
-        # Find last "location" block or "server {" and inject before the final "}"
-        # Build location snippet
-        snippet = f"\n    {SPEEDTEST_PROXY_MARKER}\n"
-        for name, url in SPEEDTEST_PROXY_TARGETS.items():
-            snippet += (
-                f"    location /speedtest/{name} {{\n"
-                f"        proxy_pass {url};\n"
-                f"        proxy_set_header Host \"\";\n"
-                f"        proxy_buffering off;\n"
-                f"        proxy_read_timeout 120s;\n"
-                f"    }}\n"
-            )
-        # Insert before the last closing brace of server block
-        # Find the last } in the file
-        last_brace = content.rfind("}")
-        if last_brace == -1:
-            continue
-        new_content = content[:last_brace] + snippet + content[last_brace:]
-        try:
-            import subprocess
-            # Write to temp, test, then replace
-            tmp = conf_path + ".tmp"
-            with open(tmp, "w") as f:
-                f.write(new_content)
-            result = subprocess.run(["nginx", "-t", "-c", "/etc/nginx/nginx.conf"],
-                                    capture_output=True, text=True)
-            if result.returncode != 0:
-                os.remove(tmp)
-                continue
-            os.replace(tmp, conf_path)
-            os.system("nginx -s reload 2>/dev/null")
-            return True
-        except Exception:
-            if os.path.exists(conf_path + ".tmp"):
-                os.remove(conf_path + ".tmp")
-            continue
-    return False
 
 
 def _parse_speed(output: str) -> Tuple[float, str]:
@@ -8531,27 +8467,9 @@ def _speed_emoji(mbps: float) -> str:
         return "🐌"
 
 
-SPEED_SOURCES = {
-    "vpn": {
-        "name": "🔒 VPN (бэкенд)",
-        "desc": "Скачивает файл с бэкенда через VPN тоннель",
-        "url": None,  # built dynamically: /speedtest.bin
-    },
-    "yandex": {
-        "name": "🟡 Яндекс",
-        "desc": "Через VPN → бэкенд → mirror.yandex.ru",
-        "url": None,  # built dynamically: /speedtest/yandex
-    },
-    "speedee": {
-        "name": "🌐 Speed.ee",
-        "desc": "Через VPN → бэкенд → speed.ee (Европа)",
-        "url": None,  # built dynamically: /speedtest/speedee
-    },
-}
-
 
 async def ssh_speed_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Speed test — source selection: VPN / Yandex / speed.ee."""
+    """Speed test — choose one / several / all routers."""
     q = update.callback_query
     await q.answer()
     routers = load_routers()
@@ -8562,40 +8480,18 @@ async def ssh_speed_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     online = get_online_clients()
     online_count = sum(1 for cn in routers if cn in online)
-    kb = []
-    for src_key, src in SPEED_SOURCES.items():
-        kb.append([InlineKeyboardButton(src["name"], callback_data=f'ssh_speed_src:{src_key}')])
-    kb.append([InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')])
-    await safe_edit_text(q, context,
-        f"📶 <b>Спидтест</b>\n\n"
-        f"Выберите источник для замера скорости:\n\n"
-        f"🔒 <b>VPN</b> — скорость тоннеля до бэкенда\n"
-        f"🟡 <b>Яндекс</b> — полный путь через VPN до Яндекса\n"
-        f"🌐 <b>Speed.ee</b> — полный путь через VPN до Европы\n\n"
-        f"Онлайн: <b>{online_count}</b> / {len(routers)}",
-        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
-
-
-async def ssh_speed_targets(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Speed test — target selection after source is chosen."""
-    q = update.callback_query
-    await q.answer()
-    src_key = context.user_data.get('speed_source', 'vpn')
-    src = SPEED_SOURCES.get(src_key, SPEED_SOURCES["vpn"])
-    routers = load_routers()
-    online = get_online_clients()
-    online_count = sum(1 for cn in routers if cn in online)
     kb = [
         [InlineKeyboardButton("🖥 Один роутер", callback_data='ssh_speed_one')],
         [InlineKeyboardButton("☑️ Несколько роутеров", callback_data='ssh_speed_multi')],
         [InlineKeyboardButton(f"🌐 Все онлайн ({online_count})", callback_data='ssh_speed_all')],
-        [InlineKeyboardButton("◀️ Назад", callback_data='ssh_speed_menu')],
+        [InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')],
     ]
     await safe_edit_text(q, context,
-        f"📶 <b>Спидтест — {src['name']}</b>\n\n"
-        f"{src['desc']}\n\n"
+        f"📶 <b>Спидтест</b>\n\n"
+        f"Скачивание {SPEEDTEST_SIZE_MB}MB файла через VPN тоннель\n"
         f"Онлайн: <b>{online_count}</b> / {len(routers)}",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
 
 
 async def ssh_speed_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8614,9 +8510,9 @@ async def ssh_speed_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not kb:
         await safe_edit_text(q, context, "Нет онлайн роутеров.",
             reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("◀️ Назад", callback_data='ssh_speed_targets')]]))
+                [[InlineKeyboardButton("◀️ Назад", callback_data='ssh_speed_menu')]]))
         return
-    kb.append([InlineKeyboardButton("◀️ Назад", callback_data='ssh_speed_targets')])
+    kb.append([InlineKeyboardButton("◀️ Назад", callback_data='ssh_speed_menu')])
     await safe_edit_text(q, context, "📶 Выберите роутер для спидтеста:",
         reply_markup=InlineKeyboardMarkup(kb))
 
@@ -8639,34 +8535,27 @@ async def ssh_speed_multi_select(update: Update, context: ContextTypes.DEFAULT_T
     if not kb:
         await safe_edit_text(q, context, "Нет онлайн роутеров.",
             reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("◀️ Назад", callback_data='ssh_speed_targets')]]))
+                [[InlineKeyboardButton("◀️ Назад", callback_data='ssh_speed_menu')]]))
         return
     count = len(selected)
     kb.append([InlineKeyboardButton(f"▶️ Старт ({count})", callback_data='ssh_speed_multi_go')])
-    kb.append([InlineKeyboardButton("◀️ Назад", callback_data='ssh_speed_targets')])
+    kb.append([InlineKeyboardButton("◀️ Назад", callback_data='ssh_speed_menu')])
     await safe_edit_text(q, context,
         f"📶 Выберите роутеры для спидтеста:\nВыбрано: <b>{count}</b>",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
 
 async def _do_speedtest(q_or_msg, context, targets: list):
-    """Run speed test on a list of routers."""
-    src_key = context.user_data.get('speed_source', 'vpn')
-    src = SPEED_SOURCES.get(src_key, SPEED_SOURCES["vpn"])
+    """Run speed test on a list of routers (VPN tunnel only)."""
+    if not _ensure_speedtest_file():
+        text = "❌ Не удалось создать тестовый файл на бэкенде."
+        if hasattr(q_or_msg, 'message'):
+            await safe_edit_text(q_or_msg, context, text)
+        else:
+            await q_or_msg.reply_text(text)
+        return
 
-    # Ensure test infrastructure exists
-    if src_key == "vpn":
-        if not _ensure_speedtest_file():
-            text = "❌ Не удалось создать тестовый файл на бэкенде."
-            if hasattr(q_or_msg, 'message'):
-                await safe_edit_text(q_or_msg, context, text)
-            else:
-                await q_or_msg.reply_text(text)
-            return
-    else:
-        _ensure_speedtest_proxy()
-
-    # Get backend VPN IP — all sources use it (nginx proxies external)
+    # Get backend VPN IP
     backend_vpn_ip = ""
     try:
         import subprocess
@@ -8683,10 +8572,7 @@ async def _do_speedtest(q_or_msg, context, targets: list):
     if not backend_vpn_ip:
         backend_vpn_ip = "10.9.0.1"
 
-    # URL paths: vpn=/speedtest.bin, yandex=/speedtest/yandex, speedee=/speedtest/speedee
-    url_paths = {"vpn": "/speedtest.bin", "yandex": "/speedtest/yandex", "speedee": "/speedtest/speedee"}
-    download_url = f"http://{backend_vpn_ip}{url_paths.get(src_key, '/speedtest.bin')}"
-    file_info = f"{src['name']} ({backend_vpn_ip})"
+    download_url = f"http://{backend_vpn_ip}/speedtest.bin"
 
     total = len(targets)
     if hasattr(q_or_msg, 'message'):
@@ -8770,7 +8656,7 @@ async def _do_speedtest(q_or_msg, context, targets: list):
     report = "\n".join(results)
     await msg.edit_text(
         f"📶 <b>Спидтест завершён</b>: {done}/{total}\n"
-        f"Файл: {file_info}\n\n{report}",
+        f"Файл: {SPEEDTEST_SIZE_MB}MB через VPN ({backend_vpn_ip})\n\n{report}",
         parse_mode="HTML")
 
 
