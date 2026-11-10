@@ -8432,12 +8432,19 @@ def _parse_speed(output: str) -> Tuple[float, str]:
         lines = output.strip().split("\n")
         for line in reversed(lines):
             line = line.strip()
-            # wget fallback: "wget_time:SECONDS"
+            # wget fallback: "wget_time:SECONDS:BYTES" or legacy "wget_time:SECONDS"
             if line.startswith("wget_time:"):
-                secs = int(line.split(":")[1])
+                parts = line.split(":")
+                secs = int(parts[1])
+                if len(parts) >= 3 and parts[2].strip().isdigit():
+                    file_bytes = int(parts[2].strip())
+                else:
+                    file_bytes = SPEEDTEST_SIZE_MB * 1048576
                 if secs <= 0:
                     secs = 1
-                bps = (SPEEDTEST_SIZE_MB * 1048576) / secs
+                if file_bytes <= 0:
+                    return 0.0, "ошибка загрузки"
+                bps = file_bytes / secs
                 mbps = bps * 8 / 1_000_000
                 txt = f"~{mbps:.0f} Mbps" if mbps >= 10 else f"~{mbps:.1f} Mbps"
                 return mbps, txt
@@ -8468,19 +8475,16 @@ SPEED_SOURCES = {
         "name": "🔒 VPN (бэкенд)",
         "desc": "Скачивает файл с бэкенда через VPN тоннель",
         "url": None,  # built dynamically from tun0 IP
-        "size_mb": SPEEDTEST_SIZE_MB,
     },
     "yandex": {
         "name": "🟡 Яндекс",
         "desc": "Скачивает с mirror.yandex.ru через VPN",
         "url": "http://mirror.yandex.ru/anonimity/tor/tor-0.4.8.16.tar.gz",
-        "size_mb": 7,
     },
     "speedee": {
         "name": "🌐 Speed.ee",
         "desc": "Скачивает с speed.ee через VPN",
         "url": "http://speed.ee/speedtest/random4000x4000.jpg",
-        "size_mb": 2,
     },
 }
 
@@ -8616,10 +8620,10 @@ async def _do_speedtest(q_or_msg, context, targets: list):
         if not backend_vpn_ip:
             backend_vpn_ip = "10.9.0.1"
         download_url = f"http://{backend_vpn_ip}/speedtest.bin"
-        file_info = f"{src['size_mb']} MB через VPN ({backend_vpn_ip})"
+        file_info = f"{SPEEDTEST_SIZE_MB} MB через VPN ({backend_vpn_ip})"
     else:
         download_url = src["url"]
-        file_info = f"~{src['size_mb']} MB — {src['name']}"
+        file_info = src["name"]
 
     total = len(targets)
     if hasattr(q_or_msg, 'message'):
@@ -8631,13 +8635,15 @@ async def _do_speedtest(q_or_msg, context, targets: list):
         msg = await q_or_msg.reply_text(f"📶 Спидтест... 0/{total}")
 
     # Build command — curl preferred, wget fallback
+    # curl: accurate bytes/sec; wget fallback: download to /tmp, measure real size
     speed_cmd = (
         f'if command -v curl >/dev/null 2>&1; then '
-        f'curl -o /dev/null -s -w "%{{speed_download}}" '
+        f'curl -L -o /dev/null -s -w "%{{speed_download}}" '
         f'"{download_url}"; '
         f'else '
-        f'S=$(date +%s); wget -q -O /dev/null "{download_url}" 2>/dev/null; '
-        f'E=$(date +%s); echo "wget_time:$((E-S))"; fi'
+        f'S=$(date +%s); wget -q -O /tmp/_st.bin "{download_url}" 2>/dev/null; '
+        f'E=$(date +%s); FS=$(wc -c < /tmp/_st.bin 2>/dev/null || echo 0); '
+        f'rm -f /tmp/_st.bin; echo "wget_time:$((E-S)):$FS"; fi'
     )
 
     results = []
