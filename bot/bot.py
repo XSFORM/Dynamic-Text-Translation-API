@@ -9290,8 +9290,10 @@ async def ssh_chpass_receive(update: Update, context: ContextTypes.DEFAULT_TYPE)
     total = len(target_list)
     msg = await update.message.reply_text(
         f"🔑 Меняю пароль... 0/{total}  ░░░░░░░░░░ 0%")
+    # Escape password for shell — single quotes prevent $, #, !, etc. interpretation
+    safe_pw = password.replace("'", "'\\''")
     chpass_cmd = (
-        f'nvram set http_passwd={password} && '
+        f"nvram set http_passwd='{safe_pw}' && "
         f'nvram commit && mtd_storage.sh save && '
         f'echo "CHPASS_OK" && '
         f'( sleep 2 ; reboot ) > /dev/null 2>&1 &'
