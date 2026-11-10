@@ -1042,6 +1042,7 @@ async def rtunnel_key_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "<i>Добавьте этот ключ в authorized_keys на туннельном сервере.</i>"
         )
         kb = [
+            [InlineKeyboardButton("📤 Залить на сервер", callback_data='rt_deploy_key')],
             [InlineKeyboardButton("🔄 Перегенерировать", callback_data='rt_key_regen')],
             [InlineKeyboardButton("◀️ Назад", callback_data='rt_menu')],
         ]
@@ -1067,6 +1068,82 @@ async def rtunnel_key_generate(update: Update, context: ContextTypes.DEFAULT_TYP
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("◀️ Назад", callback_data='rt_key_menu')]]))
+
+
+async def rtunnel_deploy_key_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ask for tunnel server password to deploy SSH key."""
+    q = update.callback_query
+    await q.answer()
+    ts = load_tunnel_server()
+    pubkey = tunnel_get_pubkey()
+    if not ts.get("ip"):
+        await safe_edit_text(q, context, "❌ Сначала задайте IP сервера.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='rt_key_menu')]]))
+        return
+    if not pubkey:
+        await safe_edit_text(q, context, "❌ Сначала сгенерируйте SSH-ключ.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='rt_key_menu')]]))
+        return
+    _clear_awaits(context)
+    context.user_data['await_rt_deploy_key_pass'] = True
+    ip = ts["ip"]
+    ssh_port = ts.get("ssh_port", 22)
+    await safe_edit_text(q, context,
+        f"📤 <b>Залить ключ на сервер</b>\n\n"
+        f"Сервер: <code>{ip}:{ssh_port}</code>\n\n"
+        "Бот подключится и добавит SSH-ключ в\n"
+        "<code>~/.ssh/authorized_keys</code>\n"
+        "(если уже есть — не дублирует)\n\n"
+        "Введите пароль root от сервера:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data='rt_key_menu')]]))
+
+
+async def rtunnel_deploy_key_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Process password and deploy SSH key to tunnel server."""
+    password = update.message.text.strip()
+    context.user_data.pop('await_rt_deploy_key_pass', None)
+
+    ts = load_tunnel_server()
+    pubkey = tunnel_get_pubkey()
+    if not ts.get("ip") or not pubkey:
+        await update.message.reply_text("❌ Сервер или ключ не настроены.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='rt_key_menu')]]))
+        return
+
+    ip = ts["ip"]
+    ssh_port = int(ts.get("ssh_port", 22))
+    ssh_user = ts.get("ssh_user", "root")
+
+    await update.message.reply_text(f"⏳ Подключаюсь к {ip}:{ssh_port}...")
+
+    key_fragment = pubkey.split()[1][:50]
+    deploy_cmd = (
+        "mkdir -p /root/.ssh && chmod 700 /root/.ssh ; "
+        f"grep -qF '{key_fragment}' /root/.ssh/authorized_keys 2>/dev/null || "
+        f"echo '{pubkey}' >> /root/.ssh/authorized_keys ; "
+        "chmod 600 /root/.ssh/authorized_keys ; "
+        "echo DEPLOY_KEY_OK"
+    )
+
+    ok, out = ssh_exec(ip, ssh_port, ssh_user, password, deploy_cmd, cmd_timeout=15)
+    if not ok:
+        # Try port 22 if different
+        if ssh_port != 22:
+            ok, out = ssh_exec(ip, 22, ssh_user, password, deploy_cmd, cmd_timeout=15)
+
+    if ok and "DEPLOY_KEY_OK" in out:
+        await update.message.reply_text(
+            f"✅ Ключ добавлен на <code>{ip}:{ssh_port}</code>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='rt_key_menu')]]))
+    else:
+        short = out.strip()[:200] if out else "—"
+        await update.message.reply_text(
+            f"❌ Ошибка:\n<code>{escape(short)}</code>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Повторить", callback_data='rt_deploy_key')],
+                [InlineKeyboardButton("◀️ Назад", callback_data='rt_key_menu')]]))
 
 
 async def rtunnel_setup_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6475,6 +6552,8 @@ async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_T
         await rtunnel_set_ip_handler(update, context); return
     if context.user_data.get('await_rt_setup_pass'):
         await rtunnel_setup_handler(update, context); return
+    if context.user_data.get('await_rt_deploy_key_pass'):
+        await rtunnel_deploy_key_handler(update, context); return
     # GOST text inputs
     if context.user_data.get('await_gost_add'):
         await gost_add_handler(update, context); return
@@ -6995,6 +7074,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await rtunnel_key_menu(update, context)
     elif data in ('rt_key_gen', 'rt_key_regen'):
         await rtunnel_key_generate(update, context)
+    elif data == 'rt_deploy_key':
+        await rtunnel_deploy_key_start(update, context)
     elif data == 'rt_setup':
         await rtunnel_setup_start(update, context)
     elif data == 'rt_ports':
