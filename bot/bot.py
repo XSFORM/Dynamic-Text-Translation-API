@@ -136,6 +136,7 @@ RR_HMAC_KEY_FILE = "/var/lib/remote_refresh/hmac_key"
 RR_SCRIPT_FILE = "/var/www/html/router/update_script.sh"
 RR_ROUTER_ID_MAP_FILE = "/var/lib/remote_refresh/router_id_map.json"
 SPEEDTEST_FILE = "/var/www/html/speedtest.bin"
+SPEEDTEST_FILE_1MB = "/var/www/html/speedtest_1mb.bin"
 SPEEDTEST_SIZE_MB = 5
 
 # =====================================================================
@@ -7115,6 +7116,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # --- Speedtest ---
     elif data == 'ssh_speed_menu':
         await ssh_speed_menu(update, context)
+    elif data.startswith('ssh_speed_size:'):
+        context.user_data['speed_size_mb'] = int(data.split(':')[1])
+        await ssh_speed_menu(update, context)
     elif data == 'ssh_speed_one':
         await ssh_speed_select(update, context)
     elif data == 'ssh_speed_multi':
@@ -8517,11 +8521,15 @@ async def _ssh_isp_auto_apply(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 
-def _ensure_speedtest_file():
+def _ensure_speedtest_file(size_mb: int = 5):
     """Create speedtest file on backend if missing."""
-    if not os.path.exists(SPEEDTEST_FILE):
-        os.system(f"dd if=/dev/urandom of={SPEEDTEST_FILE} bs=1M count={SPEEDTEST_SIZE_MB} 2>/dev/null")
-    return os.path.exists(SPEEDTEST_FILE)
+    if size_mb == 1:
+        path = SPEEDTEST_FILE_1MB
+    else:
+        path = SPEEDTEST_FILE
+    if not os.path.exists(path):
+        os.system(f"dd if=/dev/urandom of={path} bs=1M count={size_mb} 2>/dev/null")
+    return os.path.exists(path)
 
 
 
@@ -8583,7 +8591,11 @@ async def ssh_speed_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     online = get_online_clients()
     online_count = sum(1 for cn in routers if cn in online)
+    size_mb = context.user_data.get('speed_size_mb', 5)
+    size_mark = lambda s: " ✓" if s == size_mb else ""
     kb = [
+        [InlineKeyboardButton(f"📦 1 MB (быстро){size_mark(1)}", callback_data='ssh_speed_size:1'),
+         InlineKeyboardButton(f"📦 5 MB (точно){size_mark(5)}", callback_data='ssh_speed_size:5')],
         [InlineKeyboardButton("🖥 Один роутер", callback_data='ssh_speed_one')],
         [InlineKeyboardButton("☑️ Несколько роутеров", callback_data='ssh_speed_multi')],
         [InlineKeyboardButton(f"🌐 Все онлайн ({online_count})", callback_data='ssh_speed_all')],
@@ -8591,7 +8603,8 @@ async def ssh_speed_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     await safe_edit_text(q, context,
         f"📶 <b>Спидтест</b>\n\n"
-        f"Скачивание {SPEEDTEST_SIZE_MB}MB файла через VPN тоннель\n"
+        f"Файл: <b>{size_mb} MB</b> через VPN тоннель\n"
+        f"{'⚡ Быстро, точность ±30%' if size_mb == 1 else '🎯 Точно, но дольше'}\n\n"
         f"Онлайн: <b>{online_count}</b> / {len(routers)}",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
@@ -8650,7 +8663,8 @@ async def ssh_speed_multi_select(update: Update, context: ContextTypes.DEFAULT_T
 
 async def _do_speedtest(q_or_msg, context, targets: list):
     """Run speed test on a list of routers (VPN tunnel only)."""
-    if not _ensure_speedtest_file():
+    size_mb = context.user_data.get('speed_size_mb', 5)
+    if not _ensure_speedtest_file(size_mb):
         text = "❌ Не удалось создать тестовый файл на бэкенде."
         if hasattr(q_or_msg, 'message'):
             await safe_edit_text(q_or_msg, context, text)
@@ -8675,7 +8689,8 @@ async def _do_speedtest(q_or_msg, context, targets: list):
     if not backend_vpn_ip:
         backend_vpn_ip = "10.9.0.1"
 
-    download_url = f"http://{backend_vpn_ip}/speedtest.bin"
+    bin_name = "speedtest_1mb.bin" if size_mb == 1 else "speedtest.bin"
+    download_url = f"http://{backend_vpn_ip}/{bin_name}"
 
     total = len(targets)
     if hasattr(q_or_msg, 'message'):
@@ -8687,7 +8702,6 @@ async def _do_speedtest(q_or_msg, context, targets: list):
         msg = await q_or_msg.reply_text(f"📶 Спидтест... 0/{total}")
 
     # Build command — curl preferred, wget fallback
-    # curl: accurate bytes/sec; wget fallback: download to /tmp, measure real size
     speed_cmd = (
         f'if command -v curl >/dev/null 2>&1; then '
         f'curl -L -o /dev/null -s -w "%{{speed_download}}" '
@@ -8703,7 +8717,7 @@ async def _do_speedtest(q_or_msg, context, targets: list):
     cancel_key = f"speed_cancel_{id(msg)}"
     context.user_data[cancel_key] = False
 
-    SPEED_TIMEOUT = 90
+    SPEED_TIMEOUT = 30 if size_mb == 1 else 90
 
     for cn in targets:
         if context.user_data.get(cancel_key):
@@ -8726,10 +8740,16 @@ async def _do_speedtest(q_or_msg, context, targets: list):
                 break
             except asyncio.TimeoutError:
                 pass
+            # Check cancel
             if context.user_data.get(cancel_key):
                 ok, out = False, "отменено"
+                # Don't wait for SSH — it'll finish in background
                 break
+            # Check hard timeout (SSH might hang beyond cmd_timeout)
             elapsed = int(time.time() - start_t)
+            if elapsed > SPEED_TIMEOUT + 10:
+                ok, out = False, "таймаут"
+                break
             if elapsed - last_edit >= 3:
                 try:
                     await msg.edit_text(
@@ -8742,8 +8762,6 @@ async def _do_speedtest(q_or_msg, context, targets: list):
                     pass
 
         elapsed_s = int(time.time() - start_t)
-        if context.user_data.get(cancel_key) and out != "отменено":
-            pass
         if ok and out.strip() and out != "отменено":
             mbps, speed_txt = _parse_speed(out)
             emoji = _speed_emoji(mbps)
@@ -8755,11 +8773,18 @@ async def _do_speedtest(q_or_msg, context, targets: list):
             results.append(f"🐌 <b>{cn}</b>: {escape(short)} ({elapsed_s}с)")
         done += 1
 
+        # If cancelled, mark remaining and break
+        if context.user_data.get(cancel_key):
+            for remaining_cn in targets[targets.index(cn) + 1:]:
+                results.append(f"⏹ <b>{remaining_cn}</b>: отменено")
+                done += 1
+            break
+
     context.user_data.pop(cancel_key, None)
     report = "\n".join(results)
     await msg.edit_text(
         f"📶 <b>Спидтест завершён</b>: {done}/{total}\n"
-        f"Файл: {SPEEDTEST_SIZE_MB}MB через VPN ({backend_vpn_ip})\n\n{report}",
+        f"Файл: {size_mb}MB через VPN ({backend_vpn_ip})\n\n{report}",
         parse_mode="HTML")
 
 
