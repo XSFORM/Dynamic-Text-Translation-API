@@ -8423,12 +8423,11 @@ def _parse_speed(output: str) -> str:
             line = line.strip()
             if line.replace(".", "").replace(",", "").isdigit():
                 bps = float(line.replace(",", "."))
-                if bps > 1048576:
-                    return f"{bps / 1048576:.1f} MB/s"
-                elif bps > 1024:
-                    return f"{bps / 1024:.0f} KB/s"
+                mbps = bps / 1048576
+                if mbps >= 10:
+                    return f"{mbps:.0f} MB/s"
                 else:
-                    return f"{bps:.0f} B/s"
+                    return f"{mbps:.2f} MB/s"
     except Exception:
         pass
     return output.strip()[-60:] if output else "—"
