@@ -8098,25 +8098,31 @@ async def ssh_cmd_multi_select(update: Update, context: ContextTypes.DEFAULT_TYP
         reply_markup=InlineKeyboardMarkup(kb))
 
 async def ssh_exec_multi(msg, routers_dict, targets, cmd, context):
-    """Execute SSH command on multiple routers and return report."""
-    results = []
+    """Execute SSH command on multiple routers in parallel (up to 10 at a time)."""
+    PARALLEL = 10
     total = len(targets)
     done = 0
     last_edit = 0
+    results_map = {}  # cn -> (ok, out)
+    loop = asyncio.get_event_loop()
+    online = get_online_clients()
+
+    # Pre-filter: skip missing/offline immediately
+    to_run = []
     for cn in targets:
         r = routers_dict.get(cn)
         if not r:
-            results.append((cn, False, "не найден в routers.json"))
+            results_map[cn] = (False, "не найден в routers.json")
             done += 1
-            continue
-        online = get_online_clients()
-        if cn not in online:
-            results.append((cn, False, "оффлайн"))
+        elif cn not in online:
+            results_map[cn] = (False, "оффлайн")
             done += 1
-            continue
-        ok, out = router_ssh_exec(cn, cmd)
-        results.append((cn, ok, out))
-        done += 1
+        else:
+            to_run.append(cn)
+
+    # Progress updater
+    async def _update_progress():
+        nonlocal last_edit
         now_t = time.time()
         if now_t - last_edit >= 2 or done == total:
             pct = done * 100 // total
@@ -8128,12 +8134,28 @@ async def ssh_exec_multi(msg, routers_dict, targets, cmd, context):
                 last_edit = now_t
             except Exception:
                 pass
-    # Build report
-    success = sum(1 for _, ok, _ in results if ok)
+
+    # Process in batches of PARALLEL
+    for i in range(0, len(to_run), PARALLEL):
+        batch = to_run[i:i + PARALLEL]
+
+        async def _run_one(cn):
+            return cn, await loop.run_in_executor(None, router_ssh_exec, cn, cmd)
+
+        tasks = [_run_one(cn) for cn in batch]
+        for coro in asyncio.as_completed(tasks):
+            cn, (ok, out) = await coro
+            results_map[cn] = (ok, out)
+            done += 1
+            await _update_progress()
+
+    # Build report in original order
+    success = sum(1 for ok, _ in results_map.values() if ok)
     fail = total - success
     lines = [f"💻 <b>Команда:</b> <code>{escape(cmd[:200])}</code>",
              f"✅ Успешно: {success}  ❌ Ошибки: {fail}\n"]
-    for cn, ok, out in results:
+    for cn in targets:
+        ok, out = results_map.get(cn, (False, "—"))
         icon = "✅" if ok else "❌"
         short = out.strip()[:300] if out else "—"
         lines.append(f"{icon} <b>{cn}</b>:\n<pre>{escape(short)}</pre>")
