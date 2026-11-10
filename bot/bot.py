@@ -3658,7 +3658,7 @@ async def _force_ip_execute(msg, targets, new_ip: str):
         results.append((cn, ok, out, is_pptp))
         done += 1
         now_t = time.time()
-        if total > 3 and (done % 5 == 0 or done == total) and now_t - last_edit >= 2:
+        if now_t - last_edit >= 2 or done == total:
             pct = done * 100 // total
             filled = pct // 10
             bar = "▓" * filled + "░" * (10 - filled)
@@ -5743,7 +5743,7 @@ async def _rr_push_dom_exec(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             results.append(f"❌ <b>{cn}</b>: {escape(short)}")
         done += 1
         now_t = time.time()
-        if total > 3 and (done % 5 == 0 or done == total) and now_t - last_edit >= 2:
+        if now_t - last_edit >= 2 or done == total:
             pct = done * 100 // total
             filled = pct // 10
             bar = "▓" * filled + "░" * (10 - filled)
@@ -5854,7 +5854,7 @@ async def _chk_dom_exec(update: Update, context: ContextTypes.DEFAULT_TYPE, targ
         done += 1
         # Update progress every 5 routers or at the end
         now_t = time.time()
-        if total > 3 and (done % 5 == 0 or done == total) and now_t - last_edit >= 2:
+        if now_t - last_edit >= 2 or done == total:
             pct = done * 100 // total
             filled = pct // 10
             bar = "▓" * filled + "░" * (10 - filled)
@@ -8044,7 +8044,7 @@ async def _do_ssh_deploy_multi(q_or_msg, context, targets: list, front_ip: str):
             results.append(f"❌ <b>{cn}</b>: {escape(short)}")
         done += 1
         now_t = time.time()
-        if total > 3 and (done % 5 == 0 or done == total) and now_t - last_edit >= 2:
+        if now_t - last_edit >= 2 or done == total:
             pct = done * 100 // total
             filled = pct // 10
             bar = "▓" * filled + "░" * (10 - filled)
@@ -8118,7 +8118,7 @@ async def ssh_exec_multi(msg, routers_dict, targets, cmd, context):
         results.append((cn, ok, out))
         done += 1
         now_t = time.time()
-        if total > 3 and (done % 5 == 0 or done == total) and now_t - last_edit >= 2:
+        if now_t - last_edit >= 2 or done == total:
             pct = done * 100 // total
             filled = pct // 10
             bar = "▓" * filled + "░" * (10 - filled)
@@ -9293,7 +9293,7 @@ async def ssh_ping_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 results.append(f"❌ <b>{cn}</b> ({ip}) — {out[:60]}")
             done += 1
         now_t = time.time()
-        if total > 3 and (done % 5 == 0 or done == total) and now_t - last_edit >= 2:
+        if now_t - last_edit >= 2 or done == total:
             pct = done * 100 // total
             filled = pct // 10
             bar = "▓" * filled + "░" * (10 - filled)
@@ -9462,7 +9462,7 @@ async def ssh_chpass_receive(update: Update, context: ContextTypes.DEFAULT_TYPE)
             results.append(f"❌ <b>{cn}</b> — {escape(out[:200])}")
         done += 1
         now_t = time.time()
-        if total > 3 and (done % 5 == 0 or done == total) and now_t - last_edit >= 2:
+        if now_t - last_edit >= 2 or done == total:
             pct = done * 100 // total
             filled = pct // 10
             bar = "▓" * filled + "░" * (10 - filled)
