@@ -8418,8 +8418,9 @@ def _ensure_speedtest_file():
     return os.path.exists(SPEEDTEST_FILE)
 
 
-def _parse_speed(output: str) -> str:
-    """Parse curl or wget speed output → human-readable Mbps string."""
+def _parse_speed(output: str) -> Tuple[float, str]:
+    """Parse curl or wget speed output → (mbps_float, human-readable string).
+    Returns (0.0, raw_text) on parse failure."""
     try:
         lines = output.strip().split("\n")
         for line in reversed(lines):
@@ -8431,21 +8432,28 @@ def _parse_speed(output: str) -> str:
                     secs = 1
                 bps = (SPEEDTEST_SIZE_MB * 1048576) / secs
                 mbps = bps * 8 / 1_000_000
-                if mbps >= 10:
-                    return f"~{mbps:.0f} Mbps"
-                else:
-                    return f"~{mbps:.1f} Mbps"
+                txt = f"~{mbps:.0f} Mbps" if mbps >= 10 else f"~{mbps:.1f} Mbps"
+                return mbps, txt
             # curl: bytes/sec as float
             if line.replace(".", "").replace(",", "").isdigit():
                 bps = float(line.replace(",", "."))
                 mbps = bps * 8 / 1_000_000
-                if mbps >= 10:
-                    return f"{mbps:.0f} Mbps"
-                else:
-                    return f"{mbps:.1f} Mbps"
+                txt = f"{mbps:.0f} Mbps" if mbps >= 10 else f"{mbps:.1f} Mbps"
+                return mbps, txt
     except Exception:
         pass
-    return output.strip()[-60:] if output else "—"
+    raw = output.strip()[-60:] if output else "—"
+    return 0.0, raw
+
+
+def _speed_emoji(mbps: float) -> str:
+    """Rate speed: ✅ good (>3), ⚠️ medium (1-3), 🐌 bad (<1)."""
+    if mbps >= 3:
+        return "✅"
+    elif mbps >= 1:
+        return "⚠️"
+    else:
+        return "🐌"
 
 
 async def ssh_speed_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8615,16 +8623,18 @@ async def _do_speedtest(q_or_msg, context, targets: list):
                 except Exception:
                     pass
 
+        elapsed_s = int(time.time() - start_t)
         if context.user_data.get(cancel_key) and out != "отменено":
             pass  # got result before cancel processed — use it
         if ok and out.strip() and out != "отменено":
-            speed = _parse_speed(out)
-            results.append(f"📶 <b>{cn}</b>: {speed}")
+            mbps, speed_txt = _parse_speed(out)
+            emoji = _speed_emoji(mbps)
+            results.append(f"{emoji} <b>{cn}</b>: {speed_txt} ({elapsed_s}с)")
         elif out == "отменено":
             results.append(f"⏹ <b>{cn}</b>: отменено")
         else:
             short = out.strip()[:80] if out else "—"
-            results.append(f"❌ <b>{cn}</b>: {escape(short)}")
+            results.append(f"🐌 <b>{cn}</b>: {escape(short)} ({elapsed_s}с)")
         done += 1
 
     context.user_data.pop(cancel_key, None)
