@@ -3170,9 +3170,9 @@ def build_snapshot_report(date_str: str) -> str:
         for fip in group_order:
             clients = sorted(groups[fip], key=lambda x: x[1], reverse=True)
             group_total = sum(b for _, b in clients)
-            srv_name = gost.get(fip, {}).get('name', '')
-            if srv_name:
-                lines.append(f"── {fip} ({srv_name}) ──")
+            srv_label = gost.get(fip, {}).get('label', '')
+            if srv_label:
+                lines.append(f"── {fip} ({srv_label}) ──")
             elif fip == "unknown":
                 lines.append("── оффлайн / без фронта ──")
             else:
@@ -3346,9 +3346,14 @@ def build_traffic_report():
         clients = sorted(groups[fip], key=lambda x: x[1], reverse=True)
         group_total = sum(b for _, b in clients)
         # server header
-        srv_name = gost.get(fip, {}).get('name', '')
-        if srv_name:
-            header = f"── {fip} ({srv_name}) ──"
+        srv_label = gost.get(fip, {}).get('label', '')
+        # get ISP tag from ip pool
+        pool = load_ip_pool()
+        ip_isp = {e["ip"]: e.get("isp", "all") for e in pool}
+        isp_tag = ip_isp.get(fip, "all")
+        isp_icon = {"agts": "🏢", "telekom": "📡"}.get(isp_tag, "🌐")
+        if srv_label:
+            header = f"── {isp_icon} {fip} ({srv_label}) ──"
         elif fip == "unknown":
             header = "── оффлайн / без фронта ──"
         else:
@@ -7065,8 +7070,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     cum += front_traffic.get(srv_ip, 0)
                 cum_gb = cum / 1024 / 1024 / 1024
                 pct = (cum / (limit_tb * 1024**4) * 100) if limit_tb > 0 else 0
-                name = gost.get(srv_ip, {}).get('name', srv_ip)
-                lines.append(f"{status_icon} {name} ({srv_ip})")
+                label = gost.get(srv_ip, {}).get('label', srv_ip)
+                lines.append(f"{status_icon} {label} ({srv_ip})")
                 lines.append(f"   Лимит: {limit_tb} TB | Использовано: {cum_gb:.1f} GB ({pct:.0f}%)")
         else:
             lines.append("Нет настроенных сигналов.")
@@ -7082,16 +7087,29 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup(kb))
 
     elif data == 'traffic_alert_add':
-        # Show list of GOST front-servers to pick from
+        # Show list of GOST front-servers grouped by ISP
         gost = load_gost_servers()
         if not gost:
             await safe_edit_text(q, context, "Нет GOST-серверов.",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='traffic_alert_menu')]]))
         else:
-            kb = []
+            pool = load_ip_pool()
+            ip_isp = {e["ip"]: e.get("isp", "all") for e in pool}
+            groups = {"agts": [], "telekom": [], "all": []}
             for ip, info in gost.items():
-                name = info.get('name', ip)
-                kb.append([InlineKeyboardButton(f"{name} ({ip})", callback_data=f'traffic_alert_srv:{ip}')])
+                isp_tag = ip_isp.get(ip, "all")
+                groups.setdefault(isp_tag, []).append((ip, info))
+            kb = []
+            isp_icons = {"agts": "🏢", "telekom": "📡", "all": "🌐"}
+            isp_labels = {"agts": "АГТС", "telekom": "Телеком", "all": "Все"}
+            for tag in ["agts", "telekom", "all"]:
+                items = groups.get(tag, [])
+                if not items:
+                    continue
+                icon = isp_icons.get(tag, "")
+                for ip, info in items:
+                    label = info.get('label', ip)
+                    kb.append([InlineKeyboardButton(f"{icon} {label} ({ip})", callback_data=f'traffic_alert_srv:{ip}')])
             kb.append([InlineKeyboardButton("◀️ Назад", callback_data='traffic_alert_menu')])
             await safe_edit_text(q, context, "<b>Выберите фронт-сервер для сигнала:</b>", parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup(kb))
@@ -7110,8 +7128,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         gost = load_gost_servers()
         kb = []
         for srv_ip, cfg in alerts.items():
-            name = gost.get(srv_ip, {}).get('name', srv_ip)
-            kb.append([InlineKeyboardButton(f"🔄 {name} ({srv_ip})", callback_data=f'traffic_alert_reset:{srv_ip}')])
+            label = gost.get(srv_ip, {}).get('label', srv_ip)
+            kb.append([InlineKeyboardButton(f"🔄 {label} ({srv_ip})", callback_data=f'traffic_alert_reset:{srv_ip}')])
         kb.append([InlineKeyboardButton("◀️ Назад", callback_data='traffic_alert_menu')])
         await safe_edit_text(q, context, "<b>Сбросить счётчик для:</b>", parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(kb))
@@ -7133,8 +7151,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         gost = load_gost_servers()
         kb = []
         for srv_ip in alerts:
-            name = gost.get(srv_ip, {}).get('name', srv_ip)
-            kb.append([InlineKeyboardButton(f"🗑 {name} ({srv_ip})", callback_data=f'traffic_alert_del:{srv_ip}')])
+            label = gost.get(srv_ip, {}).get('label', srv_ip)
+            kb.append([InlineKeyboardButton(f"🗑 {label} ({srv_ip})", callback_data=f'traffic_alert_del:{srv_ip}')])
         kb.append([InlineKeyboardButton("◀️ Назад", callback_data='traffic_alert_menu')])
         await safe_edit_text(q, context, "<b>Удалить сигнал для:</b>", parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(kb))
