@@ -85,10 +85,13 @@ alert_enabled = True
 clients_last_online = set()
 
 TRAFFIC_DB_PATH = "/root/monitor_bot/traffic_usage.json"
+TRAFFIC_HISTORY_DIR = "/root/monitor_bot/traffic_history"
+TRAFFIC_ALERT_PATH = "/root/monitor_bot/traffic_alerts.json"
 traffic_usage: Dict[str, Dict[str, int]] = {}
 _last_session_state = {}
 _last_traffic_save_time = 0
 TRAFFIC_SAVE_INTERVAL = 60
+_traffic_midnight_saved = False  # flag to save snapshot once per day
 
 CLIENT_META_PATH = "/root/monitor_bot/clients_meta.json"
 client_meta: Dict[str, Dict[str, str]] = {}
@@ -3092,14 +3095,219 @@ def clear_traffic_stats():
     traffic_usage = {}; _last_session_state = {}
     save_traffic_db(force=True)
 
+# ── Traffic daily snapshots ──────────────────────────────────────────
+def _ensure_traffic_history_dir():
+    os.makedirs(TRAFFIC_HISTORY_DIR, exist_ok=True)
+
+def save_traffic_snapshot():
+    """Save current traffic_usage as daily snapshot and reset counters."""
+    _ensure_traffic_history_dir()
+    today = datetime.now().strftime("%Y-%m-%d")
+    snap = {}
+    for name, val in traffic_usage.items():
+        total = val['rx'] + val['tx']
+        if total > 0:
+            snap[name] = {'rx': val['rx'], 'tx': val['tx']}
+    snap_path = os.path.join(TRAFFIC_HISTORY_DIR, f"{today}.json")
+    try:
+        with open(snap_path, "w") as f:
+            json.dump(snap, f)
+    except Exception as e:
+        print(f"[traffic_snap] save error: {e}")
+    # cleanup old snapshots (>7 days)
+    _cleanup_traffic_snapshots()
+
+def _cleanup_traffic_snapshots():
+    _ensure_traffic_history_dir()
+    cutoff = datetime.now() - timedelta(days=7)
+    for fn in os.listdir(TRAFFIC_HISTORY_DIR):
+        if not fn.endswith(".json"):
+            continue
+        try:
+            dt = datetime.strptime(fn.replace(".json", ""), "%Y-%m-%d")
+            if dt < cutoff:
+                os.remove(os.path.join(TRAFFIC_HISTORY_DIR, fn))
+        except:
+            pass
+
+def list_traffic_snapshots() -> list:
+    """Return sorted list of available snapshot dates."""
+    _ensure_traffic_history_dir()
+    dates = []
+    for fn in os.listdir(TRAFFIC_HISTORY_DIR):
+        if fn.endswith(".json"):
+            dates.append(fn.replace(".json", ""))
+    return sorted(dates, reverse=True)
+
+def load_traffic_snapshot(date_str: str) -> dict:
+    path = os.path.join(TRAFFIC_HISTORY_DIR, f"{date_str}.json")
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except:
+        return {}
+
+def build_snapshot_report(date_str: str) -> str:
+    snap = load_traffic_snapshot(date_str)
+    if not snap:
+        return f"<b>Трафик за {date_str}:</b>\nНет данных."
+    items = sorted(snap.items(), key=lambda x: x[1]['rx'] + x[1]['tx'], reverse=True)
+    grand_total = sum(v['rx'] + v['tx'] for v in snap.values())
+    max_name = max(len(n) for n, _ in items)
+    max_name = max(max_name, 6)
+    lines = [f"<b>Трафик за {date_str}:</b>", "<pre>"]
+    for name, val in items:
+        total = val['rx'] + val['tx']
+        gb = total / 1024 / 1024 / 1024
+        pct = (total / grand_total * 100) if grand_total > 0 else 0
+        size_str = f"{gb:6.2f} GB" if gb >= 0.01 else f"{total/1024/1024:6.1f} MB"
+        lines.append(f"{name:<{max_name}}  {size_str}  {pct:4.1f}%")
+    lines.append("─" * (max_name + 20))
+    gt_gb = grand_total / 1024 / 1024 / 1024
+    lines.append(f"{'Итого':<{max_name}}  {gt_gb:6.2f} GB")
+    lines.append("</pre>")
+    return "\n".join(lines)
+
+def check_midnight_snapshot():
+    """Called from monitoring loop. Saves snapshot + resets at midnight."""
+    global _traffic_midnight_saved, traffic_usage, _last_session_state
+    now = datetime.now()
+    if now.hour == 0 and now.minute < 2:
+        if not _traffic_midnight_saved:
+            # save yesterday's date
+            yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+            snap_path = os.path.join(TRAFFIC_HISTORY_DIR, f"{yesterday}.json")
+            _ensure_traffic_history_dir()
+            snap = {}
+            for name, val in traffic_usage.items():
+                total = val['rx'] + val['tx']
+                if total > 0:
+                    snap[name] = {'rx': val['rx'], 'tx': val['tx']}
+            try:
+                with open(snap_path, "w") as f:
+                    json.dump(snap, f)
+            except Exception as e:
+                print(f"[midnight_snap] {e}")
+            _cleanup_traffic_snapshots()
+            # save cumulative bytes for active alerts before reset
+            update_alert_base_on_midnight()
+            # reset daily counters
+            traffic_usage = {}
+            _last_session_state = {}
+            save_traffic_db(force=True)
+            _traffic_midnight_saved = True
+    else:
+        _traffic_midnight_saved = False
+
+# ── Traffic alerts (per front-server) ────────────────────────────────
+def load_traffic_alerts() -> dict:
+    """Load alert configs: {server_ip: {limit_tb, cumulative_bytes, notified_75, notified_90, notified_100, active}}"""
+    try:
+        with open(TRAFFIC_ALERT_PATH, "r") as f:
+            return json.load(f)
+    except:
+        return {}
+
+def save_traffic_alerts(alerts: dict):
+    try:
+        tmp = TRAFFIC_ALERT_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(alerts, f, indent=2)
+        os.replace(tmp, TRAFFIC_ALERT_PATH)
+    except Exception as e:
+        print(f"[traffic_alert] save error: {e}")
+
+def get_front_server_traffic() -> Dict[str, int]:
+    """Calculate total bytes per front-server IP from current traffic + client front IPs."""
+    front_ips = get_client_front_ips()
+    server_totals: Dict[str, int] = {}
+    for cn, val in traffic_usage.items():
+        total = val['rx'] + val['tx']
+        fip = front_ips.get(cn, "unknown")
+        server_totals[fip] = server_totals.get(fip, 0) + total
+    return server_totals
+
+async def check_traffic_alerts(bot):
+    """Check if any alert thresholds crossed. Called from monitoring loop."""
+    alerts = load_traffic_alerts()
+    if not alerts:
+        return
+    front_traffic = get_front_server_traffic()
+    changed = False
+    for srv_ip, cfg in alerts.items():
+        if not cfg.get('active', False):
+            continue
+        # update cumulative bytes from daily traffic
+        current_daily = front_traffic.get(srv_ip, 0)
+        # cumulative = saved_base + current daily
+        cum = cfg.get('base_bytes', 0) + current_daily
+        limit_bytes = cfg.get('limit_tb', 1) * 1024 * 1024 * 1024 * 1024  # TB → bytes
+        if limit_bytes <= 0:
+            continue
+        pct = cum / limit_bytes * 100
+        cum_gb = cum / 1024 / 1024 / 1024
+        limit_tb = cfg.get('limit_tb', 1)
+        if pct >= 100 and not cfg.get('notified_100'):
+            await bot.send_message(ADMIN_ID,
+                f"🚨 <b>ЛИМИТ ТРАФИКА!</b>\n"
+                f"Сервер: <code>{srv_ip}</code>\n"
+                f"Использовано: {cum_gb:.1f} GB / {limit_tb} TB ({pct:.0f}%)",
+                parse_mode="HTML")
+            cfg['notified_100'] = True; changed = True
+        elif pct >= 90 and not cfg.get('notified_90'):
+            await bot.send_message(ADMIN_ID,
+                f"⚠️ <b>Трафик 90%!</b>\n"
+                f"Сервер: <code>{srv_ip}</code>\n"
+                f"Использовано: {cum_gb:.1f} GB / {limit_tb} TB ({pct:.0f}%)",
+                parse_mode="HTML")
+            cfg['notified_90'] = True; changed = True
+        elif pct >= 75 and not cfg.get('notified_75'):
+            await bot.send_message(ADMIN_ID,
+                f"📊 <b>Трафик 75%!</b>\n"
+                f"Сервер: <code>{srv_ip}</code>\n"
+                f"Использовано: {cum_gb:.1f} GB / {limit_tb} TB ({pct:.0f}%)",
+                parse_mode="HTML")
+            cfg['notified_75'] = True; changed = True
+    if changed:
+        save_traffic_alerts(alerts)
+
+def update_alert_base_on_midnight():
+    """Before midnight reset, save current daily traffic into alert base_bytes."""
+    alerts = load_traffic_alerts()
+    if not alerts:
+        return
+    front_traffic = get_front_server_traffic()
+    changed = False
+    for srv_ip, cfg in alerts.items():
+        if not cfg.get('active', False):
+            continue
+        daily = front_traffic.get(srv_ip, 0)
+        cfg['base_bytes'] = cfg.get('base_bytes', 0) + daily
+        changed = True
+    if changed:
+        save_traffic_alerts(alerts)
+
 def build_traffic_report():
     if not traffic_usage:
         return "<b>Трафик:</b>\nНет данных."
     items = sorted(traffic_usage.items(), key=lambda x: x[1]['rx'] + x[1]['tx'], reverse=True)
-    lines = ["<b>Использование трафика:</b>"]
+    grand_total = sum(v['rx'] + v['tx'] for v in traffic_usage.values())
+    if grand_total == 0:
+        return "<b>Трафик:</b>\nНет данных."
+    # find max name length for alignment
+    max_name = max(len(n) for n, _ in items)
+    max_name = max(max_name, 6)  # minimum 6 chars
+    lines = ["<b>Использование трафика:</b>", "<pre>"]
     for name, val in items:
         total = val['rx'] + val['tx']
-        lines.append(f"• {name}: {total/1024/1024/1024:.2f} GB")
+        gb = total / 1024 / 1024 / 1024
+        pct = (total / grand_total * 100) if grand_total > 0 else 0
+        size_str = f"{gb:6.2f} GB" if gb >= 0.01 else f"{total/1024/1024:6.1f} MB"
+        lines.append(f"{name:<{max_name}}  {size_str}  {pct:4.1f}%")
+    lines.append("─" * (max_name + 20))
+    gt_gb = grand_total / 1024 / 1024 / 1024
+    lines.append(f"{'Итого':<{max_name}}  {gt_gb:6.2f} GB")
+    lines.append("</pre>")
     return "\n".join(lines)
 
 def parse_openvpn_status(status_path=STATUS_LOG):
@@ -3151,11 +3359,19 @@ async def check_new_connections(app: Application):
     global clients_last_online, last_alert_time
     if not hasattr(check_new_connections, "_last_enforce"):
         check_new_connections._last_enforce = 0
+    if not hasattr(check_new_connections, "_last_alert_check"):
+        check_new_connections._last_alert_check = 0
     while True:
         try:
             clients, online_names, tunnel_ips = parse_openvpn_status()
             update_traffic_from_status(clients)
+            # midnight snapshot + daily reset
+            check_midnight_snapshot()
             now_t = time.time()
+            # traffic alerts check every 30 min
+            if now_t - check_new_connections._last_alert_check > 1800:
+                await check_traffic_alerts(app.bot)
+                check_new_connections._last_alert_check = now_t
             if now_t - check_new_connections._last_enforce > ENFORCE_INTERVAL_SECONDS:
                 enforce_client_expiries()
                 check_and_notify_expiring(app.bot)
@@ -5996,6 +6212,8 @@ def _kb_openvpn():
         [InlineKeyboardButton("📊 Статистика", callback_data='stats'),
          InlineKeyboardButton("🛣️ Тунель", callback_data='send_ipp')],
         [InlineKeyboardButton("📶 Трафик", callback_data='traffic'),
+         InlineKeyboardButton("📅 История", callback_data='traffic_history')],
+        [InlineKeyboardButton("🚨 Сигнал трафика", callback_data='traffic_alert_menu'),
          InlineKeyboardButton("🧹 Очистить трафик", callback_data='traffic_clear')],
         [InlineKeyboardButton("🌐 Обновить адрес", callback_data='update_remote')],
         [InlineKeyboardButton("⏳ Сроки ключей", callback_data='keys_expiry'),
@@ -6555,6 +6773,37 @@ async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_T
         await rtunnel_setup_handler(update, context); return
     if context.user_data.get('await_rt_deploy_key_pass'):
         await rtunnel_deploy_key_handler(update, context); return
+    # Traffic alert limit input
+    if context.user_data.get('await_traffic_alert_limit'):
+        srv_ip = context.user_data.pop('await_traffic_alert_limit')
+        txt = update.message.text.strip().replace(",", ".")
+        try:
+            limit_tb = float(txt)
+            if limit_tb <= 0:
+                raise ValueError
+        except:
+            await update.message.reply_text("❌ Введите число больше 0 (например: 0.9 или 2)")
+            context.user_data['await_traffic_alert_limit'] = srv_ip
+            return
+        alerts = load_traffic_alerts()
+        alerts[srv_ip] = {
+            'limit_tb': limit_tb,
+            'base_bytes': 0,
+            'active': True,
+            'notified_75': False,
+            'notified_90': False,
+            'notified_100': False,
+        }
+        save_traffic_alerts(alerts)
+        await update.message.reply_text(
+            f"✅ Сигнал установлен!\n"
+            f"Сервер: <code>{srv_ip}</code>\n"
+            f"Лимит: {limit_tb} TB\n"
+            f"Уведомления: 75%, 90%, 100%\n"
+            f"Проверка каждые 30 минут.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='traffic_alert_menu')]]))
+        return
     # GOST text inputs
     if context.user_data.get('await_gost_add'):
         await gost_add_handler(update, context); return
@@ -6724,6 +6973,122 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == 'cancel_clear_traffic':
         await safe_edit_text(q, context, "Отменено.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='menu_openvpn')]]))
+
+    # ── Traffic history ──────────────────────────────────────────────
+    elif data == 'traffic_history':
+        dates = list_traffic_snapshots()
+        if not dates:
+            await safe_edit_text(q, context, "📅 Нет сохранённых снапшотов.\nДанные сохраняются автоматически в полночь.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='menu_openvpn')]]))
+        else:
+            kb = [[InlineKeyboardButton(f"📅 {d}", callback_data=f'traffic_snap:{d}')] for d in dates]
+            kb.append([InlineKeyboardButton("◀️ Назад", callback_data='menu_openvpn')])
+            await safe_edit_text(q, context, "<b>📅 История трафика:</b>\nВыберите дату:", parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(kb))
+
+    elif data.startswith('traffic_snap:'):
+        date_str = data[len('traffic_snap:'):]
+        report = build_snapshot_report(date_str)
+        await safe_edit_text(q, context, report, parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='traffic_history')]]))
+
+    # ── Traffic alert menu ───────────────────────────────────────────
+    elif data == 'traffic_alert_menu':
+        alerts = load_traffic_alerts()
+        gost = load_gost_servers()
+        lines = ["<b>🚨 Сигнал трафика</b>\n"]
+        if alerts:
+            for srv_ip, cfg in alerts.items():
+                status_icon = "🟢" if cfg.get('active') else "⚪"
+                limit_tb = cfg.get('limit_tb', 0)
+                cum = cfg.get('base_bytes', 0)
+                # add current daily traffic
+                front_traffic = get_front_server_traffic()
+                if cfg.get('active'):
+                    cum += front_traffic.get(srv_ip, 0)
+                cum_gb = cum / 1024 / 1024 / 1024
+                pct = (cum / (limit_tb * 1024**4) * 100) if limit_tb > 0 else 0
+                name = gost.get(srv_ip, {}).get('name', srv_ip)
+                lines.append(f"{status_icon} {name} ({srv_ip})")
+                lines.append(f"   Лимит: {limit_tb} TB | Использовано: {cum_gb:.1f} GB ({pct:.0f}%)")
+        else:
+            lines.append("Нет настроенных сигналов.")
+        lines.append("\nВыберите действие:")
+        kb = [
+            [InlineKeyboardButton("➕ Добавить сигнал", callback_data='traffic_alert_add')],
+        ]
+        if alerts:
+            kb.append([InlineKeyboardButton("🔄 Сбросить счётчик", callback_data='traffic_alert_reset_menu')])
+            kb.append([InlineKeyboardButton("🗑 Удалить сигнал", callback_data='traffic_alert_del_menu')])
+        kb.append([InlineKeyboardButton("◀️ Назад", callback_data='menu_openvpn')])
+        await safe_edit_text(q, context, "\n".join(lines), parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(kb))
+
+    elif data == 'traffic_alert_add':
+        # Show list of GOST front-servers to pick from
+        gost = load_gost_servers()
+        if not gost:
+            await safe_edit_text(q, context, "Нет GOST-серверов.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='traffic_alert_menu')]]))
+        else:
+            kb = []
+            for ip, info in gost.items():
+                name = info.get('name', ip)
+                kb.append([InlineKeyboardButton(f"{name} ({ip})", callback_data=f'traffic_alert_srv:{ip}')])
+            kb.append([InlineKeyboardButton("◀️ Назад", callback_data='traffic_alert_menu')])
+            await safe_edit_text(q, context, "<b>Выберите фронт-сервер для сигнала:</b>", parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(kb))
+
+    elif data.startswith('traffic_alert_srv:'):
+        srv_ip = data[len('traffic_alert_srv:'):]
+        context.user_data['await_traffic_alert_limit'] = srv_ip
+        await safe_edit_text(q, context,
+            f"Введите лимит трафика в TB для <code>{srv_ip}</code>:\n"
+            f"(например: <code>0.9</code> или <code>2</code>)",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Отмена", callback_data='traffic_alert_menu')]]))
+
+    elif data == 'traffic_alert_reset_menu':
+        alerts = load_traffic_alerts()
+        gost = load_gost_servers()
+        kb = []
+        for srv_ip, cfg in alerts.items():
+            name = gost.get(srv_ip, {}).get('name', srv_ip)
+            kb.append([InlineKeyboardButton(f"🔄 {name} ({srv_ip})", callback_data=f'traffic_alert_reset:{srv_ip}')])
+        kb.append([InlineKeyboardButton("◀️ Назад", callback_data='traffic_alert_menu')])
+        await safe_edit_text(q, context, "<b>Сбросить счётчик для:</b>", parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(kb))
+
+    elif data.startswith('traffic_alert_reset:'):
+        srv_ip = data[len('traffic_alert_reset:'):]
+        alerts = load_traffic_alerts()
+        if srv_ip in alerts:
+            alerts[srv_ip]['base_bytes'] = 0
+            alerts[srv_ip]['notified_75'] = False
+            alerts[srv_ip]['notified_90'] = False
+            alerts[srv_ip]['notified_100'] = False
+            save_traffic_alerts(alerts)
+        await safe_edit_text(q, context, f"✅ Счётчик для <code>{srv_ip}</code> сброшен.", parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='traffic_alert_menu')]]))
+
+    elif data == 'traffic_alert_del_menu':
+        alerts = load_traffic_alerts()
+        gost = load_gost_servers()
+        kb = []
+        for srv_ip in alerts:
+            name = gost.get(srv_ip, {}).get('name', srv_ip)
+            kb.append([InlineKeyboardButton(f"🗑 {name} ({srv_ip})", callback_data=f'traffic_alert_del:{srv_ip}')])
+        kb.append([InlineKeyboardButton("◀️ Назад", callback_data='traffic_alert_menu')])
+        await safe_edit_text(q, context, "<b>Удалить сигнал для:</b>", parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(kb))
+
+    elif data.startswith('traffic_alert_del:'):
+        srv_ip = data[len('traffic_alert_del:'):]
+        alerts = load_traffic_alerts()
+        alerts.pop(srv_ip, None)
+        save_traffic_alerts(alerts)
+        await safe_edit_text(q, context, f"✅ Сигнал для <code>{srv_ip}</code> удалён.", parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='traffic_alert_menu')]]))
 
     elif data == 'update_remote':
         await start_update_remote_dialog(update, context)
