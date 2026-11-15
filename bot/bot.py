@@ -3151,20 +3151,48 @@ def build_snapshot_report(date_str: str) -> str:
     snap = load_traffic_snapshot(date_str)
     if not snap:
         return f"<b>Трафик за {date_str}:</b>\nНет данных."
-    items = sorted(snap.items(), key=lambda x: x[1]['rx'] + x[1]['tx'], reverse=True)
     grand_total = sum(v['rx'] + v['tx'] for v in snap.values())
-    max_name = max(len(n) for n, _ in items)
+    if grand_total == 0:
+        return f"<b>Трафик за {date_str}:</b>\nНет данных."
+    # check if snapshot has front-server info
+    has_fronts = any(v.get('front') for v in snap.values())
+    max_name = max(len(n) for n in snap.keys())
     max_name = max(max_name, 6)
+    gost = load_gost_servers()
     lines = [f"<b>Трафик за {date_str}:</b>", "<pre>"]
-    for name, val in items:
-        total = val['rx'] + val['tx']
-        gb = total / 1024 / 1024 / 1024
-        pct = (total / grand_total * 100) if grand_total > 0 else 0
-        size_str = f"{gb:6.2f} GB" if gb >= 0.01 else f"{total/1024/1024:6.1f} MB"
-        lines.append(f"{name:<{max_name}}  {size_str}  {pct:4.1f}%")
-    lines.append("─" * (max_name + 20))
+    if has_fronts:
+        groups: Dict[str, list] = {}
+        for name, val in snap.items():
+            total = val['rx'] + val['tx']
+            fip = val.get('front', 'unknown')
+            groups.setdefault(fip, []).append((name, total))
+        group_order = sorted(groups.keys(), key=lambda k: sum(b for _, b in groups[k]), reverse=True)
+        for fip in group_order:
+            clients = sorted(groups[fip], key=lambda x: x[1], reverse=True)
+            group_total = sum(b for _, b in clients)
+            srv_name = gost.get(fip, {}).get('name', '')
+            if srv_name:
+                lines.append(f"── {fip} ({srv_name}) ──")
+            elif fip == "unknown":
+                lines.append("── оффлайн / без фронта ──")
+            else:
+                lines.append(f"── {fip} ──")
+            for name, total in clients:
+                pct = (total / grand_total * 100) if grand_total > 0 else 0
+                lines.append(f"  {name:<{max_name}} {_format_size(total)} {pct:4.1f}%")
+            gt_gb = group_total / 1024 / 1024 / 1024
+            lines.append(f"  {'Итого':<{max_name}} {gt_gb:6.2f} GB")
+            lines.append("")
+    else:
+        # old format without front info
+        items = sorted(snap.items(), key=lambda x: x[1]['rx'] + x[1]['tx'], reverse=True)
+        for name, val in items:
+            total = val['rx'] + val['tx']
+            pct = (total / grand_total * 100) if grand_total > 0 else 0
+            lines.append(f"{name:<{max_name}}  {_format_size(total)}  {pct:4.1f}%")
+    lines.append("═" * (max_name + 22))
     gt_gb = grand_total / 1024 / 1024 / 1024
-    lines.append(f"{'Итого':<{max_name}}  {gt_gb:6.2f} GB")
+    lines.append(f"{'ВСЕГО':<{max_name + 2}} {gt_gb:6.2f} GB")
     lines.append("</pre>")
     return "\n".join(lines)
 
@@ -3178,11 +3206,12 @@ def check_midnight_snapshot():
             yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
             snap_path = os.path.join(TRAFFIC_HISTORY_DIR, f"{yesterday}.json")
             _ensure_traffic_history_dir()
+            front_ips = get_client_front_ips()
             snap = {}
             for name, val in traffic_usage.items():
                 total = val['rx'] + val['tx']
                 if total > 0:
-                    snap[name] = {'rx': val['rx'], 'tx': val['tx']}
+                    snap[name] = {'rx': val['rx'], 'tx': val['tx'], 'front': front_ips.get(name, 'unknown')}
             try:
                 with open(snap_path, "w") as f:
                     json.dump(snap, f)
@@ -3287,26 +3316,54 @@ def update_alert_base_on_midnight():
     if changed:
         save_traffic_alerts(alerts)
 
+def _format_size(total_bytes):
+    gb = total_bytes / 1024 / 1024 / 1024
+    if gb >= 0.01:
+        return f"{gb:6.2f} GB"
+    return f"{total_bytes/1024/1024:6.1f} MB"
+
 def build_traffic_report():
     if not traffic_usage:
         return "<b>Трафик:</b>\nНет данных."
-    items = sorted(traffic_usage.items(), key=lambda x: x[1]['rx'] + x[1]['tx'], reverse=True)
     grand_total = sum(v['rx'] + v['tx'] for v in traffic_usage.values())
     if grand_total == 0:
         return "<b>Трафик:</b>\nНет данных."
-    # find max name length for alignment
-    max_name = max(len(n) for n, _ in items)
-    max_name = max(max_name, 6)  # minimum 6 chars
-    lines = ["<b>Использование трафика:</b>", "<pre>"]
-    for name, val in items:
+    # group clients by front-server IP
+    front_ips = get_client_front_ips()
+    gost = load_gost_servers()
+    groups: Dict[str, list] = {}  # {front_ip: [(name, bytes)]}
+    for name, val in traffic_usage.items():
         total = val['rx'] + val['tx']
-        gb = total / 1024 / 1024 / 1024
-        pct = (total / grand_total * 100) if grand_total > 0 else 0
-        size_str = f"{gb:6.2f} GB" if gb >= 0.01 else f"{total/1024/1024:6.1f} MB"
-        lines.append(f"{name:<{max_name}}  {size_str}  {pct:4.1f}%")
-    lines.append("─" * (max_name + 20))
+        fip = front_ips.get(name, "unknown")
+        groups.setdefault(fip, []).append((name, total))
+    # sort groups by total bytes desc
+    group_order = sorted(groups.keys(), key=lambda k: sum(b for _, b in groups[k]), reverse=True)
+    # max name length across all clients
+    max_name = max(len(n) for n in traffic_usage.keys())
+    max_name = max(max_name, 6)
+    lines = ["<b>Использование трафика:</b>", "<pre>"]
+    for fip in group_order:
+        clients = sorted(groups[fip], key=lambda x: x[1], reverse=True)
+        group_total = sum(b for _, b in clients)
+        # server header
+        srv_name = gost.get(fip, {}).get('name', '')
+        if srv_name:
+            header = f"── {fip} ({srv_name}) ──"
+        elif fip == "unknown":
+            header = "── оффлайн / без фронта ──"
+        else:
+            header = f"── {fip} ──"
+        lines.append(header)
+        for name, total in clients:
+            pct = (total / grand_total * 100) if grand_total > 0 else 0
+            lines.append(f"  {name:<{max_name}} {_format_size(total)} {pct:4.1f}%")
+        gt_gb = group_total / 1024 / 1024 / 1024
+        lines.append(f"  {'Итого':<{max_name}} {gt_gb:6.2f} GB")
+        lines.append("")
+    # grand total
+    lines.append("═" * (max_name + 22))
     gt_gb = grand_total / 1024 / 1024 / 1024
-    lines.append(f"{'Итого':<{max_name}}  {gt_gb:6.2f} GB")
+    lines.append(f"{'ВСЕГО':<{max_name + 2}} {gt_gb:6.2f} GB")
     lines.append("</pre>")
     return "\n".join(lines)
 
