@@ -9008,11 +9008,13 @@ async def ssh_isp_auto_gateway(update: Update, context: ContextTypes.DEFAULT_TYP
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("◀️ ISP теги", callback_data='ssh_isp_tag')]]))
         return
+    total = len(online_routers)
     # Show progress
+    msg = q.message
     await safe_edit_text(q, context,
         f"🌐 <b>Авто ISP (gateway)</b>\n\n"
-        f"Проверяю {len(online_routers)} онлайн роутеров...\n"
-        f"Подключаюсь по SSH и читаю gateway...",
+        f"Проверяю {total} онлайн роутеров...\n"
+        f"░░░░░░░░░░ 0/{total}  0%",
         parse_mode="HTML")
     loop = asyncio.get_event_loop()
     # SSH into each router and get gateway
@@ -9024,8 +9026,28 @@ async def ssh_isp_auto_gateway(update: Update, context: ContextTypes.DEFAULT_TYP
         'echo "$gw"'
     )
     results = {}  # cn -> (ok, gateway_output)
+    done = 0
+    last_edit = 0
     PARALLEL = 10
     to_run = list(online_routers)
+
+    async def _update_gw_progress():
+        nonlocal last_edit
+        now_t = time.time()
+        if now_t - last_edit >= 2 or done == total:
+            pct = done * 100 // total
+            filled = pct // 10
+            bar = "▓" * filled + "░" * (10 - filled)
+            try:
+                await msg.edit_text(
+                    f"🌐 <b>Авто ISP (gateway)</b>\n\n"
+                    f"Проверяю {total} онлайн роутеров...\n"
+                    f"{bar} {done}/{total}  {pct}%",
+                    parse_mode="HTML")
+                last_edit = now_t
+            except Exception:
+                pass
+
     for i in range(0, len(to_run), PARALLEL):
         batch = to_run[i:i + PARALLEL]
 
@@ -9036,6 +9058,8 @@ async def ssh_isp_auto_gateway(update: Update, context: ContextTypes.DEFAULT_TYP
         for coro in asyncio.as_completed(tasks):
             cn, result = await coro
             results[cn] = result
+            done += 1
+            await _update_gw_progress()
 
     # Analyze results
     changes = []  # (cn, old_isp, new_isp, gateway)
