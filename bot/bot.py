@@ -6358,11 +6358,14 @@ async def _reply_kb_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     files = sorted(files, key=lambda x: _natural_key(x[:-5]))
     routers = load_routers()
     pptp_clients = load_pptp_clients()
-    lines = ["<b>Статус всех ключей:</b>"]
+    # Group by ISP
+    isp_groups = {"agts": [], "telekom": [], "": []}
     cnt_online = cnt_offline = cnt_disabled = cnt_pptp = 0
+    max_name = max((len(f[:-5]) for f in files), default=10)
     for f in files:
         name = f[:-5]
         r = routers.get(name, {})
+        isp = r.get("isp", "")
         is_pptp = r.get("vpn_type") == "pptp"
         if is_pptp and name in online_names:
             switch_ts = r.get("vpn_type_ts", 0)
@@ -6370,26 +6373,47 @@ async def _reply_kb_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 r.pop("vpn_type", None)
                 r.pop("vpn_type_ts", None)
                 is_pptp = False
+        padded = name.ljust(max_name)
         if is_client_ccd_disabled(name):
             cnt_disabled += 1
-            lines.append(f"⛔ {name}")
+            entry = f"⛔ <code>{padded}</code>"
         elif is_pptp:
             pptp_ip = pptp_clients.get(name, "")
             cnt_pptp += 1
-            lines.append(f'🟡 {name}  <a href="http://{pptp_ip}">{pptp_ip}</a> [PPTP]')
+            entry = f'🟡 <code>{padded}</code> <a href="http://{pptp_ip}">{pptp_ip}</a>'
         elif name in online_names:
             cnt_online += 1
             tip = tunnel_ips.get(name, "")
             if tip:
-                lines.append(f'🟢 {name}  <a href="http://{tip}">{tip}</a>')
+                entry = f'🟢 <code>{padded}</code> <a href="http://{tip}">{tip}</a>'
             else:
-                lines.append(f"🟢 {name}")
+                entry = f"🟢 <code>{padded}</code>"
         else:
             cnt_offline += 1
-            lines.append(f"🔴 {name}")
-    summary = (f"\nОнлайн: {cnt_online}  Офлайн: {cnt_offline}  "
-               f"Откл: {cnt_disabled}  PPTP: {cnt_pptp}  Всего: {len(files)}")
-    lines.append(summary)
+            entry = f"🔴 <code>{padded}</code>"
+        if isp not in isp_groups:
+            isp_groups[isp] = []
+        isp_groups[isp].append(entry)
+    lines = ["<b>Статус всех ключей:</b>"]
+    isp_headers = {"agts": "🏢 АГТС", "telekom": "📡 Телеком", "": "🔹 Без ISP тега"}
+    for isp_key in ["agts", "telekom", ""]:
+        entries = isp_groups.get(isp_key, [])
+        if not entries:
+            continue
+        lines.append(f"\n<b>── {isp_headers[isp_key]} ({len(entries)}) ──</b>")
+        lines.extend(entries)
+    for isp_key, entries in isp_groups.items():
+        if isp_key in ("agts", "telekom", "") or not entries:
+            continue
+        lines.append(f"\n<b>── {isp_key} ({len(entries)}) ──</b>")
+        lines.extend(entries)
+    lines.append("")
+    lines.append(f"🟢 OpenVPN: <b>{cnt_online}</b>")
+    if cnt_pptp:
+        lines.append(f"🟡 PPTP: <b>{cnt_pptp}</b>")
+    lines.append(f"🔴 Оффлайн: <b>{cnt_offline}</b>")
+    lines.append(f"⛔ Отключены: <b>{cnt_disabled}</b>")
+    lines.append(f"📊 Всего: <b>{cnt_online + cnt_pptp + cnt_offline + cnt_disabled}</b>")
     kb = [[InlineKeyboardButton("🔄 Обновить", callback_data='stats'),
            InlineKeyboardButton("◀️ Меню", callback_data='menu_openvpn')]]
     await update.message.reply_text("\n".join(lines),
@@ -6953,18 +6977,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         files = sorted(files, key=lambda x: _natural_key(x[:-5]))
         routers = load_routers()
         pptp_clients = load_pptp_clients()
-        lines = ["<b>Статус всех ключей:</b>"]
-        cnt_online = 0
-        cnt_offline = 0
-        cnt_disabled = 0
-        cnt_pptp = 0
+        # Group clients by ISP
+        isp_groups = {"agts": [], "telekom": [], "": []}
+        cnt_online = cnt_offline = cnt_disabled = cnt_pptp = 0
         _stats_routers_dirty = False
+        # Find max name length for alignment
+        max_name = max((len(f[:-5]) for f in files), default=10)
         for f in files:
             name = f[:-5]
             r = routers.get(name, {})
+            isp = r.get("isp", "")
             is_pptp = r.get("vpn_type") == "pptp"
-            # Auto-correct: if marked PPTP but seen in OpenVPN status.log → fix
-            # Grace period: skip auto-correct within 10 min of manual switch
             if is_pptp and name in online_names:
                 switch_ts = r.get("vpn_type_ts", 0)
                 if time.time() - switch_ts > 600:
@@ -6972,27 +6995,45 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     r.pop("vpn_type_ts", None)
                     _stats_routers_dirty = True
                     is_pptp = False
+            padded = name.ljust(max_name)
             if is_client_ccd_disabled(name):
-                st = "⛔"
                 cnt_disabled += 1
-                lines.append(f"{st} {name}")
+                entry = f"⛔ <code>{padded}</code>"
             elif is_pptp:
-                # PPTP router — not in OpenVPN status.log
                 pptp_ip = pptp_clients.get(name, "")
                 cnt_pptp += 1
-                lines.append(f'🟡 {name}  <a href="http://{pptp_ip}">{pptp_ip}</a> [PPTP]')
+                entry = f'🟡 <code>{padded}</code> <a href="http://{pptp_ip}">{pptp_ip}</a>'
             elif name in online_names:
-                st = "🟢"
                 cnt_online += 1
                 tip = tunnel_ips.get(name, "")
                 if tip:
-                    lines.append(f'{st} {name}  <a href="http://{tip}">{tip}</a>')
+                    entry = f'🟢 <code>{padded}</code> <a href="http://{tip}">{tip}</a>'
                 else:
-                    lines.append(f"{st} {name}")
+                    entry = f"🟢 <code>{padded}</code>"
             else:
-                st = "🔴"
                 cnt_offline += 1
-                lines.append(f"{st} {name}")
+                entry = f"🔴 <code>{padded}</code>"
+            if isp not in isp_groups:
+                isp_groups[isp] = []
+            isp_groups[isp].append(entry)
+        lines = ["<b>Статус всех ключей:</b>"]
+        isp_headers = {
+            "agts": "🏢 АГТС",
+            "telekom": "📡 Телеком",
+            "": "🔹 Без ISP тега"
+        }
+        for isp_key in ["agts", "telekom", ""]:
+            entries = isp_groups.get(isp_key, [])
+            if not entries:
+                continue
+            lines.append(f"\n<b>── {isp_headers[isp_key]} ({len(entries)}) ──</b>")
+            lines.extend(entries)
+        # Other ISP tags (if any)
+        for isp_key, entries in isp_groups.items():
+            if isp_key in ("agts", "telekom", "") or not entries:
+                continue
+            lines.append(f"\n<b>── {isp_key} ({len(entries)}) ──</b>")
+            lines.extend(entries)
         lines.append("")
         lines.append(f"🟢 OpenVPN: <b>{cnt_online}</b>")
         if cnt_pptp:
@@ -11463,6 +11504,20 @@ HELP_TEXT = f"""
       Бот смотрит через какой фронт подключён
       каждый роутер → находит ISP тег фронта
       в пуле → предлагает применить.
+      Быстрый (~1 сек), но работает только если
+      фронт-серверы размечены по ISP.
+    🌐 Авто ISP (gateway+traceroute) — определение
+      ISP через SSH на каждый роутер:
+      • 10.x.x.x gateway → АГТС (PPPoE double NAT)
+      • 217.174.x.x / 119.235.x.x → Телеком
+      • 192.168.x.x (мост) → traceroute через мост:
+        второй хоп 217.174/119.235 → Телеком,
+        traceroute заблокирован → АГТС.
+      Работает для ВСЕХ роутеров включая мосты.
+      Медленнее (~1-2 мин для всех), т.к. SSH +
+      traceroute на мостах ~10 сек каждый.
+      Запоминает офлайн/ошибки — проверит при
+      следующем запуске когда роутер появится.
     При деплое скрипт на роутере переключается
     на ISP-специфичные файлы:
       АГТС → current_vpn_ip_agts.txt
