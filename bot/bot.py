@@ -9002,9 +9002,21 @@ async def ssh_isp_auto_gateway(update: Update, context: ContextTypes.DEFAULT_TYP
     routers = load_routers()
     online = get_online_clients()
     online_routers = [cn for cn in routers if cn in online]
+    # Include previously pending routers (offline/failed) that are now online
+    pending = context.user_data.get('isp_gw_pending', [])
+    rechecked = []
+    if pending:
+        for cn in pending:
+            if cn in online and cn in routers and cn not in online_routers:
+                online_routers.append(cn)
+                rechecked.append(cn)
+    # Track offline routers for next run
+    offline_routers = [cn for cn in routers if cn not in online]
     if not online_routers:
+        context.user_data['isp_gw_pending'] = offline_routers
         await safe_edit_text(q, context,
-            "⚠️ Нет онлайн роутеров для проверки.",
+            f"⚠️ Нет онлайн роутеров для проверки.\n"
+            f"📋 {len(offline_routers)} офлайн — будут проверены в следующий раз.",
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("◀️ ISP теги", callback_data='ssh_isp_tag')]]))
         return
@@ -9133,8 +9145,15 @@ async def ssh_isp_auto_gateway(update: Update, context: ContextTypes.DEFAULT_TYP
                 parts.append(f"  • {cn} → {gw}")
         if failed:
             parts.append(f"❌ SSH ошибки: {len(failed)}")
-            for cn, err in failed[:3]:
+            for cn, err in failed[:5]:
                 parts.append(f"  • {cn}: {err[:60]}")
+        if rechecked:
+            parts.append(f"\n🔄 Повторно проверено (были офлайн): {len(rechecked)}")
+        # Save pending for next run (offline + failed)
+        new_pending = offline_routers + [cn for cn, _ in failed]
+        context.user_data['isp_gw_pending'] = new_pending
+        if offline_routers:
+            parts.append(f"📋 Офлайн: {len(offline_routers)} — проверятся в следующий раз")
         await safe_edit_text(q, context, "\n".join(parts),
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(
@@ -9153,8 +9172,19 @@ async def ssh_isp_auto_gateway(update: Update, context: ContextTypes.DEFAULT_TYP
         lines.append(f"\n✅ Без изменений: {len(unchanged)}")
     if unknown:
         lines.append(f"❓ Неизвестный gateway: {len(unknown)}")
+        for cn, gw in unknown[:5]:
+            lines.append(f"  • {cn} → {gw}")
     if failed:
         lines.append(f"❌ SSH ошибки: {len(failed)}")
+        for cn, err in failed[:5]:
+            lines.append(f"  • {cn}: {err[:60]}")
+    if rechecked:
+        lines.append(f"\n🔄 Повторно проверено (были офлайн): {len(rechecked)}")
+    # Save pending for next run (offline + failed)
+    new_pending = offline_routers + [cn for cn, _ in failed]
+    context.user_data['isp_gw_pending'] = new_pending
+    if offline_routers:
+        lines.append(f"📋 Офлайн: {len(offline_routers)} — проверятся в следующий раз")
     kb = [
         [InlineKeyboardButton(f"🏷 Только тег ({len(changes)})", callback_data='ssh_isp_auto_apply:tag')],
         [InlineKeyboardButton(f"🏷 + 📦 Тег + Деплой ({len(changes)})", callback_data='ssh_isp_auto_apply:deploy')],
