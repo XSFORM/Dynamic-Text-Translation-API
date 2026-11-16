@@ -7551,6 +7551,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _ssh_isp_apply(update, context, data[len('ssh_isp_apply:'):])
     elif data == 'ssh_isp_auto':
         await ssh_isp_auto_detect(update, context)
+    elif data == 'ssh_isp_auto_gw':
+        await ssh_isp_auto_gateway(update, context)
     elif data.startswith('ssh_isp_auto_apply:'):
         await _ssh_isp_auto_apply(update, context, data[len('ssh_isp_auto_apply:'):])
     # --- Speedtest ---
@@ -8682,6 +8684,7 @@ async def ssh_isp_tag_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         InlineKeyboardButton(f"❌ Убрать тег ({count})", callback_data='ssh_isp_bulk:none'),
     ])
     kb.append([InlineKeyboardButton("🔍 Авто ISP (по фронту)", callback_data='ssh_isp_auto')])
+    kb.append([InlineKeyboardButton("🌐 Авто ISP (по gateway)", callback_data='ssh_isp_auto_gw')])
     kb.append([InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')])
     await safe_edit_text(q, context,
         f"🏷 <b>ISP теги</b> — выберите роутеры галочками\n"
@@ -8953,6 +8956,146 @@ async def _ssh_isp_auto_apply(update: Update, context: ContextTypes.DEFAULT_TYPE
         reply_markup=InlineKeyboardMarkup(
             [[InlineKeyboardButton("◀️ ISP теги", callback_data='ssh_isp_tag'),
               InlineKeyboardButton("🏠 Меню", callback_data='ssh_routers')]]))
+
+
+# =====================================================================
+#  AUTO ISP BY GATEWAY — detect ISP from router's WAN gateway via SSH
+# =====================================================================
+
+def _detect_isp_by_gateway(gw: str) -> str:
+    """Determine ISP from gateway IP.
+    Private gateway (10.x, 192.168.x, 172.16-31.x) → АГТС (double NAT).
+    Public gateway (217.174.x, 119.235.x, etc.)   → Телеком.
+    Returns 'agts', 'telekom', or '' if unknown.
+    """
+    if not gw or gw == '0.0.0.0':
+        return ''
+    parts = gw.split('.')
+    if len(parts) != 4:
+        return ''
+    try:
+        a, b = int(parts[0]), int(parts[1])
+    except ValueError:
+        return ''
+    # Private ranges → АГТС
+    if a == 10:
+        return 'agts'
+    if a == 192 and b == 168:
+        return 'agts'
+    if a == 172 and 16 <= b <= 31:
+        return 'agts'
+    # Known Телеком public subnets
+    if a == 217 and b == 174:
+        return 'telekom'
+    if a == 119 and b == 235:
+        return 'telekom'
+    # Other public IP — likely Телеком (they assign public gateways)
+    # but return empty to avoid false positives
+    return ''
+
+
+async def ssh_isp_auto_gateway(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Auto-detect ISP by SSHing into routers and reading their WAN gateway."""
+    q = update.callback_query
+    await q.answer()
+    routers = load_routers()
+    online = get_online_clients()
+    online_routers = [cn for cn in routers if cn in online]
+    if not online_routers:
+        await safe_edit_text(q, context,
+            "⚠️ Нет онлайн роутеров для проверки.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀️ ISP теги", callback_data='ssh_isp_tag')]]))
+        return
+    # Show progress
+    await safe_edit_text(q, context,
+        f"🌐 <b>Авто ISP (gateway)</b>\n\n"
+        f"Проверяю {len(online_routers)} онлайн роутеров...\n"
+        f"Подключаюсь по SSH и читаю gateway...",
+        parse_mode="HTML")
+    loop = asyncio.get_event_loop()
+    # SSH into each router and get gateway
+    # Command: try nvram first, fallback to ip route
+    gw_cmd = (
+        'gw=$(nvram get wan0_gateway 2>/dev/null); '
+        '[ -z "$gw" -o "$gw" = "0.0.0.0" ] && '
+        'gw=$(ip route 2>/dev/null | grep "^default" | head -1 | awk \'{print $3}\'); '
+        'echo "$gw"'
+    )
+    results = {}  # cn -> (ok, gateway_output)
+    PARALLEL = 10
+    to_run = list(online_routers)
+    for i in range(0, len(to_run), PARALLEL):
+        batch = to_run[i:i + PARALLEL]
+
+        async def _run_one(cn):
+            return cn, await loop.run_in_executor(None, router_ssh_exec, cn, gw_cmd)
+
+        tasks = [_run_one(cn) for cn in batch]
+        for coro in asyncio.as_completed(tasks):
+            cn, result = await coro
+            results[cn] = result
+
+    # Analyze results
+    changes = []  # (cn, old_isp, new_isp, gateway)
+    unchanged = []
+    failed = []
+    unknown = []
+    for cn in online_routers:
+        ok, output = results.get(cn, (False, ""))
+        if not ok:
+            failed.append((cn, output))
+            continue
+        gw = output.strip().split('\n')[-1].strip()  # last line
+        isp = _detect_isp_by_gateway(gw)
+        if not isp:
+            unknown.append((cn, gw))
+            continue
+        old_isp = routers[cn].get("isp", "")
+        if old_isp == isp:
+            unchanged.append(cn)
+        else:
+            changes.append((cn, old_isp, isp, gw))
+
+    if not changes:
+        parts = [f"🌐 <b>Авто ISP (gateway)</b>\n\nВсе проверенные роутеры уже имеют правильные теги."]
+        if unchanged:
+            parts.append(f"✅ Совпадают: {len(unchanged)}")
+        if unknown:
+            parts.append(f"❓ Неизвестный gateway: {len(unknown)}")
+            for cn, gw in unknown[:5]:
+                parts.append(f"  • {cn} → {gw}")
+        if failed:
+            parts.append(f"❌ SSH ошибки: {len(failed)}")
+            for cn, err in failed[:3]:
+                parts.append(f"  • {cn}: {err[:60]}")
+        await safe_edit_text(q, context, "\n".join(parts),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀️ ISP теги", callback_data='ssh_isp_tag')]]))
+        return
+
+    # Store changes (reuse same apply mechanism)
+    context.user_data['isp_auto_changes'] = [(cn, old, new) for cn, old, new, gw in changes]
+    lines = [f"🌐 <b>Авто ISP (gateway)</b> — найдено <b>{len(changes)}</b> изменений:\n"]
+    for cn, old_isp, new_isp, gw in changes:
+        old_label = ISP_NAMES.get(old_isp, "—") if old_isp else "—"
+        new_icon = {"agts": "🏢", "telekom": "📡"}.get(new_isp, "")
+        new_label = ISP_NAMES.get(new_isp, new_isp)
+        lines.append(f"• <b>{cn}</b>: {old_label} → {new_icon} {new_label} <code>({gw})</code>")
+    if unchanged:
+        lines.append(f"\n✅ Без изменений: {len(unchanged)}")
+    if unknown:
+        lines.append(f"❓ Неизвестный gateway: {len(unknown)}")
+    if failed:
+        lines.append(f"❌ SSH ошибки: {len(failed)}")
+    kb = [
+        [InlineKeyboardButton(f"🏷 Только тег ({len(changes)})", callback_data='ssh_isp_auto_apply:tag')],
+        [InlineKeyboardButton(f"🏷 + 📦 Тег + Деплой ({len(changes)})", callback_data='ssh_isp_auto_apply:deploy')],
+        [InlineKeyboardButton("◀️ Отмена", callback_data='ssh_isp_tag')],
+    ]
+    await safe_edit_text(q, context, "\n".join(lines),
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
 
 # =====================================================================
