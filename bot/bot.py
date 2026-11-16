@@ -8684,7 +8684,7 @@ async def ssh_isp_tag_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         InlineKeyboardButton(f"❌ Убрать тег ({count})", callback_data='ssh_isp_bulk:none'),
     ])
     kb.append([InlineKeyboardButton("🔍 Авто ISP (по фронту)", callback_data='ssh_isp_auto')])
-    kb.append([InlineKeyboardButton("🌐 Авто ISP (по gateway)", callback_data='ssh_isp_auto_gw')])
+    kb.append([InlineKeyboardButton("🌐 Авто ISP (gateway+traceroute)", callback_data='ssh_isp_auto_gw')])
     kb.append([InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')])
     await safe_edit_text(q, context,
         f"🏷 <b>ISP теги</b> — выберите роутеры галочками\n"
@@ -9012,18 +9012,51 @@ async def ssh_isp_auto_gateway(update: Update, context: ContextTypes.DEFAULT_TYP
     # Show progress
     msg = q.message
     await safe_edit_text(q, context,
-        f"🌐 <b>Авто ISP (gateway)</b>\n\n"
+        f"🌐 <b>Авто ISP (gateway+traceroute)</b>\n\n"
         f"Проверяю {total} онлайн роутеров...\n"
+        f"(мосты определяются через traceroute ~10сек)\n"
         f"░░░░░░░░░░ 0/{total}  0%",
         parse_mode="HTML")
     loop = asyncio.get_event_loop()
-    # SSH into each router and get gateway
-    # Command: try nvram first, fallback to ip route
+    # SSH into each router and detect ISP via gateway + traceroute for bridged
+    # Output format: ISP:agts / ISP:telekom / ISP:unknown[:info]
     gw_cmd = (
-        'gw=$(nvram get wan0_gateway 2>/dev/null); '
-        '[ -z "$gw" -o "$gw" = "0.0.0.0" ] && '
+        # Get default gateway and device from ip route
         'gw=$(ip route 2>/dev/null | grep "^default" | head -1 | awk \'{print $3}\'); '
-        'echo "$gw"'
+        'dev=$(ip route 2>/dev/null | grep "^default" | head -1 | awk \'{print $5}\'); '
+        # Fallback to nvram if empty
+        '[ -z "$gw" -o "$gw" = "0.0.0.0" ] && gw=$(nvram get wan0_gateway 2>/dev/null); '
+        '[ -z "$dev" ] && dev=$(nvram get wan0_ifname_t 2>/dev/null); '
+        # Parse first two octets
+        'a=$(echo $gw | cut -d. -f1); '
+        'b=$(echo $gw | cut -d. -f2); '
+        # Direct detection by gateway
+        'if [ "$a" = "10" ]; then echo "ISP:agts"; '
+        'elif [ "$a" = "217" -a "$b" = "174" ]; then echo "ISP:telekom"; '
+        'elif [ "$a" = "119" -a "$b" = "235" ]; then echo "ISP:telekom"; '
+        # Bridged router (192.168.x.x) — use traceroute to detect ISP
+        'elif [ "$a" = "192" -a "$b" = "168" ]; then '
+        '  ip route add 8.8.8.8/32 via $gw dev $dev 2>/dev/null; '
+        '  tr=$(traceroute -n -m 3 -q 1 -w 2 8.8.8.8 2>/dev/null); '
+        '  ip route del 8.8.8.8/32 via $gw dev $dev 2>/dev/null; '
+        # Parse hops 2 and 3 (skip hop 1 = bridge gateway)
+        '  hop=""; '
+        '  for line in $(echo "$tr" | tail -n +2 | sed -n "2,3p" | awk \'{print $2}\'); do '
+        '    [ "$line" != "*" ] && hop=$line && break; '
+        '  done; '
+        '  if [ -z "$hop" -o "$hop" = "*" ]; then echo "ISP:agts"; '
+        '  else '
+        '    ha=$(echo $hop | cut -d. -f1); '
+        '    hb=$(echo $hop | cut -d. -f2); '
+        '    if [ "$ha" = "217" -a "$hb" = "174" ]; then echo "ISP:telekom"; '
+        '    elif [ "$ha" = "119" -a "$hb" = "235" ]; then echo "ISP:telekom"; '
+        '    elif [ "$ha" = "10" ]; then echo "ISP:agts"; '
+        '    else echo "ISP:unknown:$hop"; fi; '
+        '  fi; '
+        'elif [ "$a" = "172" ] && [ "$b" -ge 16 ] && [ "$b" -le 31 ] 2>/dev/null; then '
+        '  echo "ISP:unknown:$gw"; '
+        'elif [ -n "$gw" ]; then echo "ISP:unknown:$gw"; '
+        'else echo "ISP:unknown:no_gw"; fi'
     )
     results = {}  # cn -> (ok, gateway_output)
     done = 0
@@ -9040,8 +9073,9 @@ async def ssh_isp_auto_gateway(update: Update, context: ContextTypes.DEFAULT_TYP
             bar = "▓" * filled + "░" * (10 - filled)
             try:
                 await msg.edit_text(
-                    f"🌐 <b>Авто ISP (gateway)</b>\n\n"
+                    f"🌐 <b>Авто ISP (gateway+traceroute)</b>\n\n"
                     f"Проверяю {total} онлайн роутеров...\n"
+                    f"(мосты определяются через traceroute ~10сек)\n"
                     f"{bar} {done}/{total}  {pct}%",
                     parse_mode="HTML")
                 last_edit = now_t
@@ -9061,8 +9095,8 @@ async def ssh_isp_auto_gateway(update: Update, context: ContextTypes.DEFAULT_TYP
             done += 1
             await _update_gw_progress()
 
-    # Analyze results
-    changes = []  # (cn, old_isp, new_isp, gateway)
+    # Analyze results — parse ISP:xxx output from enhanced command
+    changes = []  # (cn, old_isp, new_isp, info)
     unchanged = []
     failed = []
     unknown = []
@@ -9071,19 +9105,26 @@ async def ssh_isp_auto_gateway(update: Update, context: ContextTypes.DEFAULT_TYP
         if not ok:
             failed.append((cn, output))
             continue
-        gw = output.strip().split('\n')[-1].strip()  # last line
-        isp = _detect_isp_by_gateway(gw)
-        if not isp:
-            unknown.append((cn, gw))
+        last_line = output.strip().split('\n')[-1].strip()
+        if last_line.startswith("ISP:"):
+            parts_isp = last_line.split(":", 2)
+            isp = parts_isp[1] if len(parts_isp) >= 2 else ""
+            info = parts_isp[2] if len(parts_isp) >= 3 else ""
+        else:
+            # Fallback: old format (just gateway IP)
+            isp = _detect_isp_by_gateway(last_line)
+            info = last_line
+        if not isp or isp == "unknown":
+            unknown.append((cn, info or last_line))
             continue
         old_isp = routers[cn].get("isp", "")
         if old_isp == isp:
             unchanged.append(cn)
         else:
-            changes.append((cn, old_isp, isp, gw))
+            changes.append((cn, old_isp, isp, info or isp))
 
     if not changes:
-        parts = [f"🌐 <b>Авто ISP (gateway)</b>\n\nВсе проверенные роутеры уже имеют правильные теги."]
+        parts = [f"🌐 <b>Авто ISP (gateway+traceroute)</b>\n\nВсе проверенные роутеры уже имеют правильные теги."]
         if unchanged:
             parts.append(f"✅ Совпадают: {len(unchanged)}")
         if unknown:
@@ -9102,12 +9143,12 @@ async def ssh_isp_auto_gateway(update: Update, context: ContextTypes.DEFAULT_TYP
 
     # Store changes (reuse same apply mechanism)
     context.user_data['isp_auto_changes'] = [(cn, old, new) for cn, old, new, gw in changes]
-    lines = [f"🌐 <b>Авто ISP (gateway)</b> — найдено <b>{len(changes)}</b> изменений:\n"]
-    for cn, old_isp, new_isp, gw in changes:
+    lines = [f"🌐 <b>Авто ISP (gateway+traceroute)</b> — найдено <b>{len(changes)}</b> изменений:\n"]
+    for cn, old_isp, new_isp, info in changes:
         old_label = ISP_NAMES.get(old_isp, "—") if old_isp else "—"
         new_icon = {"agts": "🏢", "telekom": "📡"}.get(new_isp, "")
         new_label = ISP_NAMES.get(new_isp, new_isp)
-        lines.append(f"• <b>{cn}</b>: {old_label} → {new_icon} {new_label} <code>({gw})</code>")
+        lines.append(f"• <b>{cn}</b>: {old_label} → {new_icon} {new_label}")
     if unchanged:
         lines.append(f"\n✅ Без изменений: {len(unchanged)}")
     if unknown:
