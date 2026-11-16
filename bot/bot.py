@@ -8977,13 +8977,14 @@ def _detect_isp_by_gateway(gw: str) -> str:
         a, b = int(parts[0]), int(parts[1])
     except ValueError:
         return ''
-    # Private ranges → АГТС
+    # АГТС uses 10.x.x.x private gateways (PPPoE double NAT)
     if a == 10:
         return 'agts'
+    # 192.168.x.x and 172.16-31.x.x = behind bridge/NAT, could be any ISP
     if a == 192 and b == 168:
-        return 'agts'
+        return ''
     if a == 172 and 16 <= b <= 31:
-        return 'agts'
+        return ''
     # Known Телеком public subnets
     if a == 217 and b == 174:
         return 'telekom'
