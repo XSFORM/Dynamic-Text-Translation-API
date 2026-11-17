@@ -10167,23 +10167,26 @@ async def ssh_router_status(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         "pass5=$(nvram get wl_wpa_psk 2>/dev/null); "
         "echo \"WIFI_2G: $ssid24 | $pass24\" && "
         "echo \"WIFI_5G: $ssid5 | $pass5\" && "
-        # Connected clients from ARP (active only), enriched with names from DHCP leases
+        # Collect WiFi station MACs, then ARP clients
         "echo '---CLIENTS---' && "
         "defgw=$(ip route 2>/dev/null | grep '^default' | head -1 | awk '{print $3}'); "
-        "lan_ip=$(nvram get lan_ipaddr 2>/dev/null); "
-        "lan_net=$(echo $lan_ip | cut -d. -f1-3); "
+        # Get WiFi associated MACs (2.4GHz ra0 + 5GHz rai0)
+        "wifi_macs=$( { "
+        "  iwpriv ra0 show stainfo 2>/dev/null; "
+        "  iwpriv rai0 show stainfo 2>/dev/null; "
+        "} | grep -oiE '([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}' | tr 'A-F' 'a-f' | sort -u ); "
         "cat /proc/net/arp 2>/dev/null | tail -n +2 | grep -v '00:00:00:00:00:00' | "
         "while read cip _ _ cmac _ cdev; do "
         "  [ \"$cdev\" = \"lo\" ] && continue; "
         "  cname=$(grep -i \"$cmac\" /tmp/static_ip.inf 2>/dev/null | head -1 | cut -d',' -f3); "
         "  [ -z \"$cname\" ] && cname='*'; "
-        "  cnet=$(echo $cip | cut -d. -f1-3); "
+        "  cmac_lower=$(echo $cmac | tr 'A-F' 'a-f'); "
         "  if [ \"$cip\" = \"$defgw\" ]; then "
         "    echo \"GATEWAY: $cip  $cmac\"; "
-        "  elif [ \"$cnet\" != \"$lan_net\" ]; then "
-        "    echo \"GWCLIENT: $cip  $cname  $cmac\"; "
+        "  elif echo \"$wifi_macs\" | grep -qF \"$cmac_lower\"; then "
+        "    echo \"WIFI: $cip  $cname  $cmac\"; "
         "  else "
-        "    echo \"CLIENT: $cip  $cname  $cmac\"; "
+        "    echo \"LAN: $cip  $cname  $cmac\"; "
         "  fi; "
         "done"
     )
@@ -10193,8 +10196,8 @@ async def ssh_router_status(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         lines_raw = out.strip().split('\n')
         sys_lines = []
         wifi_lines = []
-        client_lines = []
-        gw_client_lines = []
+        wifi_clients = []   # connected to this router's WiFi
+        lan_clients = []    # wired / from main router
         gateway_line = ""
         section = 'sys'
         for line in lines_raw:
@@ -10212,12 +10215,14 @@ async def ssh_router_status(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                 stripped = line.strip()
                 if stripped.startswith("GATEWAY:"):
                     gateway_line = stripped[8:].strip()
-                elif stripped.startswith("GWCLIENT:"):
-                    gw_client_lines.append(stripped[9:].strip())
+                elif stripped.startswith("WIFI:"):
+                    wifi_clients.append(stripped[5:].strip())
+                elif stripped.startswith("LAN:"):
+                    lan_clients.append(stripped[4:].strip())
                 elif stripped.startswith("CLIENT:"):
-                    client_lines.append(stripped[7:].strip())
+                    wifi_clients.append(stripped[7:].strip())
                 elif stripped:
-                    client_lines.append(stripped)
+                    wifi_clients.append(stripped)
         parts = [f"🔍 <b>Статус {cn}</b> ({ip}):\n"]
         # System info
         parts.append(f"<pre>{escape(chr(10).join(sys_lines))}</pre>")
@@ -10243,17 +10248,22 @@ async def ssh_router_status(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             vendor = _oui_vendor(gw_mac) if gw_mac else ""
             vendor_str = f" ({vendor})" if vendor else ""
             parts.append(f"\n🔗 <b>Шлюз:</b> <code>{escape(gateway_line)}</code>{vendor_str}")
-            # Clients connected to the gateway (different subnet)
-            if gw_client_lines:
-                parts.append(f"  └ <b>За шлюзом ({len(gw_client_lines)}):</b>")
-                for cl in gw_client_lines:
+            # LAN clients (came through cable / main router WiFi)
+            if lan_clients:
+                parts.append(f"  └ <b>Через шлюз ({len(lan_clients)}):</b>")
+                for cl in lan_clients:
                     parts.append(f"    <code>{escape(cl)}</code>")
-        # Connected clients (local LAN)
-        if client_lines:
-            parts.append(f"\n👥 <b>Подключённые ({len(client_lines)}):</b>")
-            for cl in client_lines:
+        # WiFi clients (connected to this router's WiFi)
+        if wifi_clients:
+            parts.append(f"\n📶 <b>WiFi клиенты ({len(wifi_clients)}):</b>")
+            for cl in wifi_clients:
                 parts.append(f"  <code>{escape(cl)}</code>")
-        elif section == 'clients':
+        # LAN clients without gateway context
+        if not gateway_line and lan_clients:
+            parts.append(f"\n🔌 <b>LAN клиенты ({len(lan_clients)}):</b>")
+            for cl in lan_clients:
+                parts.append(f"  <code>{escape(cl)}</code>")
+        if not wifi_clients and not lan_clients and section == 'clients':
             parts.append("\n👥 <b>Подключённые:</b> нет")
         text = "\n".join(parts)
     else:
