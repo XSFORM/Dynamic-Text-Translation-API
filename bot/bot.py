@@ -154,6 +154,8 @@ _OUI_VENDORS = {
     "E8:68:19": "Huawei", "F8:4A:BF": "Huawei", "0C:96:BF": "Huawei",
     "24:09:95": "Huawei", "D4:6A:A8": "Huawei", "B4:30:52": "Huawei",
     "88:44:77": "Huawei", "C4:86:E9": "Huawei", "F4:C7:14": "Huawei",
+    "B8:E3:B1": "Huawei", "00:46:4B": "Huawei", "AC:E2:15": "Huawei",
+    "34:29:12": "Huawei", "58:60:5F": "Huawei", "C8:14:51": "Huawei",
     # Xiaomi / Redmi
     "78:11:DC": "Xiaomi", "64:CC:2E": "Xiaomi", "28:6C:07": "Xiaomi",
     "00:9E:C8": "Xiaomi", "7C:1C:4E": "Xiaomi", "50:64:2B": "Xiaomi",
