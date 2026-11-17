@@ -7780,6 +7780,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parts_d = data[len('ssh_wifipass_band:'):].split(':', 1)
         if len(parts_d) == 2:
             await ssh_wifipass_band(update, context, parts_d[0], parts_d[1])
+    elif data.startswith('ssh_monitor_off:'):
+        cn = data[len('ssh_monitor_off:'):]
+        await ssh_dns_monitor_off(update, context, cn)
     elif data.startswith('ssh_monitor:'):
         cn = data[len('ssh_monitor:'):]
         await ssh_dns_monitor(update, context, cn)
@@ -10747,6 +10750,7 @@ async def ssh_dns_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE, cn
             msg += "DNS-лог пуст — устройства пока не делали запросов."
         kb = [
             [InlineKeyboardButton("🔄 Обновить", callback_data=f'ssh_monitor:{cn}')],
+            [InlineKeyboardButton("🔇 Отключить логирование", callback_data=f'ssh_monitor_off:{cn}')],
             [InlineKeyboardButton("◀️ Назад", callback_data=f'ssh_status:{cn}')],
         ]
         await q.message.edit_text(msg, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
@@ -10818,11 +10822,37 @@ async def ssh_dns_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE, cn
         text = text[:3990] + "\n..."
     kb = [
         [InlineKeyboardButton("🔄 Обновить", callback_data=f'ssh_monitor:{cn}')],
+        [InlineKeyboardButton("🔇 Отключить логирование", callback_data=f'ssh_monitor_off:{cn}')],
         [InlineKeyboardButton("◀️ Назад", callback_data=f'ssh_status:{cn}')],
     ]
     await q.message.edit_text(text, parse_mode="HTML",
         disable_web_page_preview=True,
         reply_markup=InlineKeyboardMarkup(kb))
+
+async def ssh_dns_monitor_off(update: Update, context: ContextTypes.DEFAULT_TYPE, cn: str):
+    """Disable DNS logging (log-queries) on router."""
+    q = update.callback_query
+    await safe_edit_text(q, context, f"🔇 Отключаю DNS-логирование на <b>{cn}</b>...", parse_mode="HTML")
+    cmd = (
+        "if grep -q '^log-queries' /etc/storage/dnsmasq/dnsmasq.conf 2>/dev/null; then "
+        "  sed -i '/^log-queries/d' /etc/storage/dnsmasq/dnsmasq.conf; "
+        "  mtd_storage.sh save 2>/dev/null; "
+        "  restart_dhcpd 2>/dev/null; "
+        "  echo 'DNS_LOG_DISABLED'; "
+        "else "
+        "  echo 'DNS_LOG_ALREADY_OFF'; "
+        "fi"
+    )
+    ok, out = router_ssh_exec(cn, cmd)
+    kb = [[InlineKeyboardButton("◀️ Назад", callback_data=f'ssh_status:{cn}')]]
+    if not ok:
+        await q.message.edit_text(f"❌ Ошибка: {out}", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+        return
+    if "DNS_LOG_DISABLED" in out:
+        msg = f"✅ DNS-логирование отключено на <b>{cn}</b>.\nЛоги больше не пишутся."
+    else:
+        msg = f"ℹ️ DNS-логирование уже было отключено на <b>{cn}</b>."
+    await q.message.edit_text(msg, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
 async def ssh_update_script(update: Update, context: ContextTypes.DEFAULT_TYPE, cn: str):
     q = update.callback_query
