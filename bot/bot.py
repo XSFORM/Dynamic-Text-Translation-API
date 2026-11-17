@@ -127,6 +127,69 @@ RR_IP_FILE_TELEKOM = "/var/www/html/current_vpn_ip_telekom.txt"
 RR_PPTP_IP_FILE_AGTS = "/var/www/html/current_pptp_ip_agts.txt"
 RR_PPTP_IP_FILE_TELEKOM = "/var/www/html/current_pptp_ip_telekom.txt"
 ISP_NAMES = {"agts": "АГТС", "telekom": "Телеком", "all": "Все"}
+
+# OUI vendor lookup (first 3 bytes of MAC → manufacturer)
+_OUI_VENDORS = {
+    # ASUS
+    "24:CF:24": "ASUS", "2C:4D:54": "ASUS", "04:92:26": "ASUS",
+    "1C:87:2C": "ASUS", "AC:9E:17": "ASUS", "B0:6E:BF": "ASUS",
+    "50:46:5D": "ASUS", "38:D5:47": "ASUS", "10:7B:44": "ASUS",
+    "D8:50:E6": "ASUS", "40:B0:34": "ASUS", "60:45:CB": "ASUS",
+    "90:E6:BA": "ASUS", "F4:6D:04": "ASUS", "00:0C:6E": "ASUS",
+    "74:D0:2B": "ASUS", "14:DA:E9": "ASUS", "4C:ED:FB": "ASUS",
+    "C8:7F:54": "ASUS", "FC:34:97": "ASUS", "A0:36:9F": "ASUS",
+    # TP-Link
+    "50:3E:AA": "TP-Link", "14:CC:20": "TP-Link", "30:B4:9E": "TP-Link",
+    "54:AF:97": "TP-Link", "60:E3:27": "TP-Link", "64:70:02": "TP-Link",
+    "98:DA:C4": "TP-Link", "AC:84:C6": "TP-Link", "C0:06:C3": "TP-Link",
+    "D4:6E:0E": "TP-Link", "F4:EC:38": "TP-Link", "B0:4E:26": "TP-Link",
+    "EC:08:6B": "TP-Link", "F8:D1:11": "TP-Link", "5C:A6:E6": "TP-Link",
+    "78:44:76": "TP-Link", "B0:95:75": "TP-Link", "90:F6:52": "TP-Link",
+    "C0:25:E9": "TP-Link", "CC:32:E5": "TP-Link", "18:A6:F7": "TP-Link",
+    # Huawei / HiSilicon
+    "00:E0:FC": "Huawei", "48:46:FB": "Huawei", "88:28:B3": "Huawei",
+    "CC:A2:23": "Huawei", "04:F9:38": "Huawei", "10:47:80": "Huawei",
+    "20:A6:CD": "Huawei", "28:6E:D4": "Huawei", "48:DB:50": "Huawei",
+    "5C:7D:5E": "Huawei", "70:72:3C": "Huawei", "80:D0:9B": "Huawei",
+    "E8:68:19": "Huawei", "F8:4A:BF": "Huawei", "0C:96:BF": "Huawei",
+    "24:09:95": "Huawei", "D4:6A:A8": "Huawei", "B4:30:52": "Huawei",
+    "88:44:77": "Huawei", "C4:86:E9": "Huawei", "F4:C7:14": "Huawei",
+    # Xiaomi / Redmi
+    "78:11:DC": "Xiaomi", "64:CC:2E": "Xiaomi", "28:6C:07": "Xiaomi",
+    "00:9E:C8": "Xiaomi", "7C:1C:4E": "Xiaomi", "50:64:2B": "Xiaomi",
+    "58:44:98": "Xiaomi", "34:CE:00": "Xiaomi", "84:D8:1B": "Xiaomi",
+    "D4:3B:04": "Xiaomi", "F0:24:75": "Xiaomi", "8C:DE:F9": "Xiaomi",
+    "04:CF:8C": "Xiaomi", "AC:3B:77": "Xiaomi", "C4:4B:D1": "Xiaomi",
+    "B0:E2:35": "Xiaomi", "FC:64:3A": "Xiaomi", "74:23:44": "Xiaomi",
+    # D-Link
+    "1C:7E:E5": "D-Link", "28:10:7B": "D-Link", "FC:75:16": "D-Link",
+    "84:C9:B2": "D-Link", "C4:E9:0A": "D-Link", "78:54:2E": "D-Link",
+    "B8:A3:86": "D-Link", "C8:BE:19": "D-Link", "F0:B4:D2": "D-Link",
+    # Netgear
+    "2C:B0:5D": "Netgear", "44:94:FC": "Netgear", "A0:04:60": "Netgear",
+    "B0:7F:B9": "Netgear", "C0:3F:0E": "Netgear", "E0:46:9A": "Netgear",
+    "84:1B:5E": "Netgear", "6C:B0:CE": "Netgear", "9C:3D:CF": "Netgear",
+    # Tenda
+    "C8:3A:35": "Tenda", "CC:2D:E0": "Tenda", "D8:32:14": "Tenda",
+    "08:10:79": "Tenda", "B0:83:FE": "Tenda", "EC:F0:FE": "Tenda",
+    # ZTE
+    "00:19:CB": "ZTE", "00:1E:73": "ZTE", "30:4C:7E": "ZTE",
+    "54:22:F8": "ZTE", "68:77:24": "ZTE", "9C:D2:4B": "ZTE",
+    "E0:19:54": "ZTE", "18:68:CB": "ZTE", "C8:64:C7": "ZTE",
+    # Keenetic / ZyXEL
+    "50:FF:20": "Keenetic", "04:BF:6D": "Keenetic", "FC:4D:8D": "ZyXEL",
+    # Mikrotik
+    "48:8F:5A": "MikroTik", "6C:3B:6B": "MikroTik", "D4:CA:6D": "MikroTik",
+    "CC:2D:E0": "MikroTik", "E4:8D:8C": "MikroTik", "74:4D:28": "MikroTik",
+    # Mercusys
+    "50:A4:D0": "Mercusys", "94:83:C4": "Mercusys",
+}
+
+def _oui_vendor(mac: str) -> str:
+    """Lookup vendor by MAC OUI (first 3 bytes)."""
+    mac = mac.upper().replace("-", ":")
+    oui = mac[:8]
+    return _OUI_VENDORS.get(oui, "")
 ISP_LIST = ["agts", "telekom"]
 ISP_PPTP_FILES = {"agts": RR_PPTP_IP_FILE_AGTS, "telekom": RR_PPTP_IP_FILE_TELEKOM}
 RR_EMERGENCY_OEC_FILE = "/var/www/html/router/emergency_oec.txt"
@@ -10107,13 +10170,18 @@ async def ssh_router_status(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         # Connected clients from ARP (active only), enriched with names from DHCP leases
         "echo '---CLIENTS---' && "
         "defgw=$(ip route 2>/dev/null | grep '^default' | head -1 | awk '{print $3}'); "
+        "lan_ip=$(nvram get lan_ipaddr 2>/dev/null); "
+        "lan_net=$(echo $lan_ip | cut -d. -f1-3); "
         "cat /proc/net/arp 2>/dev/null | tail -n +2 | grep -v '00:00:00:00:00:00' | "
         "while read cip _ _ cmac _ cdev; do "
         "  [ \"$cdev\" = \"lo\" ] && continue; "
         "  cname=$(grep -i \"$cmac\" /tmp/static_ip.inf 2>/dev/null | head -1 | cut -d',' -f3); "
         "  [ -z \"$cname\" ] && cname='*'; "
+        "  cnet=$(echo $cip | cut -d. -f1-3); "
         "  if [ \"$cip\" = \"$defgw\" ]; then "
         "    echo \"GATEWAY: $cip  $cmac\"; "
+        "  elif [ \"$cnet\" != \"$lan_net\" ]; then "
+        "    echo \"GWCLIENT: $cip  $cname  $cmac\"; "
         "  else "
         "    echo \"CLIENT: $cip  $cname  $cmac\"; "
         "  fi; "
@@ -10126,6 +10194,7 @@ async def ssh_router_status(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         sys_lines = []
         wifi_lines = []
         client_lines = []
+        gw_client_lines = []
         gateway_line = ""
         section = 'sys'
         for line in lines_raw:
@@ -10140,10 +10209,15 @@ async def ssh_router_status(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             elif section == 'wifi':
                 wifi_lines.append(line)
             elif section == 'clients':
-                if line.strip().startswith("GATEWAY:"):
-                    gateway_line = line.strip()[8:].strip()
-                elif line.strip():
-                    client_lines.append(line)
+                stripped = line.strip()
+                if stripped.startswith("GATEWAY:"):
+                    gateway_line = stripped[8:].strip()
+                elif stripped.startswith("GWCLIENT:"):
+                    gw_client_lines.append(stripped[9:].strip())
+                elif stripped.startswith("CLIENT:"):
+                    client_lines.append(stripped[7:].strip())
+                elif stripped:
+                    client_lines.append(stripped)
         parts = [f"🔍 <b>Статус {cn}</b> ({ip}):\n"]
         # System info
         parts.append(f"<pre>{escape(chr(10).join(sys_lines))}</pre>")
@@ -10162,16 +10236,22 @@ async def ssh_router_status(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                     ssid, _, pwd = info.partition(' | ')
                     if ssid:
                         parts.append(f"  5GHz:   <code>{escape(ssid)}</code> 🔑 <code>{escape(pwd)}</code>")
-        # Gateway (upstream router/bridge)
+        # Gateway (upstream router/bridge) with OUI vendor
         if gateway_line:
-            parts.append(f"\n🔗 <b>Шлюз:</b> <code>{escape(gateway_line)}</code>")
-        # Connected clients
+            gw_parts = gateway_line.split()
+            gw_mac = gw_parts[1] if len(gw_parts) >= 2 else ""
+            vendor = _oui_vendor(gw_mac) if gw_mac else ""
+            vendor_str = f" ({vendor})" if vendor else ""
+            parts.append(f"\n🔗 <b>Шлюз:</b> <code>{escape(gateway_line)}</code>{vendor_str}")
+            # Clients connected to the gateway (different subnet)
+            if gw_client_lines:
+                parts.append(f"  └ <b>За шлюзом ({len(gw_client_lines)}):</b>")
+                for cl in gw_client_lines:
+                    parts.append(f"    <code>{escape(cl)}</code>")
+        # Connected clients (local LAN)
         if client_lines:
             parts.append(f"\n👥 <b>Подключённые ({len(client_lines)}):</b>")
             for cl in client_lines:
-                cl = cl.strip()
-                if cl.startswith("CLIENT: "):
-                    cl = cl[8:]
                 parts.append(f"  <code>{escape(cl)}</code>")
         elif section == 'clients':
             parts.append("\n👥 <b>Подключённые:</b> нет")
