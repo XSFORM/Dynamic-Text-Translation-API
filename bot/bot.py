@@ -6910,6 +6910,9 @@ async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_T
     # SSH change password text input
     if context.user_data.get('await_ssh_chpass'):
         await ssh_chpass_receive(update, context); return
+    # SSH WiFi password change text input
+    if context.user_data.get('await_ssh_wifipass'):
+        await ssh_wifipass_receive(update, context); return
     # Auto IP text inputs
     if context.user_data.get('await_aip_add'):
         await auto_ip_add_handler(update, context); return
@@ -7751,6 +7754,29 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith('ssh_status:'):
         cn = data[len('ssh_status:'):]
         await ssh_router_status(update, context, cn)
+    elif data.startswith('ssh_mf_block:'):
+        cn = data[len('ssh_mf_block:'):]
+        await ssh_mf_block_menu(update, context, cn)
+    elif data.startswith('ssh_mf_doblock:'):
+        # ssh_mf_doblock:CN:MAC
+        parts_d = data[len('ssh_mf_doblock:'):].split(':', 1)
+        if len(parts_d) == 2:
+            await ssh_mf_do_block(update, context, parts_d[0], parts_d[1])
+    elif data.startswith('ssh_mf_unblock:'):
+        cn = data[len('ssh_mf_unblock:'):]
+        await ssh_mf_unblock_menu(update, context, cn)
+    elif data.startswith('ssh_mf_dounblock:'):
+        parts_d = data[len('ssh_mf_dounblock:'):].split(':', 1)
+        if len(parts_d) == 2:
+            await ssh_mf_do_unblock(update, context, parts_d[0], parts_d[1])
+    elif data.startswith('ssh_wifipass:'):
+        cn = data[len('ssh_wifipass:'):]
+        await ssh_wifipass_menu(update, context, cn)
+    elif data.startswith('ssh_wifipass_band:'):
+        # ssh_wifipass_band:CN:BAND
+        parts_d = data[len('ssh_wifipass_band:'):].split(':', 1)
+        if len(parts_d) == 2:
+            await ssh_wifipass_band(update, context, parts_d[0], parts_d[1])
     elif data == 'ssh_select_status':
         await ssh_select_router(update, context, 'ssh_status')
     elif data == 'ssh_select_update':
@@ -10189,6 +10215,17 @@ async def ssh_router_status(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         "  else "
         "    echo \"LAN: $cip  $cname  $cmac\"; "
         "  fi; "
+        "done && "
+        # Macfilter (blocked devices)
+        "echo '---MACFILTER---' && "
+        "mf_num=$(nvram get macfilter_num_x 2>/dev/null); "
+        "mf_enable=$(nvram get macfilter_enable_x 2>/dev/null); "
+        "echo \"MF_ENABLE:$mf_enable\" && "
+        "echo \"MF_NUM:$mf_num\" && "
+        "i=0; while [ \"$i\" -lt \"${mf_num:-0}\" ] 2>/dev/null; do "
+        "  mac=$(nvram get macfilter_list_x${i} 2>/dev/null); "
+        "  [ -n \"$mac\" ] && echo \"MF_MAC:$mac\"; "
+        "  i=$((i+1)); "
         "done"
     )
     ok, out = router_ssh_exec(cn, cmd)
@@ -10200,6 +10237,8 @@ async def ssh_router_status(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         wifi_clients = []   # connected to this router's WiFi
         lan_clients = []    # wired / from main router
         gateway_line = ""
+        blocked_macs = []   # macfilter blocked MACs
+        mf_enable = ""
         section = 'sys'
         for line in lines_raw:
             if '---WIFI---' in line:
@@ -10207,6 +10246,9 @@ async def ssh_router_status(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                 continue
             elif '---CLIENTS---' in line:
                 section = 'clients'
+                continue
+            elif '---MACFILTER---' in line:
+                section = 'macfilter'
                 continue
             if section == 'sys':
                 sys_lines.append(line)
@@ -10224,6 +10266,15 @@ async def ssh_router_status(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                     wifi_clients.append(stripped[7:].strip())
                 elif stripped:
                     wifi_clients.append(stripped)
+            elif section == 'macfilter':
+                stripped = line.strip()
+                if stripped.startswith("MF_ENABLE:"):
+                    mf_enable = stripped[10:].strip()
+                elif stripped.startswith("MF_MAC:"):
+                    raw_mac = stripped[7:].strip().upper()
+                    if len(raw_mac) == 12:
+                        raw_mac = ':'.join(raw_mac[i:i+2] for i in range(0, 12, 2))
+                    blocked_macs.append(raw_mac)
         parts = [f"🔍 <b>Статус {cn}</b> ({ip}):\n"]
         # System info
         parts.append(f"<pre>{escape(chr(10).join(sys_lines))}</pre>")
@@ -10266,13 +10317,267 @@ async def ssh_router_status(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                 parts.append(f"  <code>{escape(cl)}</code>")
         if not wifi_clients and not lan_clients and section == 'clients':
             parts.append("\n👥 <b>Подключённые:</b> нет")
+        # Blocked devices (macfilter)
+        if blocked_macs:
+            parts.append(f"\n🚫 <b>Чёрный список ({len(blocked_macs)}):</b>")
+            for bm in blocked_macs:
+                vendor = _oui_vendor(bm)
+                vendor_str = f"  ({vendor})" if vendor else ""
+                parts.append(f"  <code>{escape(bm)}</code>{vendor_str}")
+        # Store data for action buttons
+        context.user_data[f'status_{cn}_wifi_clients'] = wifi_clients
+        context.user_data[f'status_{cn}_lan_clients'] = lan_clients
+        context.user_data[f'status_{cn}_blocked'] = blocked_macs
         text = "\n".join(parts)
     else:
         text = f"❌ <b>{cn}</b>: {out}"
-    kb = [[InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')]]
+    kb = []
+    kb.append([
+        InlineKeyboardButton("🔑 Сменить пароль WiFi", callback_data=f'ssh_wifipass:{cn}'),
+    ])
+    if context.user_data.get(f'status_{cn}_wifi_clients') or context.user_data.get(f'status_{cn}_lan_clients'):
+        kb.append([InlineKeyboardButton("🚫 Заблокировать", callback_data=f'ssh_mf_block:{cn}')])
+    if context.user_data.get(f'status_{cn}_blocked'):
+        kb.append([InlineKeyboardButton("✅ Разблокировать", callback_data=f'ssh_mf_unblock:{cn}')])
+    kb.append([InlineKeyboardButton("🔄 Обновить", callback_data=f'ssh_status:{cn}')])
+    kb.append([InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')])
     await q.message.edit_text(text, parse_mode="HTML",
         disable_web_page_preview=True,
         reply_markup=InlineKeyboardMarkup(kb))
+
+async def ssh_mf_block_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, cn: str):
+    """Show list of connected clients to block."""
+    q = update.callback_query
+    wifi_clients = context.user_data.get(f'status_{cn}_wifi_clients', [])
+    lan_clients = context.user_data.get(f'status_{cn}_lan_clients', [])
+    blocked_macs = [m.upper().replace(":", "") for m in context.user_data.get(f'status_{cn}_blocked', [])]
+    kb = []
+    all_clients = []
+    for cl in wifi_clients:
+        parts_cl = cl.split()
+        # format: IP  NAME  MAC
+        mac = ""
+        name = ""
+        ip_addr = ""
+        for p in parts_cl:
+            if len(p.replace(":", "").replace("-", "")) == 12 and all(c in '0123456789abcdefABCDEF:-' for c in p):
+                mac = p
+            elif p.count('.') == 3:
+                ip_addr = p
+            elif p != '*':
+                name = p
+        if mac:
+            all_clients.append(("📶", ip_addr, name, mac))
+    for cl in lan_clients:
+        parts_cl = cl.split()
+        mac = ""
+        name = ""
+        ip_addr = ""
+        for p in parts_cl:
+            if len(p.replace(":", "").replace("-", "")) == 12 and all(c in '0123456789abcdefABCDEF:-' for c in p):
+                mac = p
+            elif p.count('.') == 3:
+                ip_addr = p
+            elif p != '*':
+                name = p
+        if mac:
+            all_clients.append(("🔌", ip_addr, name, mac))
+    if not all_clients:
+        await safe_edit_text(q, context, "Нет клиентов для блокировки.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data=f'ssh_status:{cn}')]]))
+        return
+    for icon, ip_addr, name, mac in all_clients:
+        mac_clean = mac.upper().replace(":", "")
+        if mac_clean in blocked_macs:
+            continue  # already blocked
+        label = f"{icon} {name or ip_addr} ({mac[-8:]})"
+        cb_mac = mac.upper().replace(":", "")
+        kb.append([InlineKeyboardButton(label, callback_data=f'ssh_mf_doblock:{cn}:{cb_mac}')])
+    if not kb:
+        await safe_edit_text(q, context, "Все клиенты уже заблокированы.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data=f'ssh_status:{cn}')]]))
+        return
+    kb.append([InlineKeyboardButton("◀️ Назад", callback_data=f'ssh_status:{cn}')])
+    await safe_edit_text(q, context, f"🚫 <b>Заблокировать устройство на {cn}:</b>\nВыберите клиента:",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+async def ssh_mf_do_block(update: Update, context: ContextTypes.DEFAULT_TYPE, cn: str, mac_raw: str):
+    """Block a MAC address via macfilter."""
+    q = update.callback_query
+    await safe_edit_text(q, context, f"🚫 Блокирую <code>{escape(mac_raw)}</code> на <b>{cn}</b>...", parse_mode="HTML")
+    # Build shell command to add MAC to macfilter
+    cmd = (
+        f'num=$(nvram get macfilter_num_x 2>/dev/null); '
+        f'[ -z "$num" ] && num=0; '
+        f'nvram set macfilter_list_x${{num}}={mac_raw} && '
+        f'nvram set macfilter_time_x${{num}}=00002359 && '
+        f'nvram set macfilter_date_x${{num}}=1111111 && '
+        f'nvram set macfilter_num_x=$((num+1)) && '
+        f'nvram set macfilter_enable_x=2 && '
+        f'nvram commit && '
+        f'restart_firewall && '
+        f'echo "BLOCK_OK"'
+    )
+    ok, out = router_ssh_exec(cn, cmd)
+    if ok and "BLOCK_OK" in out:
+        fmt_mac = ':'.join(mac_raw[i:i+2] for i in range(0, 12, 2)) if len(mac_raw) == 12 else mac_raw
+        vendor = _oui_vendor(fmt_mac)
+        vendor_str = f" ({vendor})" if vendor else ""
+        text = f"✅ Устройство <code>{escape(fmt_mac)}</code>{vendor_str} заблокировано на <b>{cn}</b>"
+    else:
+        text = f"❌ Ошибка блокировки на <b>{cn}</b>: {escape(out[:200])}"
+    kb = [
+        [InlineKeyboardButton("🔍 Обновить статус", callback_data=f'ssh_status:{cn}')],
+        [InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')],
+    ]
+    await q.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+async def ssh_mf_unblock_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, cn: str):
+    """Show blocked devices to unblock."""
+    q = update.callback_query
+    blocked_macs = context.user_data.get(f'status_{cn}_blocked', [])
+    if not blocked_macs:
+        await safe_edit_text(q, context, "Чёрный список пуст.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data=f'ssh_status:{cn}')]]))
+        return
+    kb = []
+    for mac in blocked_macs:
+        vendor = _oui_vendor(mac)
+        vendor_str = f" ({vendor})" if vendor else ""
+        label = f"🚫 {mac}{vendor_str}"
+        cb_mac = mac.upper().replace(":", "")
+        kb.append([InlineKeyboardButton(label, callback_data=f'ssh_mf_dounblock:{cn}:{cb_mac}')])
+    kb.append([InlineKeyboardButton("◀️ Назад", callback_data=f'ssh_status:{cn}')])
+    await safe_edit_text(q, context, f"✅ <b>Разблокировать устройство на {cn}:</b>\nВыберите:",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+async def ssh_mf_do_unblock(update: Update, context: ContextTypes.DEFAULT_TYPE, cn: str, mac_raw: str):
+    """Unblock a MAC address from macfilter."""
+    q = update.callback_query
+    await safe_edit_text(q, context, f"✅ Разблокирую <code>{escape(mac_raw)}</code> на <b>{cn}</b>...", parse_mode="HTML")
+    # Shell command: find the MAC, remove it, shift remaining entries down
+    cmd = (
+        'num=$(nvram get macfilter_num_x 2>/dev/null); '
+        '[ -z "$num" -o "$num" = "0" ] && echo "EMPTY" && exit 0; '
+        'found=-1; i=0; while [ "$i" -lt "$num" ]; do '
+        '  m=$(nvram get macfilter_list_x${i} 2>/dev/null); '
+        f'  [ "$m" = "{mac_raw}" ] && found=$i; '
+        '  i=$((i+1)); '
+        'done; '
+        '[ "$found" = "-1" ] && echo "NOT_FOUND" && exit 0; '
+        # Shift entries down
+        'i=$found; last=$((num-1)); '
+        'while [ "$i" -lt "$last" ]; do '
+        '  next=$((i+1)); '
+        '  nvram set macfilter_list_x${i}=$(nvram get macfilter_list_x${next}); '
+        '  nvram set macfilter_time_x${i}=$(nvram get macfilter_time_x${next}); '
+        '  nvram set macfilter_date_x${i}=$(nvram get macfilter_date_x${next}); '
+        '  i=$((i+1)); '
+        'done; '
+        # Clear last entry and decrement count
+        'nvram set macfilter_list_x${last}= && '
+        'nvram set macfilter_time_x${last}= && '
+        'nvram set macfilter_date_x${last}= && '
+        'nvram set macfilter_num_x=$last && '
+        'nvram commit && '
+        'restart_firewall && '
+        'echo "UNBLOCK_OK"'
+    )
+    ok, out = router_ssh_exec(cn, cmd)
+    if ok and "UNBLOCK_OK" in out:
+        fmt_mac = ':'.join(mac_raw[i:i+2] for i in range(0, 12, 2)) if len(mac_raw) == 12 else mac_raw
+        text = f"✅ Устройство <code>{escape(fmt_mac)}</code> разблокировано на <b>{cn}</b>"
+    elif ok and "NOT_FOUND" in out:
+        text = f"⚠️ MAC <code>{escape(mac_raw)}</code> не найден в чёрном списке"
+    elif ok and "EMPTY" in out:
+        text = "⚠️ Чёрный список уже пуст"
+    else:
+        text = f"❌ Ошибка разблокировки на <b>{cn}</b>: {escape(out[:200])}"
+    kb = [
+        [InlineKeyboardButton("🔍 Обновить статус", callback_data=f'ssh_status:{cn}')],
+        [InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')],
+    ]
+    await q.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+async def ssh_wifipass_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, cn: str):
+    """Show WiFi password change menu - choose band."""
+    q = update.callback_query
+    kb = [
+        [InlineKeyboardButton("📶 2.4GHz (без перезагрузки)", callback_data=f'ssh_wifipass_band:{cn}:2g')],
+        [InlineKeyboardButton("📶 5GHz (⚠️ перезагрузка!)", callback_data=f'ssh_wifipass_band:{cn}:5g')],
+        [InlineKeyboardButton("📶 Оба диапазона (⚠️ перезагрузка!)", callback_data=f'ssh_wifipass_band:{cn}:both')],
+        [InlineKeyboardButton("◀️ Назад", callback_data=f'ssh_status:{cn}')],
+    ]
+    await safe_edit_text(q, context,
+        f"🔑 <b>Сменить пароль WiFi на {cn}</b>\n\n"
+        "Выберите диапазон:\n"
+        "• 2.4GHz — применится сразу, без перезагрузки\n"
+        "• 5GHz — роутер перезагрузится!\n"
+        "• Оба — роутер перезагрузится!",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+async def ssh_wifipass_band(update: Update, context: ContextTypes.DEFAULT_TYPE, cn: str, band: str):
+    """Prompt user for new WiFi password."""
+    q = update.callback_query
+    context.user_data['await_ssh_wifipass'] = True
+    context.user_data['ssh_wifipass_cn'] = cn
+    context.user_data['ssh_wifipass_band'] = band
+    band_label = {"2g": "2.4GHz", "5g": "5GHz", "both": "оба диапазона"}.get(band, band)
+    warn = ""
+    if band in ("5g", "both"):
+        warn = "\n⚠️ <b>Роутер перезагрузится после смены!</b>"
+    await safe_edit_text(q, context,
+        f"🔑 <b>Новый пароль WiFi ({band_label}) для {cn}</b>\n\n"
+        f"Введите новый пароль (минимум 8 символов):{warn}",
+        parse_mode="HTML")
+
+async def ssh_wifipass_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Receive new WiFi password and apply via SSH."""
+    if not context.user_data.get('await_ssh_wifipass'):
+        return False
+    context.user_data.pop('await_ssh_wifipass', None)
+    cn = context.user_data.pop('ssh_wifipass_cn', None)
+    band = context.user_data.pop('ssh_wifipass_band', '2g')
+    password = update.message.text.strip()
+    if not cn:
+        await update.message.reply_text("Ошибка: роутер не выбран.")
+        return True
+    if len(password) < 8:
+        await update.message.reply_text("❌ Пароль должен быть минимум 8 символов.")
+        return True
+    safe_pw = password.replace("'", "'\\''")
+    # Build command based on band
+    cmds = []
+    if band in ("2g", "both"):
+        cmds.append(f"nvram set rt_wpa_psk='{safe_pw}'")
+    if band in ("5g", "both"):
+        cmds.append(f"nvram set wl_wpa_psk='{safe_pw}'")
+    cmds.append("nvram commit")
+    # Apply
+    if band == "2g":
+        cmds.append("radio2_restart 2>/dev/null")
+    elif band == "5g":
+        cmds.append("radio5_restart 2>/dev/null")
+    else:  # both
+        cmds.append("radio2_restart 2>/dev/null; radio5_restart 2>/dev/null")
+    cmds.append('echo "WIFIPASS_OK"')
+    cmd = " && ".join(cmds)
+    msg = await update.message.reply_text(f"🔑 Меняю пароль WiFi на <b>{cn}</b>...", parse_mode="HTML")
+    ok, out = router_ssh_exec(cn, cmd)
+    band_label = {"2g": "2.4GHz", "5g": "5GHz", "both": "оба диапазона"}.get(band, band)
+    if ok and "WIFIPASS_OK" in out:
+        warn = ""
+        if band in ("5g", "both"):
+            warn = "\n⚠️ Роутер перезагружается..."
+        text = f"✅ Пароль WiFi ({band_label}) изменён на <b>{cn}</b>\nНовый пароль: <code>{escape(password)}</code>{warn}"
+    else:
+        text = f"❌ Ошибка смены пароля на <b>{cn}</b>: {escape(out[:200])}"
+    kb = [
+        [InlineKeyboardButton("🔍 Обновить статус", callback_data=f'ssh_status:{cn}')],
+        [InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')],
+    ]
+    await msg.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+    return True
 
 async def ssh_update_script(update: Update, context: ContextTypes.DEFAULT_TYPE, cn: str):
     q = update.callback_query
