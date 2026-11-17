@@ -10160,8 +10160,8 @@ async def ssh_router_status(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         "echo SCRIPT: $(/etc/storage/update_script.sh --version 2>/dev/null | head -1 || echo 'not found') && "
         "echo MODEL: $(nvram get productid 2>/dev/null || echo '?') && "
         "fv=$(nvram get firmver 2>/dev/null); bn=$(nvram get buildno 2>/dev/null); en=$(nvram get extendno 2>/dev/null); "
-        "[ -n \"$fv\" ] && echo \"FIRMWARE: ${fv}.${bn}-${en}\" || "
-        "echo FIRMWARE: $(cat /etc/storage/firmware_version 2>/dev/null || uname -r) && "
+        "if [ -n \"$fv\" ]; then echo \"FIRMWARE: ${fv}.${bn}-${en}\"; "
+        "else echo FIRMWARE: $(cat /etc/storage/firmware_version 2>/dev/null || uname -r); fi && "
         # WiFi info
         "echo '---WIFI---' && "
         "ssid24=$(nvram get rt_ssid 2>/dev/null); "
