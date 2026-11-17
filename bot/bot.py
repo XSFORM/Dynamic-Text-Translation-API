@@ -10094,7 +10094,7 @@ async def ssh_router_status(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         "echo MEMORY: $(free 2>/dev/null | head -2 || cat /proc/meminfo | head -3) && "
         "echo VPN_STATUS: $(ifconfig tun0 2>/dev/null | grep 'inet addr' || echo 'tun0 not found') && "
         "echo CRON: $(crontab -l 2>/dev/null | grep update_script || echo 'no cron') && "
-        "echo SCRIPT: $(ls -la /etc/storage/update_script.sh 2>/dev/null || echo 'not found') && "
+        "echo SCRIPT: $(/etc/storage/update_script.sh --version 2>/dev/null | head -1 || echo 'not found') && "
         "echo FIRMWARE: $(cat /etc/storage/firmware_version 2>/dev/null || uname -r) && "
         # WiFi info
         "echo '---WIFI---' && "
@@ -10104,10 +10104,14 @@ async def ssh_router_status(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         "pass5=$(nvram get wl_wpa_psk 2>/dev/null); "
         "echo \"WIFI_2G: $ssid24 | $pass24\" && "
         "echo \"WIFI_5G: $ssid5 | $pass5\" && "
-        # Connected clients
+        # Connected clients from ARP (active only), enriched with names from DHCP leases
         "echo '---CLIENTS---' && "
-        "cat /tmp/static_ip.inf 2>/dev/null | while IFS=',' read mac ip name rest; do "
-        "  [ -n \"$mac\" ] && echo \"CLIENT: $ip  $name  $mac\"; "
+        "cat /proc/net/arp 2>/dev/null | tail -n +2 | grep -v '00:00:00:00:00:00' | "
+        "while read cip _ _ cmac _ cdev; do "
+        "  [ \"$cdev\" = \"lo\" ] && continue; "
+        "  cname=$(grep -i \"$cmac\" /tmp/static_ip.inf 2>/dev/null | head -1 | cut -d',' -f3); "
+        "  [ -z \"$cname\" ] && cname='*'; "
+        "  echo \"CLIENT: $cip  $cname  $cmac\"; "
         "done"
     )
     ok, out = router_ssh_exec(cn, cmd)
