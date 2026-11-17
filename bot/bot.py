@@ -10106,12 +10106,17 @@ async def ssh_router_status(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         "echo \"WIFI_5G: $ssid5 | $pass5\" && "
         # Connected clients from ARP (active only), enriched with names from DHCP leases
         "echo '---CLIENTS---' && "
+        "defgw=$(ip route 2>/dev/null | grep '^default' | head -1 | awk '{print $3}'); "
         "cat /proc/net/arp 2>/dev/null | tail -n +2 | grep -v '00:00:00:00:00:00' | "
         "while read cip _ _ cmac _ cdev; do "
         "  [ \"$cdev\" = \"lo\" ] && continue; "
         "  cname=$(grep -i \"$cmac\" /tmp/static_ip.inf 2>/dev/null | head -1 | cut -d',' -f3); "
         "  [ -z \"$cname\" ] && cname='*'; "
-        "  echo \"CLIENT: $cip  $cname  $cmac\"; "
+        "  if [ \"$cip\" = \"$defgw\" ]; then "
+        "    echo \"GATEWAY: $cip  $cmac\"; "
+        "  else "
+        "    echo \"CLIENT: $cip  $cname  $cmac\"; "
+        "  fi; "
         "done"
     )
     ok, out = router_ssh_exec(cn, cmd)
@@ -10121,6 +10126,7 @@ async def ssh_router_status(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         sys_lines = []
         wifi_lines = []
         client_lines = []
+        gateway_line = ""
         section = 'sys'
         for line in lines_raw:
             if '---WIFI---' in line:
@@ -10134,7 +10140,9 @@ async def ssh_router_status(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             elif section == 'wifi':
                 wifi_lines.append(line)
             elif section == 'clients':
-                if line.strip():
+                if line.strip().startswith("GATEWAY:"):
+                    gateway_line = line.strip()[8:].strip()
+                elif line.strip():
                     client_lines.append(line)
         parts = [f"🔍 <b>Статус {cn}</b> ({ip}):\n"]
         # System info
@@ -10154,6 +10162,9 @@ async def ssh_router_status(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                     ssid, _, pwd = info.partition(' | ')
                     if ssid:
                         parts.append(f"  5GHz:   <code>{escape(ssid)}</code> 🔑 <code>{escape(pwd)}</code>")
+        # Gateway (upstream router/bridge)
+        if gateway_line:
+            parts.append(f"\n🔗 <b>Шлюз:</b> <code>{escape(gateway_line)}</code>")
         # Connected clients
         if client_lines:
             parts.append(f"\n👥 <b>Подключённые ({len(client_lines)}):</b>")
