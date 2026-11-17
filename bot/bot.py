@@ -10240,7 +10240,14 @@ async def ssh_router_status(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         "    echo \"MF_MAC:$mac:$mname\"; "
         "  fi; "
         "  i=$((i+1)); "
-        "done"
+        "done && "
+        # DNS logging status
+        "echo '---DNSLOG_STATUS---' && "
+        "if grep -q '^log-queries' /etc/storage/dnsmasq/dnsmasq.conf 2>/dev/null; then "
+        "  echo 'DNSLOG:ON'; "
+        "else "
+        "  echo 'DNSLOG:OFF'; "
+        "fi"
     )
     ok, out = router_ssh_exec(cn, cmd)
     if ok:
@@ -10253,6 +10260,7 @@ async def ssh_router_status(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         gateway_line = ""
         blocked_macs = []   # macfilter blocked MACs
         mf_enable = ""
+        dns_log_on = False
         section = 'sys'
         for line in lines_raw:
             if '---WIFI---' in line:
@@ -10263,6 +10271,9 @@ async def ssh_router_status(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                 continue
             elif '---MACFILTER---' in line:
                 section = 'macfilter'
+                continue
+            elif '---DNSLOG_STATUS---' in line:
+                section = 'dnslog'
                 continue
             if section == 'sys':
                 sys_lines.append(line)
@@ -10280,6 +10291,10 @@ async def ssh_router_status(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                     wifi_clients.append(stripped[7:].strip())
                 elif stripped:
                     wifi_clients.append(stripped)
+            elif section == 'dnslog':
+                stripped = line.strip()
+                if stripped == 'DNSLOG:ON':
+                    dns_log_on = True
             elif section == 'macfilter':
                 stripped = line.strip()
                 if stripped.startswith("MF_ENABLE:"):
@@ -10325,6 +10340,9 @@ async def ssh_router_status(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                     ssid, _, pwd = info.partition(' | ')
                     if ssid:
                         parts.append(f"  5GHz:   <code>{escape(ssid)}</code> 🔑 <code>{escape(pwd)}</code>")
+        # DNS logging status
+        dns_status = "✅ вкл" if dns_log_on else "❌ выкл"
+        parts.append(f"\n📋 <b>DNS-лог:</b> {dns_status}")
         # Helper: parse client string "IP  NAME  MAC" into structured tuple
         def _parse_client(cl_str):
             p = cl_str.split()
