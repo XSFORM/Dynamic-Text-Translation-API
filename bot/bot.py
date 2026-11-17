@@ -10029,20 +10029,12 @@ async def ssh_select_router(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         return
     online = get_online_clients()
     kb = []
-    # Build labels first to find max width for left-alignment
-    labels = []
     for cn in sorted(routers.keys(), key=_natural_key):
         status = "🟢" if cn in online else "🔴"
         isp = routers[cn].get("isp", "")
         isp_icon = {"agts": "🏢", "telekom": "📡"}.get(isp, "")
         prefix = f"{status} {isp_icon} " if isp_icon else f"{status} "
-        labels.append((f"{prefix}{cn}", cn))
-    # Two-column layout: router button (left) + tiny spacer (right) → text aligns left
-    for lbl, cn_key in labels:
-        kb.append([
-            InlineKeyboardButton(lbl, callback_data=f'{action}:{cn_key}'),
-            InlineKeyboardButton("⠀", callback_data='noop'),  # braille blank spacer
-        ])
+        kb.append([InlineKeyboardButton(f"{prefix}{cn}", callback_data=f'{action}:{cn}')])
     kb.append([InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')])
     titles = {
         'ssh_status': '🔍 Выберите роутер для статуса',
@@ -10089,10 +10081,7 @@ async def ssh_ver_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
         prefix = f"{status} {isp_icon} " if isp_icon else f"{status} "
         ver_labels.append((f"{prefix}{cn}", cn))
     for lbl, cn_key in ver_labels:
-        kb.append([
-            InlineKeyboardButton(lbl, callback_data=f'ssh_ver_one:{cn_key}'),
-            InlineKeyboardButton("⠀", callback_data='noop'),
-        ])
+        kb.append([InlineKeyboardButton(lbl, callback_data=f'ssh_ver_one:{cn_key}')])
     kb.append([InlineKeyboardButton("◀ Назад", callback_data='ssh_check_ver')])
     await safe_edit_text(q, context,
         "📋 Выберите роутер:",
