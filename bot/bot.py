@@ -10094,16 +10094,79 @@ async def ssh_router_status(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         "echo MEMORY: $(free 2>/dev/null | head -2 || cat /proc/meminfo | head -3) && "
         "echo VPN_STATUS: $(ifconfig tun0 2>/dev/null | grep 'inet addr' || echo 'tun0 not found') && "
         "echo CRON: $(crontab -l 2>/dev/null | grep update_script || echo 'no cron') && "
-        "echo SCRIPT: $(head -3 /tmp/update_script.sh 2>/dev/null || echo 'not found') && "
-        "echo FIRMWARE: $(cat /etc/storage/firmware_version 2>/dev/null || uname -r)"
+        "echo SCRIPT: $(ls -la /etc/storage/update_script.sh 2>/dev/null || echo 'not found') && "
+        "echo FIRMWARE: $(cat /etc/storage/firmware_version 2>/dev/null || uname -r) && "
+        # WiFi info
+        "echo '---WIFI---' && "
+        "ssid24=$(nvram get rt_ssid 2>/dev/null); "
+        "pass24=$(nvram get rt_wpa_psk 2>/dev/null); "
+        "ssid5=$(nvram get wl_ssid 2>/dev/null); "
+        "pass5=$(nvram get wl_wpa_psk 2>/dev/null); "
+        "echo \"WIFI_2G: $ssid24 | $pass24\" && "
+        "echo \"WIFI_5G: $ssid5 | $pass5\" && "
+        # Connected clients
+        "echo '---CLIENTS---' && "
+        "cat /tmp/static_ip.inf 2>/dev/null | while IFS=',' read mac ip name rest; do "
+        "  [ -n \"$mac\" ] && echo \"CLIENT: $ip  $name  $mac\"; "
+        "done"
     )
     ok, out = router_ssh_exec(cn, cmd)
     if ok:
-        text = f"🔍 <b>Статус {cn}</b> ({ip}):\n\n<pre>{escape(out[:3500])}</pre>"
+        # Parse and format output nicely
+        lines_raw = out.strip().split('\n')
+        sys_lines = []
+        wifi_lines = []
+        client_lines = []
+        section = 'sys'
+        for line in lines_raw:
+            if '---WIFI---' in line:
+                section = 'wifi'
+                continue
+            elif '---CLIENTS---' in line:
+                section = 'clients'
+                continue
+            if section == 'sys':
+                sys_lines.append(line)
+            elif section == 'wifi':
+                wifi_lines.append(line)
+            elif section == 'clients':
+                if line.strip():
+                    client_lines.append(line)
+        parts = [f"🔍 <b>Статус {cn}</b> ({ip}):\n"]
+        # System info
+        parts.append(f"<pre>{escape(chr(10).join(sys_lines))}</pre>")
+        # WiFi
+        if wifi_lines:
+            parts.append("\n📶 <b>WiFi:</b>")
+            for wl in wifi_lines:
+                wl = wl.strip()
+                if wl.startswith("WIFI_2G:"):
+                    info = wl[8:].strip()
+                    ssid, _, pwd = info.partition(' | ')
+                    if ssid:
+                        parts.append(f"  2.4GHz: <code>{escape(ssid)}</code> 🔑 <code>{escape(pwd)}</code>")
+                elif wl.startswith("WIFI_5G:"):
+                    info = wl[8:].strip()
+                    ssid, _, pwd = info.partition(' | ')
+                    if ssid:
+                        parts.append(f"  5GHz:   <code>{escape(ssid)}</code> 🔑 <code>{escape(pwd)}</code>")
+        # Connected clients
+        if client_lines:
+            parts.append(f"\n👥 <b>Подключённые ({len(client_lines)}):</b>")
+            for cl in client_lines:
+                cl = cl.strip()
+                if cl.startswith("CLIENT: "):
+                    cl = cl[8:]
+                parts.append(f"  <code>{escape(cl)}</code>")
+        elif section == 'clients':
+            parts.append("\n👥 <b>Подключённые:</b> нет")
+        text = "\n".join(parts)
     else:
         text = f"❌ <b>{cn}</b>: {out}"
     kb = [[InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')]]
-    await q.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+    await q.message.edit_text(text, parse_mode="HTML",
+        disable_web_page_preview=True,
+        reply_markup=InlineKeyboardMarkup(kb))
 
 async def ssh_update_script(update: Update, context: ContextTypes.DEFAULT_TYPE, cn: str):
     q = update.callback_query
