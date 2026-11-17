@@ -10158,6 +10158,9 @@ async def ssh_router_status(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         "echo VPN_STATUS: $(ifconfig tun0 2>/dev/null | grep 'inet addr' || echo 'tun0 not found') && "
         "echo CRON: $(crontab -l 2>/dev/null | grep update_script || echo 'no cron') && "
         "echo SCRIPT: $(/etc/storage/update_script.sh --version 2>/dev/null | head -1 || echo 'not found') && "
+        "echo MODEL: $(nvram get productid 2>/dev/null || echo '?') && "
+        "fv=$(nvram get firmver 2>/dev/null); bn=$(nvram get buildno 2>/dev/null); en=$(nvram get extendno 2>/dev/null); "
+        "[ -n \"$fv\" ] && echo \"FIRMWARE: ${fv}.${bn}-${en}\" || "
         "echo FIRMWARE: $(cat /etc/storage/firmware_version 2>/dev/null || uname -r) && "
         # WiFi info
         "echo '---WIFI---' && "
