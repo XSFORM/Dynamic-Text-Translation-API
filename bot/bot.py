@@ -146,6 +146,7 @@ _OUI_VENDORS = {
     "EC:08:6B": "TP-Link", "F8:D1:11": "TP-Link", "5C:A6:E6": "TP-Link",
     "78:44:76": "TP-Link", "B0:95:75": "TP-Link", "90:F6:52": "TP-Link",
     "C0:25:E9": "TP-Link", "CC:32:E5": "TP-Link", "18:A6:F7": "TP-Link",
+    "24:2F:D0": "TP-Link", "A4:2B:B0": "TP-Link", "34:60:F9": "TP-Link",
     # Huawei / HiSilicon
     "00:E0:FC": "Huawei", "48:46:FB": "Huawei", "88:28:B3": "Huawei",
     "CC:A2:23": "Huawei", "04:F9:38": "Huawei", "10:47:80": "Huawei",
