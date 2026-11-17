@@ -10029,12 +10029,22 @@ async def ssh_select_router(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         return
     online = get_online_clients()
     kb = []
+    # Build labels first to find max width for left-alignment
+    labels = []
     for cn in sorted(routers.keys(), key=_natural_key):
         status = "🟢" if cn in online else "🔴"
         isp = routers[cn].get("isp", "")
         isp_icon = {"agts": "🏢", "telekom": "📡"}.get(isp, "")
         prefix = f"{status} {isp_icon} " if isp_icon else f"{status} "
-        kb.append([InlineKeyboardButton(f"{prefix}{cn}", callback_data=f'{action}:{cn}')])
+        labels.append((f"{prefix}{cn}", cn))
+    # Pad labels to same width so buttons fill the row and text aligns left
+    if labels:
+        max_len = max(len(lbl) for lbl, _ in labels)
+        pad_to = max_len + 6  # extra padding for uniform look
+        _PAD_CH = " "  # en space — Telegram preserves it in buttons
+        for lbl, cn_key in labels:
+            padded = lbl + _PAD_CH * (pad_to - len(lbl))
+            kb.append([InlineKeyboardButton(padded, callback_data=f'{action}:{cn_key}')])
     kb.append([InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')])
     titles = {
         'ssh_status': '🔍 Выберите роутер для статуса',
@@ -10073,12 +10083,19 @@ async def ssh_ver_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     routers = load_routers()
     online = get_online_clients()
     kb = []
+    ver_labels = []
     for cn in sorted(routers.keys(), key=_natural_key):
         isp = routers[cn].get("isp", "")
         isp_icon = {"agts": "🏢", "telekom": "📡"}.get(isp, "")
         status = "🟢" if cn in online else "🔴"
         prefix = f"{status} {isp_icon} " if isp_icon else f"{status} "
-        kb.append([InlineKeyboardButton(f"{prefix}{cn}", callback_data=f'ssh_ver_one:{cn}')])
+        ver_labels.append((f"{prefix}{cn}", cn))
+    if ver_labels:
+        max_vl = max(len(lbl) for lbl, _ in ver_labels)
+        pad_vl = max_vl + 6
+        _PAD = " "
+        for lbl, cn_key in ver_labels:
+            kb.append([InlineKeyboardButton(lbl + _PAD * (pad_vl - len(lbl)), callback_data=f'ssh_ver_one:{cn_key}')])
     kb.append([InlineKeyboardButton("◀ Назад", callback_data='ssh_check_ver')])
     await safe_edit_text(q, context,
         "📋 Выберите роутер:",
