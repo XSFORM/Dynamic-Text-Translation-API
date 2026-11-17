@@ -10686,7 +10686,7 @@ async def ssh_dns_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE, cn
     """Show DNS activity from router syslog, grouped by device and category."""
     q = update.callback_query
     await safe_edit_text(q, context, f"👁 Читаю DNS-лог на <b>{cn}</b>...", parse_mode="HTML")
-    # Auto-enable log-queries if not present, then read DNS log
+    # Auto-enable log-queries if not present, then read DNS log + device names
     cmd = (
         # Check and enable log-queries if missing
         "if ! grep -q '^log-queries' /etc/storage/dnsmasq/dnsmasq.conf 2>/dev/null; then "
@@ -10695,7 +10695,14 @@ async def ssh_dns_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE, cn
         "  restart_dhcpd 2>/dev/null; "
         "  echo 'DNS_LOG_ENABLED'; "
         "fi; "
-        # Read DNS queries
+        # Device names from DHCP leases
+        "echo '---DEVNAMES---'; "
+        "cat /tmp/static_ip.inf 2>/dev/null; "
+        # ARP table for IP→name fallback
+        "echo '---ARPNAMES---'; "
+        "cat /proc/net/arp 2>/dev/null | tail -n +2 | grep -v '00:00:00:00:00:00'; "
+        # DNS queries
+        "echo '---DNSLOG---'; "
         "cat /tmp/syslog.log 2>/dev/null | "
         "grep 'query\\[A\\]' | "
         "awk '{print $6, $8}' | "
@@ -10707,9 +10714,32 @@ async def ssh_dns_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE, cn
         await q.message.edit_text(f"❌ Ошибка: {out}", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
         return
     just_enabled = "DNS_LOG_ENABLED" in out
-    # Remove the DNS_LOG_ENABLED marker from output
     out = out.replace("DNS_LOG_ENABLED", "").strip()
-    if not out.strip():
+    # Split output into sections
+    devnames_data = ""
+    dns_data = ""
+    section = ""
+    sections = {"devnames": [], "arp": [], "dns": []}
+    for line in out.split('\n'):
+        if '---DEVNAMES---' in line:
+            section = "devnames"; continue
+        elif '---ARPNAMES---' in line:
+            section = "arp"; continue
+        elif '---DNSLOG---' in line:
+            section = "dns"; continue
+        if section:
+            sections[section].append(line)
+    # Build IP→name mapping from DHCP leases
+    ip_names = {}
+    for nl in sections["devnames"]:
+        nparts = nl.split(',')
+        if len(nparts) >= 3:
+            lease_ip = nparts[1].strip()
+            lease_name = nparts[2].strip()
+            if lease_ip and lease_name:
+                ip_names[lease_ip] = lease_name
+    dns_lines = "\n".join(sections["dns"]).strip()
+    if not dns_lines:
         msg = f"👁 <b>Мониторинг {cn}</b>\n\n"
         if just_enabled:
             msg += "✅ DNS-логирование включено!\nЛог пока пуст — данные появятся через 1-2 минуты.\nНажмите «Обновить» чуть позже."
@@ -10721,25 +10751,9 @@ async def ssh_dns_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE, cn
         ]
         await q.message.edit_text(msg, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
         return
-    # Parse: "  COUNT DOMAIN IP"
-    # Also get device names from DHCP
-    cmd_names = (
-        "cat /tmp/static_ip.inf 2>/dev/null"
-    )
-    _, names_out = router_ssh_exec(cn, cmd_names)
-    # Build IP→name mapping from DHCP leases
-    ip_names = {}
-    if names_out:
-        for nl in names_out.strip().split('\n'):
-            nparts = nl.split(',')
-            if len(nparts) >= 3:
-                lease_ip = nparts[1].strip() if len(nparts) > 1 else ""
-                lease_name = nparts[2].strip() if len(nparts) > 2 else ""
-                if lease_ip and lease_name:
-                    ip_names[lease_ip] = lease_name
     # Parse DNS data: {ip: {category: count}}
     devices = {}  # ip -> {cat -> count, "_other" -> [(domain, count)]}
-    for line in out.strip().split('\n'):
+    for line in dns_lines.split('\n'):
         line = line.strip()
         if not line:
             continue
