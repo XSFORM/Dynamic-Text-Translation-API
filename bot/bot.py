@@ -10328,10 +10328,10 @@ async def ssh_router_status(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                 elif tok != '*' and not name_a:
                     name_a = tok
             return ip_a, name_a or '*', mac_a
-        def _fmt_client(cl_str):
+        def _fmt_client_html(cl_str):
             ip_a, name_a, mac_a = _parse_client(cl_str)
-            name_disp = name_a if name_a != '*' else '—'
-            return f"{ip_a}  {name_disp}  {mac_a}"
+            name_disp = escape(name_a) if name_a != '*' else '—'
+            return f"<code>{escape(ip_a)}</code>  {name_disp}\n      <code>{escape(mac_a)}</code>"
         # Gateway (upstream router/bridge) with OUI vendor
         if gateway_line:
             gw_parts = gateway_line.split()
@@ -10343,17 +10343,17 @@ async def ssh_router_status(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             if lan_clients:
                 parts.append(f"  └ <b>Через шлюз ({len(lan_clients)}):</b>")
                 for cl in lan_clients:
-                    parts.append(f"    <code>{escape(_fmt_client(cl))}</code>")
+                    parts.append(f"    {_fmt_client_html(cl)}")
         # WiFi clients (connected to this router's WiFi)
         if wifi_clients:
             parts.append(f"\n📶 <b>WiFi клиенты ({len(wifi_clients)}):</b>")
             for cl in wifi_clients:
-                parts.append(f"  <code>{escape(_fmt_client(cl))}</code>")
+                parts.append(f"  {_fmt_client_html(cl)}")
         # LAN clients without gateway context
         if not gateway_line and lan_clients:
             parts.append(f"\n🔌 <b>LAN клиенты ({len(lan_clients)}):</b>")
             for cl in lan_clients:
-                parts.append(f"  <code>{escape(_fmt_client(cl))}</code>")
+                parts.append(f"  {_fmt_client_html(cl)}")
         if not wifi_clients and not lan_clients and section == 'clients':
             parts.append("\n👥 <b>Подключённые:</b> нет")
         # Blocked devices (macfilter) — now tuples (mac, name)
