@@ -7780,6 +7780,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parts_d = data[len('ssh_wifipass_band:'):].split(':', 1)
         if len(parts_d) == 2:
             await ssh_wifipass_band(update, context, parts_d[0], parts_d[1])
+    elif data.startswith('ssh_monitor:'):
+        cn = data[len('ssh_monitor:'):]
+        await ssh_dns_monitor(update, context, cn)
     elif data == 'ssh_select_status':
         await ssh_select_router(update, context, 'ssh_status')
     elif data == 'ssh_select_update':
@@ -10389,6 +10392,7 @@ async def ssh_router_status(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         kb.append([InlineKeyboardButton("🚫 Заблокировать", callback_data=f'ssh_mf_block:{cn}')])
     if context.user_data.get(f'status_{cn}_blocked'):
         kb.append([InlineKeyboardButton("✅ Разблокировать", callback_data=f'ssh_mf_unblock:{cn}')])
+    kb.append([InlineKeyboardButton("👁 Мониторинг", callback_data=f'ssh_monitor:{cn}')])
     kb.append([InlineKeyboardButton("🔄 Обновить", callback_data=f'ssh_status:{cn}')])
     kb.append([InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')])
     await q.message.edit_text(text, parse_mode="HTML",
@@ -10638,6 +10642,160 @@ async def ssh_wifipass_receive(update: Update, context: ContextTypes.DEFAULT_TYP
     ]
     await msg.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
     return True
+
+# --- DNS monitoring: domain categorization ---
+_DNS_CATEGORIES = {
+    "📸 Instagram": ["instagram.com", "cdninstagram.com"],
+    "🎵 TikTok": ["tiktok.com", "tiktokcdn.com", "musical.ly", "tiktokv.com", "byteoversea.com", "ibytedtos.com"],
+    "▶️ YouTube": ["youtube.com", "googlevideo.com", "ytimg.com", "yt3.ggpht.com", "youtu.be", "youtube-nocookie.com"],
+    "📘 Facebook": ["facebook.com", "fbcdn.net", "fb.com", "facebook.net"],
+    "💬 WhatsApp": ["whatsapp.com", "whatsapp.net"],
+    "✈️ Telegram": ["telegram.org", "t.me", "telegram.me", "tdesktop.com", "telesco.pe"],
+    "🎬 Netflix": ["netflix.com", "nflxvideo.net", "nflximg.net", "nflxso.net", "nflxext.com"],
+    "🐦 Twitter/X": ["twitter.com", "x.com", "twimg.com", "t.co"],
+    "📌 Pinterest": ["pinterest.com", "pinimg.com"],
+    "👻 Snapchat": ["snapchat.com", "snap.com", "snapkit.co", "sc-cdn.net"],
+    "🎮 Roblox": ["roblox.com", "rbxcdn.com"],
+    "🎮 Minecraft": ["minecraft.net", "mojang.com"],
+    "🔍 Google": ["google.com", "googleapis.com", "gstatic.com", "google.ru"],
+    "🍎 Apple": ["apple.com", "icloud.com", "mzstatic.com"],
+    "🎵 Spotify": ["spotify.com", "scdn.co", "spotifycdn.com"],
+    "📺 Twitch": ["twitch.tv", "twitchcdn.net", "jtvnw.net"],
+    "🎓 Учёба": ["wikipedia.org", "wikimedia.org", "khanacademy.org", "coursera.org", "edx.org"],
+    "🛒 Маркетплейс": ["aliexpress.com", "alibaba.com", "amazon.com", "wildberries.ru", "ozon.ru"],
+    "📧 Почта": ["mail.google.com", "outlook.live.com", "mail.ru", "mail.yandex.ru"],
+    "🎥 Кино": ["kinopoisk.ru", "ivi.ru", "okko.tv", "megogo.net", "premier.one"],
+    "🟣 Яндекс": ["yandex.ru", "yandex.net", "yandex.com", "ya.ru"],
+    "💼 Microsoft": ["microsoft.com", "live.com", "office.com", "msn.com", "bing.com"],
+    "🕹 Steam": ["steampowered.com", "steamcommunity.com", "steamcdn-a.akamaihd.net"],
+    "📱 Samsung": ["samsung.com", "samsungcloud.com"],
+    "🎵 Yandex Music": ["music.yandex.ru", "music.yandex.com"],
+    "👤 VK": ["vk.com", "vkontakte.ru", "vk.me", "userapi.com"],
+}
+
+def _categorize_domain(domain: str) -> str:
+    """Return category emoji+name for a domain, or empty string."""
+    domain = domain.lower()
+    for cat, patterns in _DNS_CATEGORIES.items():
+        for pat in patterns:
+            if domain == pat or domain.endswith('.' + pat):
+                return cat
+    return ""
+
+async def ssh_dns_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE, cn: str):
+    """Show DNS activity from router syslog, grouped by device and category."""
+    q = update.callback_query
+    await safe_edit_text(q, context, f"👁 Читаю DNS-лог на <b>{cn}</b>...", parse_mode="HTML")
+    # Read DNS queries from syslog
+    cmd = (
+        "cat /tmp/syslog.log 2>/dev/null | "
+        "grep 'query\\[A\\]' | "
+        "awk '{print $6, $8}' | "
+        "sort | uniq -c | sort -rn | head -300"
+    )
+    ok, out = router_ssh_exec(cn, cmd)
+    if not ok:
+        kb = [[InlineKeyboardButton("◀️ Назад", callback_data=f'ssh_status:{cn}')]]
+        await q.message.edit_text(f"❌ Ошибка: {out}", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+        return
+    if not out.strip():
+        kb = [
+            [InlineKeyboardButton("◀️ Назад", callback_data=f'ssh_status:{cn}')],
+        ]
+        await q.message.edit_text(
+            f"👁 <b>Мониторинг {cn}</b>\n\n"
+            "DNS-лог пуст. Возможно нужно включить логирование:\n"
+            "<code>log-queries</code> в dnsmasq.conf + restart_dhcpd",
+            parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+        return
+    # Parse: "  COUNT DOMAIN IP"
+    # Also get device names from DHCP
+    cmd_names = (
+        "cat /tmp/static_ip.inf 2>/dev/null"
+    )
+    _, names_out = router_ssh_exec(cn, cmd_names)
+    # Build IP→name mapping from DHCP leases
+    ip_names = {}
+    if names_out:
+        for nl in names_out.strip().split('\n'):
+            nparts = nl.split(',')
+            if len(nparts) >= 3:
+                lease_ip = nparts[1].strip() if len(nparts) > 1 else ""
+                lease_name = nparts[2].strip() if len(nparts) > 2 else ""
+                if lease_ip and lease_name:
+                    ip_names[lease_ip] = lease_name
+    # Parse DNS data: {ip: {category: count}}
+    devices = {}  # ip -> {cat -> count, "_other" -> [(domain, count)]}
+    for line in out.strip().split('\n'):
+        line = line.strip()
+        if not line:
+            continue
+        toks = line.split()
+        if len(toks) < 3:
+            continue
+        try:
+            count = int(toks[0])
+        except ValueError:
+            continue
+        domain = toks[1]
+        dev_ip = toks[2]
+        if dev_ip == "127.0.0.1":
+            continue  # skip router's own queries
+        if dev_ip not in devices:
+            devices[dev_ip] = {}
+        cat = _categorize_domain(domain)
+        if cat:
+            devices[dev_ip][cat] = devices[dev_ip].get(cat, 0) + count
+        else:
+            # Store uncategorized separately
+            key = "_other"
+            if key not in devices[dev_ip]:
+                devices[dev_ip][key] = []
+            devices[dev_ip][key].append((domain, count))
+    if not devices:
+        kb = [[InlineKeyboardButton("◀️ Назад", callback_data=f'ssh_status:{cn}')]]
+        await q.message.edit_text(f"👁 <b>Мониторинг {cn}</b>\n\nНет данных.", parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(kb))
+        return
+    # Build output
+    parts = [f"👁 <b>Мониторинг {cn}</b>\n"]
+    # Sort devices by total query count (most active first)
+    dev_totals = {}
+    for dev_ip, cats in devices.items():
+        total = sum(v for k, v in cats.items() if k != "_other")
+        if "_other" in cats:
+            total += sum(c for _, c in cats["_other"])
+        dev_totals[dev_ip] = total
+    for dev_ip in sorted(dev_totals, key=lambda x: dev_totals[x], reverse=True):
+        cats = devices[dev_ip]
+        dev_name = ip_names.get(dev_ip, "")
+        if dev_name:
+            parts.append(f"\n📱 <b>{escape(dev_name)}</b> ({dev_ip})")
+        else:
+            parts.append(f"\n📱 <b>{dev_ip}</b>")
+        # Show categorized activity sorted by count
+        cat_items = [(k, v) for k, v in cats.items() if k != "_other"]
+        cat_items.sort(key=lambda x: x[1], reverse=True)
+        for cat, cnt in cat_items:
+            parts.append(f"  {cat}: {cnt}")
+        # Show top uncategorized domains (max 3)
+        if "_other" in cats:
+            other = sorted(cats["_other"], key=lambda x: x[1], reverse=True)[:3]
+            for dom, cnt in other:
+                # Shorten domain
+                short = dom if len(dom) <= 30 else dom[:27] + "..."
+                parts.append(f"  🔹 {short}: {cnt}")
+    text = "\n".join(parts)
+    # Trim if too long for Telegram (4096 chars max)
+    if len(text) > 4000:
+        text = text[:3990] + "\n..."
+    kb = [
+        [InlineKeyboardButton("🔄 Обновить", callback_data=f'ssh_monitor:{cn}')],
+        [InlineKeyboardButton("◀️ Назад", callback_data=f'ssh_status:{cn}')],
+    ]
+    await q.message.edit_text(text, parse_mode="HTML",
+        disable_web_page_preview=True,
+        reply_markup=InlineKeyboardMarkup(kb))
 
 async def ssh_update_script(update: Update, context: ContextTypes.DEFAULT_TYPE, cn: str):
     q = update.callback_query
