@@ -10686,8 +10686,16 @@ async def ssh_dns_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE, cn
     """Show DNS activity from router syslog, grouped by device and category."""
     q = update.callback_query
     await safe_edit_text(q, context, f"👁 Читаю DNS-лог на <b>{cn}</b>...", parse_mode="HTML")
-    # Read DNS queries from syslog
+    # Auto-enable log-queries if not present, then read DNS log
     cmd = (
+        # Check and enable log-queries if missing
+        "if ! grep -q '^log-queries' /etc/storage/dnsmasq/dnsmasq.conf 2>/dev/null; then "
+        "  echo 'log-queries' >> /etc/storage/dnsmasq/dnsmasq.conf; "
+        "  mtd_storage.sh save 2>/dev/null; "
+        "  restart_dhcpd 2>/dev/null; "
+        "  echo 'DNS_LOG_ENABLED'; "
+        "fi; "
+        # Read DNS queries
         "cat /tmp/syslog.log 2>/dev/null | "
         "grep 'query\\[A\\]' | "
         "awk '{print $6, $8}' | "
@@ -10698,15 +10706,20 @@ async def ssh_dns_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE, cn
         kb = [[InlineKeyboardButton("◀️ Назад", callback_data=f'ssh_status:{cn}')]]
         await q.message.edit_text(f"❌ Ошибка: {out}", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
         return
+    just_enabled = "DNS_LOG_ENABLED" in out
+    # Remove the DNS_LOG_ENABLED marker from output
+    out = out.replace("DNS_LOG_ENABLED", "").strip()
     if not out.strip():
+        msg = f"👁 <b>Мониторинг {cn}</b>\n\n"
+        if just_enabled:
+            msg += "✅ DNS-логирование включено!\nЛог пока пуст — данные появятся через 1-2 минуты.\nНажмите «Обновить» чуть позже."
+        else:
+            msg += "DNS-лог пуст — устройства пока не делали запросов."
         kb = [
+            [InlineKeyboardButton("🔄 Обновить", callback_data=f'ssh_monitor:{cn}')],
             [InlineKeyboardButton("◀️ Назад", callback_data=f'ssh_status:{cn}')],
         ]
-        await q.message.edit_text(
-            f"👁 <b>Мониторинг {cn}</b>\n\n"
-            "DNS-лог пуст. Возможно нужно включить логирование:\n"
-            "<code>log-queries</code> в dnsmasq.conf + restart_dhcpd",
-            parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+        await q.message.edit_text(msg, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
         return
     # Parse: "  COUNT DOMAIN IP"
     # Also get device names from DHCP
