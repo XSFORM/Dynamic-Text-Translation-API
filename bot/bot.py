@@ -10159,9 +10159,7 @@ async def ssh_router_status(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         "echo CRON: $(crontab -l 2>/dev/null | grep update_script || echo 'no cron') && "
         "echo SCRIPT: $(/etc/storage/update_script.sh --version 2>/dev/null | head -1 || echo 'not found') && "
         "echo MODEL: $(nvram get productid 2>/dev/null || echo '?') && "
-        "fv=$(nvram get firmver 2>/dev/null); bn=$(nvram get buildno 2>/dev/null); en=$(nvram get extendno 2>/dev/null); "
-        "if [ -n \"$fv\" ]; then echo \"FIRMWARE: ${fv}.${bn}-${en}\"; "
-        "else echo FIRMWARE: $(cat /etc/storage/firmware_version 2>/dev/null || uname -r); fi && "
+        "echo FIRMWARE: $(grep -oE 'Version: [^ ]+' /etc/motd 2>/dev/null | cut -d' ' -f2 || nvram get firmver 2>/dev/null || uname -r) && "
         # WiFi info
         "echo '---WIFI---' && "
         "ssid24=$(nvram get rt_ssid 2>/dev/null); "
