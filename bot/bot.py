@@ -6390,17 +6390,19 @@ def _kb_network():
     ])
 
 
-def _kb_system():
+def _kb_system(user_id: int = None):
     """System submenu keyboard."""
-    return InlineKeyboardMarkup([
+    rows = [
         [InlineKeyboardButton("📦 Бэкап", callback_data='backup_hub'),
          InlineKeyboardButton("📜 Просмотр лога", callback_data='log')],
         [InlineKeyboardButton("🚨 Тревога", callback_data='block_alert'),
          InlineKeyboardButton("⚡ Перезагрузка", callback_data='restart_menu')],
-        [InlineKeyboardButton("📥 Git Pull", callback_data='git_pull')],
-        [InlineKeyboardButton("📝 Заметки", callback_data='notes_menu')],
-        [InlineKeyboardButton("◀️ Главное меню", callback_data='home')],
-    ])
+    ]
+    if user_id == ADMIN_ID or user_id is None:
+        rows.append([InlineKeyboardButton("📥 Git Pull", callback_data='git_pull')])
+    rows.append([InlineKeyboardButton("📝 Заметки", callback_data='notes_menu')])
+    rows.append([InlineKeyboardButton("◀️ Главное меню", callback_data='home')])
+    return InlineKeyboardMarkup(rows)
 
 # =====================================================================
 #  AWAIT STATE MANAGEMENT
@@ -6653,6 +6655,9 @@ async def _reply_kb_autoip(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _reply_kb_gitpull(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle '📥 Git Pull' reply keyboard button — same as inline git_pull."""
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ Только для администратора")
+        return
     msg = await update.message.reply_text("📥 Git Pull...")
     try:
         r1 = subprocess.run(
@@ -7452,7 +7457,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == 'menu_system':
         _clear_awaits(context)
         await safe_edit_text(q, context, "⚙️ <b>Система</b>",
-            parse_mode="HTML", reply_markup=_kb_system())
+            parse_mode="HTML", reply_markup=_kb_system(q.from_user.id))
 
     elif data == 'noop':
         pass  # separator button
@@ -7567,6 +7572,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='menu_system')]]))
 
     elif data == 'git_pull':
+        if q.from_user.id != ADMIN_ID:
+            await q.answer("⛔ Только для администратора", show_alert=True)
+            return
         await safe_edit_text(q, context, "📥 Git Pull...")
         try:
             r1 = subprocess.run(
@@ -12591,13 +12599,23 @@ async def send_help_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #  COMMANDS
 # =====================================================================
 # Persistent bottom reply keyboard (quick access)
-REPLY_KB = ReplyKeyboardMarkup(
+REPLY_KB_ADMIN = ReplyKeyboardMarkup(
     [[KeyboardButton("📊 Статистика"), KeyboardButton("🖥 SSH Роутеры")],
      [KeyboardButton("🔐 OpenVPN"), KeyboardButton("📡 Роутеры")],
      [KeyboardButton("🌐 GOST Серверы"), KeyboardButton("🔄 Авто IP")],
      [KeyboardButton("📥 Git Pull")]],
     resize_keyboard=True
 )
+REPLY_KB_CLIENT = ReplyKeyboardMarkup(
+    [[KeyboardButton("📊 Статистика"), KeyboardButton("🖥 SSH Роутеры")],
+     [KeyboardButton("🔐 OpenVPN"), KeyboardButton("📡 Роутеры")],
+     [KeyboardButton("🌐 GOST Серверы"), KeyboardButton("🔄 Авто IP")]],
+    resize_keyboard=True
+)
+
+def get_reply_kb(user_id: int) -> ReplyKeyboardMarkup:
+    """Return reply keyboard based on user role."""
+    return REPLY_KB_ADMIN if user_id == ADMIN_ID else REPLY_KB_CLIENT
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
@@ -12615,7 +12633,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Send reply keyboard first (persists at bottom)
     await update.message.reply_text(
         f"Добро пожаловать! Версия: {BOT_VERSION}",
-        reply_markup=REPLY_KB)
+        reply_markup=get_reply_kb(update.effective_user.id))
     # Then send inline menu
     sent = await update.message.reply_text("📋 <b>Главное меню</b>",
         parse_mode="HTML", reply_markup=kb)
