@@ -10224,7 +10224,12 @@ async def ssh_router_status(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         "echo \"MF_NUM:$mf_num\" && "
         "i=0; while [ \"$i\" -lt \"${mf_num:-0}\" ] 2>/dev/null; do "
         "  mac=$(nvram get macfilter_list_x${i} 2>/dev/null); "
-        "  [ -n \"$mac\" ] && echo \"MF_MAC:$mac\"; "
+        "  if [ -n \"$mac\" ]; then "
+        "    fmac=$(echo $mac | sed 's/../&:/g' | sed 's/:$//'); "
+        "    mname=$(grep -i \"$fmac\" /tmp/static_ip.inf 2>/dev/null | head -1 | cut -d',' -f3); "
+        "    [ -z \"$mname\" ] && mname='*'; "
+        "    echo \"MF_MAC:$mac:$mname\"; "
+        "  fi; "
         "  i=$((i+1)); "
         "done"
     )
@@ -10271,10 +10276,28 @@ async def ssh_router_status(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                 if stripped.startswith("MF_ENABLE:"):
                     mf_enable = stripped[10:].strip()
                 elif stripped.startswith("MF_MAC:"):
-                    raw_mac = stripped[7:].strip().upper()
-                    if len(raw_mac) == 12:
-                        raw_mac = ':'.join(raw_mac[i:i+2] for i in range(0, 12, 2))
-                    blocked_macs.append(raw_mac)
+                    mf_rest = stripped[7:].strip()
+                    # format: MAC:NAME or just MAC
+                    mf_parts = mf_rest.split(":", 1) if ":" in mf_rest and len(mf_rest.replace(":", "")) != len(mf_rest.split(":")[0]) else [mf_rest, "*"]
+                    # MAC is 12 hex chars without colons, name follows after ':'
+                    # MF_MAC:A89CED7B0DC5:MI9T-Mi9tPRO
+                    raw_mac_str = mf_rest
+                    mf_name = "*"
+                    # Find the 12-char hex MAC and the name after it
+                    if len(mf_rest) >= 12:
+                        potential_mac = ""
+                        rest_name = "*"
+                        # Try: first 12 chars are hex MAC, then :name
+                        first12 = mf_rest[:12]
+                        if all(c in '0123456789ABCDEFabcdef' for c in first12):
+                            potential_mac = first12.upper()
+                            rest_name = mf_rest[13:].strip() if len(mf_rest) > 13 else "*"
+                        if potential_mac:
+                            raw_mac_str = ':'.join(potential_mac[i:i+2] for i in range(0, 12, 2))
+                            mf_name = rest_name if rest_name and rest_name != '*' else ""
+                        else:
+                            raw_mac_str = mf_rest.upper()
+                    blocked_macs.append((raw_mac_str, mf_name))
         parts = [f"🔍 <b>Статус {cn}</b> ({ip}):\n"]
         # System info
         parts.append(f"<pre>{escape(chr(10).join(sys_lines))}</pre>")
@@ -10293,6 +10316,22 @@ async def ssh_router_status(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                     ssid, _, pwd = info.partition(' | ')
                     if ssid:
                         parts.append(f"  5GHz:   <code>{escape(ssid)}</code> 🔑 <code>{escape(pwd)}</code>")
+        # Helper: parse client string "IP  NAME  MAC" into structured tuple
+        def _parse_client(cl_str):
+            p = cl_str.split()
+            ip_a = name_a = mac_a = ""
+            for tok in p:
+                if tok.count('.') == 3 and not mac_a:
+                    ip_a = tok
+                elif len(tok.replace(":", "").replace("-", "")) == 12 and all(c in '0123456789abcdefABCDEF:-' for c in tok):
+                    mac_a = tok
+                elif tok != '*' and not name_a:
+                    name_a = tok
+            return ip_a, name_a or '*', mac_a
+        def _fmt_client(cl_str):
+            ip_a, name_a, mac_a = _parse_client(cl_str)
+            name_disp = name_a if name_a != '*' else '—'
+            return f"{ip_a}  {name_disp}  {mac_a}"
         # Gateway (upstream router/bridge) with OUI vendor
         if gateway_line:
             gw_parts = gateway_line.split()
@@ -10304,26 +10343,34 @@ async def ssh_router_status(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             if lan_clients:
                 parts.append(f"  └ <b>Через шлюз ({len(lan_clients)}):</b>")
                 for cl in lan_clients:
-                    parts.append(f"    <code>{escape(cl)}</code>")
+                    parts.append(f"    <code>{escape(_fmt_client(cl))}</code>")
         # WiFi clients (connected to this router's WiFi)
         if wifi_clients:
             parts.append(f"\n📶 <b>WiFi клиенты ({len(wifi_clients)}):</b>")
             for cl in wifi_clients:
-                parts.append(f"  <code>{escape(cl)}</code>")
+                parts.append(f"  <code>{escape(_fmt_client(cl))}</code>")
         # LAN clients without gateway context
         if not gateway_line and lan_clients:
             parts.append(f"\n🔌 <b>LAN клиенты ({len(lan_clients)}):</b>")
             for cl in lan_clients:
-                parts.append(f"  <code>{escape(cl)}</code>")
+                parts.append(f"  <code>{escape(_fmt_client(cl))}</code>")
         if not wifi_clients and not lan_clients and section == 'clients':
             parts.append("\n👥 <b>Подключённые:</b> нет")
-        # Blocked devices (macfilter)
+        # Blocked devices (macfilter) — now tuples (mac, name)
         if blocked_macs:
             parts.append(f"\n🚫 <b>Чёрный список ({len(blocked_macs)}):</b>")
-            for bm in blocked_macs:
-                vendor = _oui_vendor(bm)
-                vendor_str = f"  ({vendor})" if vendor else ""
-                parts.append(f"  <code>{escape(bm)}</code>{vendor_str}")
+            for bm_mac, bm_name in blocked_macs:
+                vendor = _oui_vendor(bm_mac)
+                name_str = bm_name if bm_name and bm_name != '*' else ""
+                vendor_str = vendor if vendor else ""
+                extra = ""
+                if name_str and vendor_str:
+                    extra = f"  {name_str} ({vendor_str})"
+                elif name_str:
+                    extra = f"  {name_str}"
+                elif vendor_str:
+                    extra = f"  ({vendor_str})"
+                parts.append(f"  <code>{escape(bm_mac)}</code>{extra}")
         # Store data for action buttons
         context.user_data[f'status_{cn}_wifi_clients'] = wifi_clients
         context.user_data[f'status_{cn}_lan_clients'] = lan_clients
@@ -10441,10 +10488,20 @@ async def ssh_mf_unblock_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data=f'ssh_status:{cn}')]]))
         return
     kb = []
-    for mac in blocked_macs:
+    for item in blocked_macs:
+        if isinstance(item, tuple):
+            mac, name = item
+        else:
+            mac, name = item, ""
         vendor = _oui_vendor(mac)
-        vendor_str = f" ({vendor})" if vendor else ""
-        label = f"🚫 {mac}{vendor_str}"
+        # Build label: name or vendor or just MAC
+        short_mac = mac[-8:] if len(mac) > 8 else mac
+        if name and name != '*':
+            label = f"🚫 {name} ({short_mac})"
+        elif vendor:
+            label = f"🚫 {vendor} ({short_mac})"
+        else:
+            label = f"🚫 {mac}"
         cb_mac = mac.upper().replace(":", "")
         kb.append([InlineKeyboardButton(label, callback_data=f'ssh_mf_dounblock:{cn}:{cb_mac}')])
     kb.append([InlineKeyboardButton("◀️ Назад", callback_data=f'ssh_status:{cn}')])
