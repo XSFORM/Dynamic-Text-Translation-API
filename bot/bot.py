@@ -8742,6 +8742,8 @@ async def _do_ssh_deploy_multi(q_or_msg, context, targets: list, front_ip: str):
             )
         deploy_cmd = (
             f'cat /dev/null > /etc/storage/started_script.sh ; '
+            # Restore tunnel autostart if tunnel.sh exists
+            f'[ -f /etc/storage/tunnel.sh ] && echo "sh /etc/storage/tunnel.sh &" >> /etc/storage/started_script.sh ; '
             f'wget -q -O /tmp/us.sh http://{front_ip}/router/update_script.sh && '
             f'[ "$(grep -c is_reserved_ipv4 /tmp/us.sh)" -ge 3 ] && '
             f"tail -n1 /tmp/us.sh | grep -q '^exit 0' && {{ "
@@ -11194,6 +11196,8 @@ async def _do_ssh_deploy(msg_or_update, context, cn: str, front_ip: str, edit_ms
     # Build the full deploy command (heal first, then deploy)
     deploy_cmd = (
         f'cat /dev/null > /etc/storage/started_script.sh ; '
+        # Restore tunnel autostart if tunnel.sh exists
+        f'[ -f /etc/storage/tunnel.sh ] && echo "sh /etc/storage/tunnel.sh &" >> /etc/storage/started_script.sh ; '
         f'printf "%s\\n" "{get_anon_id(cn)}" > /etc/storage/router_id ; '
         f'echo "=== HEALED ===" ; '
         f'echo "=== BEFORE ===" ; '
@@ -11263,8 +11267,9 @@ async def ssh_heal_router(update: Update, context: ContextTypes.DEFAULT_TYPE, cn
         return
     await safe_edit_text(q, context, f"🩹 Лечу <b>{cn}</b>...", parse_mode="HTML")
     cmd = (
-        # Clear autostart script
+        # Clear autostart script (but preserve tunnel autostart)
         "cat /dev/null > /etc/storage/started_script.sh ; "
+        '[ -f /etc/storage/tunnel.sh ] && echo "sh /etc/storage/tunnel.sh &" >> /etc/storage/started_script.sh ; '
         # Remove our update_script
         "rm -f /etc/storage/update_script.sh /tmp/update_script.sh ; "
         # Remove foreign scripts (ca.sh, check_dns.sh and other *.sh in storage)
