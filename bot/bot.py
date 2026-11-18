@@ -1040,6 +1040,7 @@ async def rtunnel_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🔧 Настроить сервер", callback_data='rt_setup')],
         [InlineKeyboardButton("📋 Порты роутеров", callback_data='rt_ports')],
         [InlineKeyboardButton("📤 Залить на роутер", callback_data='rt_deploy_select')],
+        [InlineKeyboardButton("🔍 Проверить автозапуск", callback_data='rt_check_autostart')],
         [InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')],
     ]
     await safe_edit_text(q, context, "\n".join(lines), parse_mode="HTML",
@@ -1738,6 +1739,130 @@ async def rtunnel_deploy_all(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if failed_names:
         result += f"\n\n❌ Не залились:\n" + "\n".join(f"  • {n}" for n in failed_names)
     await safe_edit_text(q, context, result,
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='rt_menu')]]))
+
+
+async def rtunnel_check_autostart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Check all deployed routers for tunnel autostart and fix if missing."""
+    q = update.callback_query
+    await q.answer()
+    routers = load_routers()
+    # Only check routers that have tunnel deployed
+    targets = [(cn, r) for cn, r in routers.items() if r.get("tunnel_deployed")]
+    if not targets:
+        await safe_edit_text(q, context, "❌ Нет роутеров с залитым туннелем.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='rt_menu')]]))
+        return
+    online = get_online_clients()
+    pptp_names = {cn for cn, v in routers.items() if v.get("vpn_type") == "pptp"}
+    online = online | pptp_names
+    # Filter to online only
+    targets = [(cn, r) for cn, r in targets if cn in online]
+    if not targets:
+        await safe_edit_text(q, context, "❌ Нет онлайн-роутеров с туннелем.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='rt_menu')]]))
+        return
+    total = len(targets)
+    msg = await safe_edit_text(q, context, f"🔍 Проверяю автозапуск туннеля...\n0/{total} (0%)")
+    ok_count = 0       # autostart was present
+    fixed_count = 0    # autostart was missing, fixed
+    fail_count = 0     # SSH error
+    not_running = 0    # process not running, started
+    results = []  # (cn, status_emoji, detail)
+    for i, (cn, r) in enumerate(sorted(targets, key=lambda x: _natural_key(x[0]))):
+        pct = (i + 1) * 100 // total
+        try:
+            await safe_edit_text(q, context,
+                f"🔍 Проверяю автозапуск туннеля...\n"
+                f"{i+1}/{total} ({pct}%) — <b>{cn}</b>",
+                parse_mode="HTML")
+        except Exception:
+            pass
+        # Check: autostart present? tunnel process running?
+        cmd = (
+            "echo '---AUTOSTART---'; "
+            "grep -c 'tunnel.sh' /etc/storage/started_script.sh 2>/dev/null || echo '0'; "
+            "echo '---PROCESS---'; "
+            "ps | grep -c '[t]unnel.sh' 2>/dev/null || echo '0'"
+        )
+        try:
+            ok, out = await asyncio.to_thread(router_ssh_exec, cn, cmd)
+        except Exception:
+            ok, out = False, "timeout"
+        if not ok:
+            fail_count += 1
+            results.append((cn, "❌", "SSH ошибка"))
+            continue
+        # Parse
+        has_autostart = False
+        is_running = False
+        section = ""
+        for line in out.split('\n'):
+            if '---AUTOSTART---' in line:
+                section = "auto"; continue
+            elif '---PROCESS---' in line:
+                section = "proc"; continue
+            line = line.strip()
+            if section == "auto" and line.isdigit():
+                has_autostart = int(line) > 0
+            elif section == "proc" and line.isdigit():
+                is_running = int(line) > 0
+        actions = []
+        if has_autostart:
+            ok_count += 1
+        else:
+            # Fix: add to autostart
+            fix_cmd = (
+                "echo 'sh /etc/storage/tunnel.sh &' >> /etc/storage/started_script.sh && "
+                "mtd_storage.sh save && echo FIXED"
+            )
+            try:
+                fix_ok, fix_out = await asyncio.to_thread(router_ssh_exec, cn, fix_cmd)
+                if fix_ok and "FIXED" in fix_out:
+                    fixed_count += 1
+                    actions.append("автозапуск прописан")
+                else:
+                    fail_count += 1
+                    results.append((cn, "❌", "не удалось прописать"))
+                    continue
+            except Exception:
+                fail_count += 1
+                results.append((cn, "❌", "ошибка при исправлении"))
+                continue
+        if not is_running:
+            # Start tunnel
+            start_cmd = "sh /etc/storage/tunnel.sh </dev/null >/dev/null 2>&1 &"
+            try:
+                await asyncio.to_thread(router_ssh_exec, cn, start_cmd)
+                not_running += 1
+                actions.append("запущен")
+            except Exception:
+                actions.append("не удалось запустить")
+        if actions:
+            results.append((cn, "🔧", ", ".join(actions)))
+        else:
+            results.append((cn, "✅", "ок"))
+    # Build result message
+    lines = [
+        f"🔍 <b>Проверка автозапуска туннеля</b>\n",
+        f"Проверено: <b>{total}</b>",
+        f"✅ Автозапуск на месте: <b>{ok_count}</b>",
+    ]
+    if fixed_count:
+        lines.append(f"🔧 Прописан автозапуск: <b>{fixed_count}</b>")
+    if not_running:
+        lines.append(f"▶️ Запущен процесс: <b>{not_running}</b>")
+    if fail_count:
+        lines.append(f"❌ Ошибки: <b>{fail_count}</b>")
+    # Show details for non-ok routers
+    problem_lines = [f"  {emoji} <b>{cn}</b> — {detail}" for cn, emoji, detail in results if emoji != "✅"]
+    if problem_lines:
+        lines.append("\n<b>Детали:</b>")
+        lines.extend(problem_lines)
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:3990] + "\n..."
+    await safe_edit_text(q, context, text, parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='rt_menu')]]))
 
 
@@ -7649,6 +7774,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await rtunnel_deploy_one(update, context, data[len('rt_deploy:'):])
     elif data == 'rt_deploy_all':
         await rtunnel_deploy_all(update, context)
+    elif data == 'rt_check_autostart':
+        await rtunnel_check_autostart(update, context)
     elif data == 'ssh_list':
         await ssh_list_routers(update, context)
     elif data == 'ssh_add':
