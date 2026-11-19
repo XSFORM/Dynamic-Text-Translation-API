@@ -28,8 +28,11 @@ except Exception:
 ROUTERS_FILE = "/root/monitor_bot/routers.json"
 WARMUP_S = 2
 MEASURE_S = 6
-PARALLEL_SET = (1, 2, 4, 8)
-CHUNK_SET = (4096, 16384, 32768)
+PARALLEL_SET = (1, 2, 4)
+# Большие куски проверяем специально: если скорость растёт с размером,
+# значит упор в накладные расходы на вызов, а не в полосу.
+CHUNK_SET = (32768, 131072, 524288, 1048576)
+REPEATS = 3
 
 
 def connect(ip, port, user, password):
@@ -61,16 +64,22 @@ def open_stream(cli, timeout=60):
     return chan
 
 
-def run_parallel(cli, n, chunk, seconds, warmup):
-    """n потоков одновременно. Складываем байты, делим на общее время."""
-    chans = [open_stream(cli) for _ in range(n)]
+def run_parallel(conns, chunk, seconds, warmup):
+    """Параллель через ОТДЕЛЬНЫЕ соединения.
+
+    Каналы на одном Transport делят общую блокировку paramiko и вместо
+    параллельной работы мешают друг другу — прошлый прогон это показал.
+    Отдельные соединения = отдельные сокеты и потоки, без общей блокировки.
+    """
+    n = len(conns)
+    chans = [open_stream(c) for c in conns]
     results = [None] * n
 
     def worker(i):
         try:
             results[i] = pump(chans[i], chunk, seconds, warmup)
-        except Exception as e:
-            results[i] = (0, 0.0, str(e))
+        except Exception:
+            results[i] = (0, 0.0)
 
     threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
     t0 = time.monotonic()
@@ -84,9 +93,8 @@ def run_parallel(cli, n, chunk, seconds, warmup):
             c.close()
         except Exception:
             pass
-    total = sum(r[0] for r in results if r and len(r) >= 2)
-    # Делим на измеренное окно, а не на всё время вместе с прогревом.
-    span = max((r[1] for r in results if r and len(r) >= 2 and r[1] > 0), default=0)
+    total = sum(r[0] for r in results if r)
+    span = max((r[1] for r in results if r and r[1] > 0), default=0)
     return total, span, wall
 
 
@@ -117,35 +125,55 @@ def main():
     print(f"Потолок при RTT 110мс в один поток: ~{rtt_hint:.2f} Мбит/с")
     probe.close()
 
-    print(f"\nРазмер куска (1 поток, {MEASURE_S}с замера):")
+    print(f"\nРазмер куска, {REPEATS} прогона по {MEASURE_S}с (1 поток):")
+    print("  размер      прогоны (Мбит/с)        медиана")
     for chunk_size in CHUNK_SET:
         chunk = os.urandom(chunk_size)
-        chan = open_stream(cli)
-        try:
-            sent, spent = pump(chan, chunk, MEASURE_S, WARMUP_S)
-            mbps = sent * 8 / spent / 1_000_000
-            print(f"  {chunk_size:>6} байт -> {mbps:6.2f} Мбит/с")
-        except Exception as e:
-            print(f"  {chunk_size:>6} байт -> ошибка: {e}")
-        finally:
+        runs = []
+        for _ in range(REPEATS):
+            chan = open_stream(cli)
             try:
-                chan.close()
-            except Exception:
-                pass
+                sent, spent = pump(chan, chunk, MEASURE_S, WARMUP_S)
+                runs.append(sent * 8 / spent / 1_000_000)
+            except Exception as e:
+                print(f"  {chunk_size:>8} -> ошибка: {e}")
+                break
+            finally:
+                try:
+                    chan.close()
+                except Exception:
+                    pass
+        if runs:
+            med = sorted(runs)[len(runs) // 2]
+            shown = "  ".join(f"{v:5.2f}" for v in runs)
+            print(f"  {chunk_size:>8}   {shown}    {med:6.2f}")
 
-    best_chunk = os.urandom(16384)
-    print(f"\nПараллельные потоки (кусок 16384, {MEASURE_S}с замера):")
+    big = os.urandom(262144)
+    print(f"\nПараллель через ОТДЕЛЬНЫЕ соединения (кусок 256К, {MEASURE_S}с):")
     for n in PARALLEL_SET:
+        conns = []
         try:
-            total, span, wall = run_parallel(cli, n, best_chunk, MEASURE_S, WARMUP_S)
+            for _ in range(n):
+                conns.append(connect(ip, int(r.get("port", 22)),
+                                     r.get("user", "admin"), r.get("password", "")))
+            total, span, wall = run_parallel(conns, big, MEASURE_S, WARMUP_S)
             mbps = total * 8 / span / 1_000_000 if span else 0
-            print(f"  {n} поток(ов) -> {mbps:6.2f} Мбит/с  (всего {total/1024/1024:.1f} МБ за {wall:.1f}с)")
+            print(f"  {n} соед. -> {mbps:6.2f} Мбит/с  (всего {total/1024/1024:.1f} МБ за {wall:.1f}с)")
         except Exception as e:
-            print(f"  {n} поток(ов) -> ошибка: {e}")
+            print(f"  {n} соед. -> ошибка: {e}")
+        finally:
+            for c in conns:
+                try:
+                    c.close()
+                except Exception:
+                    pass
 
     cli.close()
-    print("\nЕсли с ростом числа потоков скорость растёт почти линейно —")
-    print("упор в окно SSH, лечится параллельными каналами.")
+    print("\nЧто смотреть:")
+    print("  - если с ростом куска скорость растёт и выходит на полку —")
+    print("    упор был в накладные расходы на вызов, берём большой кусок;")
+    print("  - если отдельные соединения дают прирост — гоним в несколько;")
+    print("  - если везде потолок ~5 Мбит/с — это аплинк самого бэкенда.")
 
 
 if __name__ == "__main__":
