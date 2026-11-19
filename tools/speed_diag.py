@@ -19,6 +19,12 @@ import time
 
 import paramiko
 
+# Локаль на сервере может быть latin-1, тогда кириллица в print падает.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 ROUTERS_FILE = "/root/monitor_bot/routers.json"
 WARMUP_S = 2
 MEASURE_S = 6
