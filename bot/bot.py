@@ -9629,6 +9629,50 @@ def _ensure_speedtest_file(size_mb: int = 5):
     return os.path.exists(path)
 
 
+# ---------------------------------------------------------------------
+#  Timed HTTP speed test
+# ---------------------------------------------------------------------
+# A fixed-size file is wrong at both ends of the range: on a fast link it
+# is over before TCP has ramped up, on a weak one it never finishes inside
+# the timeout. So we download for a fixed TIME instead and see how much
+# arrived — the router does the pulling and reports one number, which
+# keeps Python out of the data path entirely. That matters: pushing bytes
+# through paramiko from inside the bot's event loop fights the GIL and
+# reads several times too low.
+SPEED_SECONDS = 8          # measured window on the router
+SPEED_BIG_FILE = "/var/www/html/speedtest_big.bin"
+SPEED_BIG_MB = 24          # 10 Мбит × 8 с ≈ 10 МБ, so this never runs out
+
+
+def _ensure_speedtest_big():
+    """Create the file used by the timed test. It only has to be bigger
+    than the fastest link can pull in SPEED_SECONDS, so it never completes
+    early and every measurement covers the full window."""
+    if not os.path.exists(SPEED_BIG_FILE):
+        os.system(f"dd if=/dev/urandom of={SPEED_BIG_FILE} bs=1M "
+                  f"count={SPEED_BIG_MB} 2>/dev/null")
+    return os.path.exists(SPEED_BIG_FILE)
+
+
+def _speed_timed_cmd(url: str, seconds: int) -> str:
+    """Shell for the router: pull for `seconds`, report the rate.
+
+    curl stops at --max-time and still prints speed_download, so exit
+    code 28 is the normal outcome here, not a failure. Where curl is
+    missing we pipe wget through wc -c: same idea, and nothing touches
+    the router's flash or RAM.
+    """
+    return (
+        f'if command -v curl >/dev/null 2>&1; then '
+        f'curl -o /dev/null -s --max-time {seconds} '
+        f'-w "curl:%{{speed_download}}:%{{time_total}}" "{url}"; '
+        f'else '
+        f'S=$(date +%s); '
+        f'FS=$(timeout {seconds} wget -q -O - "{url}" 2>/dev/null | wc -c); '
+        f'E=$(date +%s); echo "wget_time:$((E-S)):$FS"; fi'
+    )
+
+
 
 def _parse_speed(output: str) -> Tuple[float, str]:
     """Parse curl or wget speed output → (mbps_float, human-readable string).
@@ -9637,6 +9681,13 @@ def _parse_speed(output: str) -> Tuple[float, str]:
         lines = output.strip().split("\n")
         for line in reversed(lines):
             line = line.strip()
+            # timed curl: "curl:BYTES_PER_SEC:SECONDS"
+            if line.startswith("curl:"):
+                parts = line.split(":")
+                bps = float(parts[1].replace(",", "."))
+                mbps = bps * 8 / 1_000_000
+                txt = f"{mbps:.0f} Мбит/с" if mbps >= 10 else f"{mbps:.1f} Мбит/с"
+                return mbps, txt
             # wget fallback: "wget_time:SECONDS:BYTES" or legacy "wget_time:SECONDS"
             if line.startswith("wget_time:"):
                 parts = line.split(":")
@@ -9689,12 +9740,12 @@ async def ssh_speed_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     online = get_online_clients()
     online_count = sum(1 for cn in routers if cn in online)
     size_mb = context.user_data.get('speed_size_mb', 5)
-    method = context.user_data.get('speed_method', 'stream')
+    method = context.user_data.get('speed_method', 'timed')
     size_mark = lambda s: " ✓" if s == size_mb else ""
     kb = [
-        [InlineKeyboardButton(f"{'🔵' if method == 'stream' else '⚪'} SSH-поток",
-                              callback_data='ssh_speed_method:stream'),
-         InlineKeyboardButton(f"{'🔵' if method == 'http' else '⚪'} HTTP-файл",
+        [InlineKeyboardButton(f"{'🔵' if method == 'timed' else '⚪'} По времени",
+                              callback_data='ssh_speed_method:timed'),
+         InlineKeyboardButton(f"{'🔵' if method == 'http' else '⚪'} По файлу",
                               callback_data='ssh_speed_method:http')],
     ]
     if method == 'http':
@@ -9707,11 +9758,11 @@ async def ssh_speed_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton(f"🌐 Все онлайн ({online_count})", callback_data='ssh_speed_all')],
         [InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')],
     ]
-    if method == 'stream':
-        descr = (f"Метод: <b>SSH-поток</b>, {SPEED2_SECONDS} сек на роутер\n"
-                 f"🎯 Замер на приём через тоннель")
+    if method == 'timed':
+        descr = (f"Метод: <b>по времени</b> — {SPEED_SECONDS} сек закачки\n"
+                 f"🎯 Одинаково честно на слабом и быстром канале")
     else:
-        descr = (f"Метод: <b>HTTP-файл</b> {size_mb} MB через тоннель\n"
+        descr = (f"Метод: <b>по файлу</b> {size_mb} MB через тоннель\n"
                  f"{'⚡ Быстро, точность ±30%' if size_mb == 1 else '🎯 Точно, но дольше'}")
     await safe_edit_text(q, context,
         f"📶 <b>Спидтест</b>\n\n"
@@ -9770,6 +9821,101 @@ async def ssh_speed_multi_select(update: Update, context: ContextTypes.DEFAULT_T
     await safe_edit_text(q, context,
         f"📶 Выберите роутеры для спидтеста:\nВыбрано: <b>{count}</b>",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def _do_speedtest_timed(q_or_msg, context, targets: list):
+    """Timed speed test: the router pulls for a fixed number of seconds.
+
+    The router does the downloading and reports one number, so nothing
+    heavy passes through Python — which is why this reads correctly while
+    pushing bytes from the bot through paramiko does not.
+    """
+    if not _ensure_speedtest_big():
+        text = "❌ Не удалось создать тестовый файл на бэкенде."
+        if hasattr(q_or_msg, 'message'):
+            await safe_edit_text(q_or_msg, context, text)
+        else:
+            await q_or_msg.reply_text(text)
+        return
+    backend_vpn_ip = _backend_vpn_ip()
+    url = f"http://{backend_vpn_ip}/speedtest_big.bin"
+    cmd = _speed_timed_cmd(url, SPEED_SECONDS)
+    total = len(targets)
+    if hasattr(q_or_msg, 'message'):
+        msg = q_or_msg.message
+        await safe_edit_text(q_or_msg, context, f"📶 Спидтест... 0/{total}", parse_mode="HTML")
+    else:
+        msg = await q_or_msg.reply_text(f"📶 Спидтест... 0/{total}")
+    cancel_key = f"speed_cancel_{id(msg)}"
+    context.user_data[cancel_key] = False
+    cancel_kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏹ Отмена", callback_data=f"ssh_speed_cancel:{cancel_key}")]
+    ])
+    results = []
+    speeds = []
+    done = 0
+    for cn in targets:
+        if context.user_data.get(cancel_key):
+            results.append(f"⏹ <b>{cn}</b>: отменено")
+            done += 1
+            continue
+        try:
+            await msg.edit_text(
+                f"📶 <b>{cn}</b> — качает {SPEED_SECONDS}с...\n({done}/{total} готово)",
+                parse_mode="HTML", reply_markup=cancel_kb)
+        except Exception:
+            pass
+        start_t = time.time()
+        try:
+            ok, out = await asyncio.wait_for(
+                asyncio.to_thread(router_ssh_exec, cn, cmd, SPEED_SECONDS + 20),
+                timeout=SPEED_SECONDS + 30)
+        except asyncio.TimeoutError:
+            ok, out = False, "таймаут"
+        except Exception as e:
+            ok, out = False, str(e)[:80]
+        elapsed_s = int(time.time() - start_t)
+        mbps, speed_txt = _parse_speed(out) if ok else (0.0, out or "ошибка")
+        if ok and mbps > 0:
+            speeds.append((cn, mbps))
+            results.append(f"{_speed2_emoji(mbps)} <b>{cn}</b>: {speed_txt} ({elapsed_s}с)")
+        else:
+            results.append(f"🐌 <b>{cn}</b>: {escape(str(speed_txt)[:60])} ({elapsed_s}с)")
+        done += 1
+        if context.user_data.get(cancel_key):
+            for rest in targets[targets.index(cn) + 1:]:
+                results.append(f"⏹ <b>{rest}</b>: отменено")
+                done += 1
+            break
+    context.user_data.pop(cancel_key, None)
+    report = "\n".join(results)
+    summary = ""
+    if len(speeds) >= 2:
+        vals = sorted(m for _, m in speeds)
+        mid = (vals[len(vals) // 2] if len(vals) % 2
+               else (vals[len(vals) // 2 - 1] + vals[len(vals) // 2]) / 2)
+        worst_cn, worst_mbps = min(speeds, key=lambda x: x[1])
+        summary = (f"\n\nСередина по парку: <b>{_speed2_human(mid)}</b>"
+                   f"\nМедленнее всех: <b>{escape(worst_cn)}</b> — {_speed2_human(worst_mbps)}")
+    text = (f"📶 <b>Спидтест завершён</b>: {done}/{total}\n"
+            f"Закачка {SPEED_SECONDS}с через тоннель ({backend_vpn_ip})\n\n{report}{summary}")
+    if len(text) > 4000:
+        text = text[:3990] + "\n..."
+    await msg.edit_text(text, parse_mode="HTML")
+
+
+def _backend_vpn_ip() -> str:
+    """Backend's address inside the tunnel — that's what routers pull from."""
+    try:
+        result = subprocess.run(["ip", "-4", "addr", "show", "tun0"],
+                                capture_output=True, text=True, timeout=5)
+        for line in result.stdout.split("\n"):
+            line = line.strip()
+            if line.startswith("inet "):
+                return line.split()[1].split("/")[0]
+    except Exception:
+        pass
+    return "10.9.0.1"
 
 
 async def _do_speedtest_stream(q_or_msg, context, targets: list):
@@ -9865,8 +10011,12 @@ def _speed2_emoji(mbps: float) -> str:
 
 async def _do_speedtest(q_or_msg, context, targets: list):
     """Run speed test on a list of routers (VPN tunnel only)."""
-    if context.user_data.get('speed_method', 'stream') == 'stream':
+    method = context.user_data.get('speed_method', 'timed')
+    if method == 'stream':
         await _do_speedtest_stream(q_or_msg, context, targets)
+        return
+    if method != 'http':
+        await _do_speedtest_timed(q_or_msg, context, targets)
         return
     size_mb = context.user_data.get('speed_size_mb', 5)
     if not _ensure_speedtest_file(size_mb):
