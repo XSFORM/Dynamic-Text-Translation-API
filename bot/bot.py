@@ -841,6 +841,145 @@ def router_ssh_exec(cn: str, command: str, cmd_timeout: int = None) -> Tuple[boo
                         command, cmd_timeout=cmd_timeout)
 
 
+# ---------------------------------------------------------------------
+#  SPEEDTEST v2 — stream over the SSH channel itself
+# ---------------------------------------------------------------------
+# Instead of downloading a fixed-size file over HTTP, push a byte stream
+# into the router for a fixed amount of TIME and see how much got through.
+# A fixed file is wrong at both ends of the range: on a fast link it is
+# over in under a second (so you mostly measure TCP ramp-up) and on a weak
+# one it never finishes inside the timeout. Fixed time always yields a
+# usable sample.
+#
+# The router is RECEIVING here, so what we measure is its download speed —
+# exactly what the customer feels — and it travels through the same VPN
+# tunnel we care about.
+#
+# We never wait for `cat` to exit: by the time the clock stops we already
+# know everything, and waiting on a slow box is what caused false timeouts.
+SPEED2_SECONDS = 8        # measured window
+SPEED2_WARMUP_S = 2       # discarded: TCP slow-start + SSH window fill
+SPEED2_MAX_MB = 14        # ceiling so a fast link doesn't push pointlessly
+SPEED2_TIMEOUT = 40       # per-router fuse
+# Random, not zeros: if SSH compression ever gets turned on, a stream of
+# zeros would compress ~1000:1 and the number would be fiction.
+_SPEED2_CHUNK = os.urandom(32768)
+
+
+def _speed2_pump(chan, seconds: int, max_mb: int, warmup_s: int) -> Tuple[int, float]:
+    """Push bytes into `chan` and return (bytes_measured, seconds_spent).
+
+    Phase 1 (warm-up) is thrown away. It absorbs TCP slow-start and fills
+    the SSH flow-control window; without it we would count bytes that are
+    still sitting in buffers as if they had already arrived.
+
+    Phase 2 is the real measurement. By now every sendall() that returns
+    means the far side actually drained roughly that much, because the
+    window is full and only refills as the router consumes.
+    """
+    limit = max_mb * 1024 * 1024
+    warm_end = time.monotonic() + warmup_s
+    while time.monotonic() < warm_end:
+        chan.sendall(_SPEED2_CHUNK)
+    counted = 0
+    started = time.monotonic()
+    deadline = started + seconds
+    while counted < limit and time.monotonic() < deadline:
+        chan.sendall(_SPEED2_CHUNK)
+        counted += len(_SPEED2_CHUNK)
+    return counted, time.monotonic() - started
+
+
+def _speed2_connect(cn: str):
+    """Open a paramiko session to the router — direct or via PPTP jump host.
+
+    Mirrors router_ssh_exec()'s dispatch. Returns (client, jump_client, err);
+    jump_client is None for OpenVPN routers and must be closed by the caller
+    when it isn't.
+    """
+    routers = load_routers()
+    r = routers.get(cn)
+    if not r:
+        return None, None, f"Роутер {cn} не найден"
+    port = int(r.get("port", 22))
+    user = r.get("user", "admin")
+    password = r.get("password", "")
+    if r.get("vpn_type") == "pptp":
+        pptp_ip = load_pptp_clients().get(cn)
+        if not pptp_ip:
+            return None, None, "Нет PPTP IP"
+        srv = load_pptp_server()
+        if not srv.get("host"):
+            return None, None, "PPTP сервер не настроен"
+        jump = paramiko.SSHClient()
+        jump.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        jump.connect(srv["host"], port=int(srv.get("port", 22)),
+                     username=srv.get("user", "root"), password=srv.get("password", ""),
+                     timeout=SSH_TIMEOUT, look_for_keys=False, allow_agent=False)
+        sock = jump.get_transport().open_channel(
+            "direct-tcpip", (pptp_ip, port), ("127.0.0.1", 0), timeout=SSH_TIMEOUT)
+        cli = paramiko.SSHClient()
+        cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        cli.connect(pptp_ip, port=port, username=user, password=password,
+                    sock=sock, timeout=SSH_TIMEOUT, look_for_keys=False, allow_agent=False)
+        return cli, jump, ""
+    ip = get_router_ip(cn)
+    if not ip:
+        return None, None, "Нет VPN IP"
+    cli = paramiko.SSHClient()
+    cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    cli.connect(ip, port=port, username=user, password=password,
+                timeout=SSH_TIMEOUT, look_for_keys=False, allow_agent=False)
+    return cli, None, ""
+
+
+def router_speedtest_stream(cn: str, seconds: int = SPEED2_SECONDS,
+                            max_mb: int = SPEED2_MAX_MB,
+                            warmup_s: int = SPEED2_WARMUP_S) -> Tuple[str, float, str]:
+    """Measure a router's download speed by streaming into it over SSH.
+
+    Returns (status, mbps, detail) where status is
+    ok / auth / host / timeout / err.
+    """
+    cli = jump = None
+    try:
+        cli, jump, err = _speed2_connect(cn)
+        if err:
+            return "err", 0.0, err
+    except paramiko.AuthenticationException:
+        return "auth", 0.0, ""
+    except (socket.timeout, paramiko.SSHException) as e:
+        return "host", 0.0, str(e)[:80]
+    except Exception as e:
+        return "err", 0.0, str(e)[:80]
+    try:
+        chan = cli.get_transport().open_session(timeout=SSH_TIMEOUT)
+        chan.settimeout(SPEED2_TIMEOUT)
+        # cat is the cheapest thing that will swallow a stream: we want to
+        # measure the link, not the router's CPU.
+        chan.exec_command("cat > /dev/null")
+        counted, spent = _speed2_pump(chan, seconds, max_mb, warmup_s)
+        # Close without waiting for exit status — see note above.
+        try:
+            chan.close()
+        except Exception:
+            pass
+        if counted <= 0 or spent <= 0:
+            return "err", 0.0, "не ушло ни байта"
+        return "ok", counted * 8 / spent / 1_000_000, ""
+    except socket.timeout:
+        return "timeout", 0.0, ""
+    except Exception as e:
+        return "err", 0.0, str(e)[:80]
+    finally:
+        for c in (cli, jump):
+            try:
+                if c:
+                    c.close()
+            except Exception:
+                pass
+
+
 def ssh_exec_key(ip: str, port: int, user: str, key_path: str, command: str,
                  sudo_pass: str = None) -> Tuple[bool, str]:
     """Execute SSH command using PEM key file. Optionally wrap in sudo."""
@@ -7806,6 +7945,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith('ssh_speed_size:'):
         context.user_data['speed_size_mb'] = int(data.split(':')[1])
         await ssh_speed_menu(update, context)
+    elif data.startswith('ssh_speed_method:'):
+        context.user_data['speed_method'] = data.split(':')[1]
+        await ssh_speed_menu(update, context)
     elif data == 'ssh_speed_one':
         await ssh_speed_select(update, context)
     elif data == 'ssh_speed_multi':
@@ -9547,19 +9689,33 @@ async def ssh_speed_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     online = get_online_clients()
     online_count = sum(1 for cn in routers if cn in online)
     size_mb = context.user_data.get('speed_size_mb', 5)
+    method = context.user_data.get('speed_method', 'stream')
     size_mark = lambda s: " ✓" if s == size_mb else ""
     kb = [
-        [InlineKeyboardButton(f"📦 1 MB (быстро){size_mark(1)}", callback_data='ssh_speed_size:1'),
-         InlineKeyboardButton(f"📦 5 MB (точно){size_mark(5)}", callback_data='ssh_speed_size:5')],
+        [InlineKeyboardButton(f"{'🔵' if method == 'stream' else '⚪'} SSH-поток",
+                              callback_data='ssh_speed_method:stream'),
+         InlineKeyboardButton(f"{'🔵' if method == 'http' else '⚪'} HTTP-файл",
+                              callback_data='ssh_speed_method:http')],
+    ]
+    if method == 'http':
+        kb.append(
+            [InlineKeyboardButton(f"📦 1 MB (быстро){size_mark(1)}", callback_data='ssh_speed_size:1'),
+             InlineKeyboardButton(f"📦 5 MB (точно){size_mark(5)}", callback_data='ssh_speed_size:5')])
+    kb += [
         [InlineKeyboardButton("🖥 Один роутер", callback_data='ssh_speed_one')],
         [InlineKeyboardButton("☑️ Несколько роутеров", callback_data='ssh_speed_multi')],
         [InlineKeyboardButton(f"🌐 Все онлайн ({online_count})", callback_data='ssh_speed_all')],
         [InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')],
     ]
+    if method == 'stream':
+        descr = (f"Метод: <b>SSH-поток</b>, {SPEED2_SECONDS} сек на роутер\n"
+                 f"🎯 Замер на приём через тоннель")
+    else:
+        descr = (f"Метод: <b>HTTP-файл</b> {size_mb} MB через тоннель\n"
+                 f"{'⚡ Быстро, точность ±30%' if size_mb == 1 else '🎯 Точно, но дольше'}")
     await safe_edit_text(q, context,
         f"📶 <b>Спидтест</b>\n\n"
-        f"Файл: <b>{size_mb} MB</b> через VPN тоннель\n"
-        f"{'⚡ Быстро, точность ±30%' if size_mb == 1 else '🎯 Точно, но дольше'}\n\n"
+        f"{descr}\n\n"
         f"Онлайн: <b>{online_count}</b> / {len(routers)}",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
@@ -9616,8 +9772,102 @@ async def ssh_speed_multi_select(update: Update, context: ContextTypes.DEFAULT_T
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
 
+async def _do_speedtest_stream(q_or_msg, context, targets: list):
+    """Speed test by streaming into the router over SSH for a fixed time."""
+    total = len(targets)
+    if hasattr(q_or_msg, 'message'):
+        msg = q_or_msg.message
+        await safe_edit_text(q_or_msg, context, f"📶 Спидтест... 0/{total}", parse_mode="HTML")
+    else:
+        msg = await q_or_msg.reply_text(f"📶 Спидтест... 0/{total}")
+    cancel_key = f"speed_cancel_{id(msg)}"
+    context.user_data[cancel_key] = False
+    cancel_kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏹ Отмена", callback_data=f"ssh_speed_cancel:{cancel_key}")]
+    ])
+    per_router = SPEED2_WARMUP_S + SPEED2_SECONDS
+    results = []
+    speeds = []   # (cn, mbps) for the summary
+    done = 0
+    for cn in targets:
+        if context.user_data.get(cancel_key):
+            results.append(f"⏹ <b>{cn}</b>: отменено")
+            done += 1
+            continue
+        try:
+            await msg.edit_text(
+                f"📶 <b>{cn}</b> — замер ~{per_router}с...\n({done}/{total} готово)",
+                parse_mode="HTML", reply_markup=cancel_kb)
+        except Exception:
+            pass
+        start_t = time.time()
+        try:
+            status, mbps, detail = await asyncio.wait_for(
+                asyncio.to_thread(router_speedtest_stream, cn),
+                timeout=SPEED2_TIMEOUT + 15)
+        except asyncio.TimeoutError:
+            status, mbps, detail = "timeout", 0.0, ""
+        except Exception as e:
+            status, mbps, detail = "err", 0.0, str(e)[:80]
+        elapsed_s = int(time.time() - start_t)
+        if status == "ok":
+            speeds.append((cn, mbps))
+            results.append(
+                f"{_speed2_emoji(mbps)} <b>{cn}</b>: {_speed2_human(mbps)} ({elapsed_s}с)")
+        else:
+            reason = {
+                "auth": "ошибка авторизации",
+                "host": "не отвечает",
+                "timeout": "таймаут",
+                "offline": "оффлайн",
+            }.get(status, detail or "ошибка")
+            results.append(f"🐌 <b>{cn}</b>: {escape(reason)} ({elapsed_s}с)")
+        done += 1
+        if context.user_data.get(cancel_key):
+            for rest in targets[targets.index(cn) + 1:]:
+                results.append(f"⏹ <b>{rest}</b>: отменено")
+                done += 1
+            break
+    context.user_data.pop(cancel_key, None)
+    report = "\n".join(results)
+    summary = ""
+    if len(speeds) >= 2:
+        vals = sorted(m for _, m in speeds)
+        mid = vals[len(vals) // 2] if len(vals) % 2 else (vals[len(vals) // 2 - 1] + vals[len(vals) // 2]) / 2
+        worst_cn, worst_mbps = min(speeds, key=lambda x: x[1])
+        summary = (f"\n\nСередина по парку: <b>{_speed2_human(mid)}</b>"
+                   f"\nМедленнее всех: <b>{escape(worst_cn)}</b> — {_speed2_human(worst_mbps)}")
+    text = (f"📶 <b>Спидтест завершён</b>: {done}/{total}\n"
+            f"SSH-поток, {SPEED2_SECONDS}с на роутер, замер на приём\n\n{report}{summary}")
+    if len(text) > 4000:
+        text = text[:3990] + "\n..."
+    await msg.edit_text(text, parse_mode="HTML")
+
+
+def _speed2_human(mbps: float) -> str:
+    return f"{mbps:.0f} Мбит/с" if mbps >= 10 else f"{mbps:.1f} Мбит/с"
+
+
+def _speed2_emoji(mbps: float) -> str:
+    """Scale tuned to the tariffs we actually see: 6 Мбит almost everywhere,
+    10 Мбит at one business client. So ✅ means the top tariff is being
+    delivered in full, 👌 means a healthy 6-Мбит line."""
+    if mbps <= 0:
+        return "❌"
+    if mbps >= 10:
+        return "✅"
+    if mbps >= 3:
+        return "👌"
+    if mbps >= 1:
+        return "⚠️"
+    return "🐌"
+
+
 async def _do_speedtest(q_or_msg, context, targets: list):
     """Run speed test on a list of routers (VPN tunnel only)."""
+    if context.user_data.get('speed_method', 'stream') == 'stream':
+        await _do_speedtest_stream(q_or_msg, context, targets)
+        return
     size_mb = context.user_data.get('speed_size_mb', 5)
     if not _ensure_speedtest_file(size_mb):
         text = "❌ Не удалось создать тестовый файл на бэкенде."
