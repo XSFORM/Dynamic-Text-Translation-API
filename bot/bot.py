@@ -4501,10 +4501,17 @@ def parse_beacon_log():
     from datetime import datetime
     beacons = {}
     try:
-        # Read last 5000 lines to catch recent beacons
-        with open(RR_BEACON_LOG, "r", errors="replace") as f:
-            lines = f.readlines()
-        for line in lines[-5000:]:
+        # Recent tail of the log. Right after the nightly logrotate the fresh
+        # access.log is nearly empty, so prepend the rotated file as well —
+        # otherwise every router looks "missing from the beacon" past midnight.
+        lines = []
+        for path in (RR_BEACON_LOG + ".1", RR_BEACON_LOG):
+            try:
+                with open(path, "r", errors="replace") as f:
+                    lines.extend(f.readlines()[-30000:])
+            except FileNotFoundError:
+                pass
+        for line in lines[-30000:]:
             if "/router/beacon.txt?" not in line:
                 continue
             # Parse timestamp: [23/Aug/2026:19:30:00 +0500]
@@ -4631,6 +4638,7 @@ LAGGARD_MAX = 40                # one pass; each router is its own SSH session
 LAGGARD_PARALLEL = 4
 
 _LAGGARD_DIAG_CMD = (
+    "echo \"RID:$(head -n1 /etc/storage/router_id 2>/dev/null | tr -d '\\r ')\"; "
     "V=$(grep -m1 '^SELF_VERSION=' /etc/storage/update_script.sh 2>/dev/null "
     "| cut -d= -f2 | tr -d '\\r '); echo \"VER:${V:-none}\"; "
     "echo \"CRON:$(crontab -l 2>/dev/null | grep -c update_script)\"; "
@@ -4659,7 +4667,8 @@ def _target_version_for(cn: str, vd: dict) -> str:
     cv, cids = vd.get("canary_version", ""), vd.get("canary_ids", "")
     if cv and cids:
         ids = {x.lower() for x in re.split(r"[,\s]+", cids) if x}
-        if get_anon_id(cn).lower() in ids:
+        # Read-only lookup: get_anon_id() would mint a new ID as a side effect.
+        if load_router_id_map().get(cn, "").lower() in ids:
             return cv
     return vd.get("version", "")
 
@@ -4690,7 +4699,7 @@ def find_laggards():
     return out, vd.get("version", ""), len(online)
 
 
-def _laggard_verdict(out: str, want: str) -> tuple:
+def _laggard_verdict(out: str, want: str, expected_id: str = "") -> tuple:
     """Turn the router's diag output into (short_status, explanation, log_lines)."""
     info, log_lines, in_log = {}, [], False
     for line in out.splitlines():
@@ -4718,7 +4727,19 @@ def _laggard_verdict(out: str, want: str) -> tuple:
     if lock.isdigit() and int(lock) > 600:
         return "завис lock", f"lock-файл висит {int(lock) // 60} мин — новые запуски выходят сразу", log_lines
     if want and ver == str(want):
-        return "версия свежая", "скрипт актуален, но маяк не доходит — смотри домены/фронт", log_lines
+        # Script is current, so why is it missing from the beacon? Most often
+        # the beacon does arrive, just signed with an ID the bot can't map
+        # back to a name: router_id was never written (mass deploy used to
+        # skip it), so the router reports as "unknown" or by a stale ID.
+        rid = info.get("RID", "")
+        if not rid or rid == "unknown":
+            return "нет ID", ("нет файла router_id — маяк уходит как «unknown», "
+                              "бот не знает, чей он"), log_lines
+        if rid.lower() != (expected_id or "").lower():
+            return "чужой ID", (f"на роутере router_id={rid}, а у бота для него "
+                                f"{expected_id or 'ID ещё не заведён'} — маяк приходит, "
+                                "но не узнаётся"), log_lines
+        return "версия свежая", "скрипт актуален и ID верный, но маяк не доходит — смотри домены/фронт", log_lines
     note = f"на роутере v{ver}, цикл жив, но не обновился"
     if info.get("KEY") == "no":
         note += "; нет HMAC-ключа"
@@ -4750,6 +4771,7 @@ async def ssh_laggards(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lock = asyncio.Lock()
     sem = asyncio.Semaphore(LAGGARD_PARALLEL)
     vd = read_version_file()
+    id_map = load_router_id_map()
 
     async def progress():
         pct = done * 100 // total
@@ -4769,7 +4791,7 @@ async def ssh_laggards(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 ok, out = False, str(e)
         want = _target_version_for(cn, vd)
-        results[cn] = _laggard_verdict(out, want) if ok and "VER:" in out \
+        results[cn] = _laggard_verdict(out, want, id_map.get(cn, "")) if ok and "VER:" in out \
             else ("SSH ✗", (out or "нет ответа")[:80], [])
         async with lock:
             done += 1
@@ -4799,9 +4821,14 @@ async def ssh_laggards(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = head_txt + "<pre>" + escape("\n".join(rows)) + "</pre>\n" + "\n\n".join(details)
 
     # Who can be fixed by simply redeploying the script.
-    fixable = [cn for cn, _, _ in shown if results[cn][0] != "SSH ✗"
-               and results[cn][0] != "версия свежая"]
+    id_fix = [cn for cn, _, _ in shown if results[cn][0] in ("нет ID", "чужой ID")]
+    fixable = [cn for cn, _, _ in shown if results[cn][0] not in
+               ("SSH ✗", "версия свежая", "нет ID", "чужой ID")]
     kb = []
+    if id_fix:
+        context.user_data['laggards_idfix'] = id_fix
+        kb.append([InlineKeyboardButton(f"🏷 Прописать правильный ID ({len(id_fix)})",
+                                        callback_data='ssh_laggards_idfix')])
     front = ""
     try:
         with open(DEPLOY_FRONT_IP_FILE) as f:
@@ -4894,6 +4921,49 @@ async def lag_notify_monitor(app):
         except Exception as e:
             logger.warning("lag_notify_monitor: %s", e)
         await asyncio.sleep(LAG_NOTIFY_EVERY_S)
+
+
+async def ssh_laggards_idfix(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Write the bot's anon ID into /etc/storage/router_id on each router.
+
+    That is all the beacon needs to be recognised again: the next cron run
+    (within 5 minutes) reports under the right ID. Nothing else on the
+    router is touched."""
+    q = update.callback_query
+    targets = context.user_data.pop('laggards_idfix', None)
+    if not targets:
+        await safe_edit_text(q, context, "Список устарел, запустите осмотр заново.")
+        return
+    total = len(targets)
+    ok_names, bad = [], []
+    for i, cn in enumerate(targets, 1):
+        try:
+            await safe_edit_text(q, context,
+                f"🏷 Прописываю ID: {i}/{total} — <b>{escape(cn)}</b>", parse_mode="HTML")
+        except Exception:
+            pass
+        aid = get_anon_id(cn)  # creates a map entry if the router never had one
+        cmd = (f"printf '%s\\n' '{aid}' > /etc/storage/router_id && "
+               f"mtd_storage.sh save >/dev/null 2>&1 && echo ID_OK")
+        try:
+            ok, out = await asyncio.to_thread(router_ssh_exec, cn, cmd, 25)
+        except Exception as e:
+            ok, out = False, str(e)
+        if ok and "ID_OK" in out:
+            ok_names.append(cn)
+        else:
+            bad.append(f"❌ <b>{escape(cn)}</b>: {escape((out or '—')[:80])}")
+    text = f"🏷 <b>ID прописан</b>: {len(ok_names)}/{total}"
+    if ok_names:
+        text += "\n✅ " + ", ".join(escape(c) for c in ok_names)
+    if bad:
+        text += "\n\n" + "\n".join(bad)
+    text += ("\n\n<i>Маяк начнёт узнавать их со следующего запуска cron, то есть в пределах "
+             "5 минут. Потом нажмите «Ещё раз» в осмотре.</i>")
+    await safe_edit_text(q, context, text, parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🩺 Осмотреть снова", callback_data='ssh_laggards')],
+            [InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')]]))
 
 
 def read_version_file():
@@ -8556,6 +8626,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🔔 Уведомления об отставших роутерах включены" if st["enabled"]
             else "🔕 Уведомления об отставших роутерах выключены.\n"
                  "Включить обратно: SSH Роутеры → 🩺 Отставшие роутеры.")
+    elif data == 'ssh_laggards_idfix':
+        await ssh_laggards_idfix(update, context)
     elif data == 'ssh_laggards_fix':
         pending = context.user_data.pop('laggards_fix', None)
         if not pending:
@@ -9255,6 +9327,10 @@ async def _do_ssh_deploy_multi(q_or_msg, context, targets: list, front_ip: str):
             # download left the router with its autostart wiped.
             f'cat /dev/null > /etc/storage/started_script.sh ; '
             f'[ -f /etc/storage/tunnel.sh ] && echo "sh /etc/storage/tunnel.sh &" >> /etc/storage/started_script.sh ; '
+            # The beacon signs itself with this ID. Single deploy always wrote
+            # it, mass deploy didn't — and those routers went missing from the
+            # beacon, reporting as "unknown".
+            f'printf "%s\\n" "{get_anon_id(cn)}" > /etc/storage/router_id ; '
             f'cp /etc/storage/update_script.sh /etc/storage/update_script.sh.bak.$(date +%H%M) 2>/dev/null ; '
             f'mv /tmp/us.sh /etc/storage/update_script.sh && chmod +x /etc/storage/update_script.sh ; '
             f'{isp_sed}'
