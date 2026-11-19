@@ -9662,14 +9662,22 @@ def _speed_timed_cmd(url: str, seconds: int) -> str:
     missing we pipe wget through wc -c: same idea, and nothing touches
     the router's flash or RAM.
     """
+    # No `timeout` here on purpose: BusyBox on Padavan wants `timeout -t 8`
+    # while coreutils wants `timeout 8`, and guessing wrong makes it try to
+    # run a program called "8" — which is what returned 0 bytes instantly.
+    # Backgrounding wget and killing it after N seconds works on both.
+    # Output goes through a pipe into wc -c, so nothing is written to the
+    # router's RAM or flash.
     return (
         f'if command -v curl >/dev/null 2>&1; then '
         f'curl -o /dev/null -s --max-time {seconds} '
         f'-w "curl:%{{speed_download}}:%{{time_total}}" "{url}"; '
         f'else '
         f'S=$(date +%s); '
-        f'FS=$(timeout {seconds} wget -q -O - "{url}" 2>/dev/null | wc -c); '
-        f'E=$(date +%s); echo "wget_time:$((E-S)):$FS"; fi'
+        f'FS=$({{ wget -q -O - "{url}" 2>/dev/null & '
+        f'WP=$!; sleep {seconds}; kill $WP 2>/dev/null; }} | wc -c); '
+        f'E=$(date +%s); '
+        f'echo "wget_time:$((E-S)):$FS"; fi'
     )
 
 
