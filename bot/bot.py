@@ -209,6 +209,46 @@ SPEEDTEST_FILE_1MB = "/var/www/html/speedtest_1mb.bin"
 SPEEDTEST_SIZE_MB = 5
 
 # =====================================================================
+#  ATOMIC WRITE — for every file routers download
+# =====================================================================
+def atomic_write(path: str, content: str, mode: int = None) -> None:
+    """Write `path` so that a reader never sees a half-written file.
+
+    Routers poll current_vpn_ip.txt, version.txt, update_script.sh and the
+    rest every few minutes, all day. With a plain open("w") the file is
+    truncated first and filled after, so a router landing in that gap
+    downloads an empty or partial file. Here we write a temp file next to
+    it and rename over the original: rename is atomic on the same
+    filesystem, readers get either the old file or the new one, never a
+    mix.
+
+    mkstemp creates files as 0600, which nginx could not read, so we copy
+    the old file's mode (or use 0644 for a new file) unless told otherwise.
+    """
+    d = os.path.dirname(path) or "."
+    os.makedirs(d, exist_ok=True)
+    if mode is None:
+        try:
+            mode = os.stat(path).st_mode & 0o777
+        except OSError:
+            mode = 0o644
+    fd, tmp = tempfile.mkstemp(dir=d, prefix="." + os.path.basename(path) + ".")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+# =====================================================================
 #  ROUTER ID MAP — anonymous hex IDs ↔ CN names
 # =====================================================================
 def load_router_id_map() -> dict:
@@ -510,11 +550,9 @@ def subnet_switch_ip(pool_data: dict, new_ip: str) -> Tuple[bool, str]:
 
     # 4. Update RR current_vpn_ip.txt (+ pptp if pptp toggle on)
     try:
-        with open(RR_IP_FILE, "w") as f:
-            f.write(new_ip)
+        atomic_write(RR_IP_FILE, new_ip)
         if auto_ip_state.get("pptp"):
-            with open(RR_PPTP_IP_FILE, "w") as f:
-                f.write(new_ip)
+            atomic_write(RR_PPTP_IP_FILE, new_ip)
         rr_append_history(f"subnet switch: {old_ip} → {new_ip}")
     except Exception:
         pass
@@ -694,16 +732,14 @@ def read_emergency_oec() -> str:
         return ""
 
 def write_emergency_oec(text: str):
-    with open(RR_EMERGENCY_OEC_FILE, "w") as f:
-        f.write(text.strip() + "\n")
+    atomic_write(RR_EMERGENCY_OEC_FILE, text.strip() + "\n")
 
 def is_emergency_enabled() -> bool:
     return os.path.isfile(RR_EMERGENCY_FLAG_FILE)
 
 def set_emergency_flag(enabled: bool):
     if enabled:
-        with open(RR_EMERGENCY_FLAG_FILE, "w") as f:
-            f.write("on\n")
+        atomic_write(RR_EMERGENCY_FLAG_FILE, "on\n")
     else:
         try:
             os.remove(RR_EMERGENCY_FLAG_FILE)
@@ -719,8 +755,7 @@ def is_pptp_emergency_enabled() -> bool:
 
 def set_pptp_emergency(enabled: bool):
     if enabled:
-        with open(RR_PPTP_EMERGENCY_FILE, "w") as f:
-            f.write("openvpn\n")
+        atomic_write(RR_PPTP_EMERGENCY_FILE, "openvpn\n")
     else:
         try:
             os.remove(RR_PPTP_EMERGENCY_FILE)
@@ -1100,10 +1135,7 @@ def save_tunnel_server(data: Dict):
 
 def _write_tunnel_ip_file(ip: str):
     """Write tunnel_ip.txt so routers can fetch it via HTTP."""
-    d = os.path.dirname(TUNNEL_IP_FILE)
-    os.makedirs(d, exist_ok=True)
-    with open(TUNNEL_IP_FILE, "w") as f:
-        f.write(ip + "\n" if ip else "")
+    atomic_write(TUNNEL_IP_FILE, ip + "\n" if ip else "")
 
 def tunnel_generate_key() -> str:
     """Generate RSA key pair for router SSH tunnel. Returns public key string."""
@@ -3991,9 +4023,7 @@ def rr_read_file(path: str, default: str = "") -> str:
         return default
 
 def rr_write_file(path: str, content: str) -> None:
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(content)
+    atomic_write(path, content)
 
 def rr_write_sha256(path: str) -> None:
     try:
@@ -4582,6 +4612,290 @@ async def beacon_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
                          reply_markup=InlineKeyboardMarkup(kb))
 
 
+# =====================================================================
+#  LAGGARDS — online routers that are not on the current version
+# =====================================================================
+# Why this exists: a router stuck on an old script works perfectly well.
+# Its VPN server address is already in memory, the tunnel comes up without
+# any help from update_script, so the customer notices nothing — while the
+# version quietly stays put. The beacon cannot explain it either: a router
+# whose update cycle is dead simply stops showing up there.
+#
+# So we work out who is missing (online in the tunnel, but no fresh beacon
+# on the version they should have), go into each one over SSH and bring
+# back a verdict: is the cycle alive, what version is really on the router,
+# has the new version been blacklisted locally, what did the log say last.
+
+LAGGARD_BEACON_STALE_MIN = 20   # cron runs every 5 min; 20 min of silence is real
+LAGGARD_MAX = 40                # one pass; each router is its own SSH session
+LAGGARD_PARALLEL = 4
+
+_LAGGARD_DIAG_CMD = (
+    "V=$(grep -m1 '^SELF_VERSION=' /etc/storage/update_script.sh 2>/dev/null "
+    "| cut -d= -f2 | tr -d '\\r '); echo \"VER:${V:-none}\"; "
+    "echo \"CRON:$(crontab -l 2>/dev/null | grep -c update_script)\"; "
+    "pidof crond >/dev/null 2>&1 && echo CROND:up || echo CROND:down; "
+    "echo \"FAIL:$(cat /etc/storage/update_fail 2>/dev/null | tr '\\n' ' ')\"; "
+    "[ -f /etc/storage/rr_key ] && echo KEY:yes || echo KEY:no; "
+    "L=/tmp/vpn_update.lock; if [ -f $L ]; then "
+    "echo \"LOCK:$(( $(date +%s) - $(awk -F: '{print $2}' $L 2>/dev/null || echo 0) ))\"; "
+    "else echo LOCK:none; fi; "
+    "echo '---LOG---'; "
+    "(logread 2>/dev/null || cat /tmp/syslog.log 2>/dev/null) | grep 'vpn-update' | tail -n 4"
+)
+
+
+def _beacon_age_min(ts: str):
+    """Minutes since a beacon timestamp like 23/Aug/2026:19:30:00, or None."""
+    try:
+        t = datetime.strptime(ts, "%d/%b/%Y:%H:%M:%S")
+        return (datetime.now() - t).total_seconds() / 60
+    except Exception:
+        return None
+
+
+def _target_version_for(cn: str, vd: dict) -> str:
+    """The version this particular router should be on (canary aware)."""
+    cv, cids = vd.get("canary_version", ""), vd.get("canary_ids", "")
+    if cv and cids:
+        ids = {x.lower() for x in re.split(r"[,\s]+", cids) if x}
+        if get_anon_id(cn).lower() in ids:
+            return cv
+    return vd.get("version", "")
+
+
+def find_laggards():
+    """Return (laggards, target_version, online_count).
+
+    laggards: list of (cn, reason_before_ssh, beacon_or_None)."""
+    vd = read_version_file()
+    routers = load_routers()
+    online = get_online_clients() | {cn for cn, v in routers.items()
+                                     if v.get("vpn_type") == "pptp"}
+    beacons = parse_beacon_log()
+    out = []
+    for cn in sorted(routers, key=_natural_key):
+        if cn not in online:
+            continue
+        want = _target_version_for(cn, vd)
+        b = beacons.get(cn)
+        if not b:
+            out.append((cn, "нет в маяке", None))
+            continue
+        age = _beacon_age_min(b.get("ts", ""))
+        if want and str(b.get("v")) != str(want):
+            out.append((cn, f"в маяке v{b.get('v')}, нужна v{want}", b))
+        elif age is not None and age > LAGGARD_BEACON_STALE_MIN:
+            out.append((cn, f"маяк молчит {int(age)} мин", b))
+    return out, vd.get("version", ""), len(online)
+
+
+def _laggard_verdict(out: str, want: str) -> tuple:
+    """Turn the router's diag output into (short_status, explanation, log_lines)."""
+    info, log_lines, in_log = {}, [], False
+    for line in out.splitlines():
+        if line.strip() == "---LOG---":
+            in_log = True
+            continue
+        if in_log:
+            if line.strip():
+                log_lines.append(line.strip()[-110:])
+        elif ":" in line:
+            k, v = line.split(":", 1)
+            info[k.strip()] = v.strip()
+    ver = info.get("VER", "?")
+    fails = info.get("FAIL", "").split()
+    lock = info.get("LOCK", "none")
+    if ver == "none":
+        return "нет скрипта", "update_script.sh на роутере отсутствует — нужно залить", log_lines
+    if info.get("CRON") == "0":
+        return "нет в cron", "скрипт не запускается: строки в crontab нет", log_lines
+    if info.get("CROND") == "down":
+        return "crond стоит", "планировщик не запущен — скрипт не вызывается", log_lines
+    if want and want in fails:
+        return "в чёрном списке", (f"v{want} помечена у роутера как сбойная "
+                                   "(HMAC не сошёлся) — сам больше не попробует"), log_lines
+    if lock.isdigit() and int(lock) > 600:
+        return "завис lock", f"lock-файл висит {int(lock) // 60} мин — новые запуски выходят сразу", log_lines
+    if want and ver == str(want):
+        return "версия свежая", "скрипт актуален, но маяк не доходит — смотри домены/фронт", log_lines
+    note = f"на роутере v{ver}, цикл жив, но не обновился"
+    if info.get("KEY") == "no":
+        note += "; нет HMAC-ключа"
+    return f"v{ver}", note, log_lines
+
+
+async def ssh_laggards(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Find laggards and inspect each over SSH, with a progress bar."""
+    q = update.callback_query
+    if context.user_data.get('laggards_running'):
+        return  # second tap while a pass is running — the progress bar is already on screen
+    lag, latest, online_cnt = await asyncio.to_thread(find_laggards)
+    back_kb = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')]])
+    if not latest:
+        await safe_edit_text(q, context, "❌ В version.txt не задана версия — не с чем сравнивать.",
+                             reply_markup=back_kb)
+        return
+    if not lag:
+        await safe_edit_text(q, context,
+            f"🩺 <b>Отставшие роутеры</b>\n\nОнлайн: {online_cnt}\n"
+            f"✅ Все онлайн-роутеры на v{latest} и отмечаются в маяке.",
+            parse_mode="HTML", reply_markup=back_kb)
+        return
+    shown = lag[:LAGGARD_MAX]
+    total = len(shown)
+    context.user_data['laggards_running'] = True
+    results = {}
+    done = 0
+    lock = asyncio.Lock()
+    sem = asyncio.Semaphore(LAGGARD_PARALLEL)
+    vd = read_version_file()
+
+    async def progress():
+        pct = done * 100 // total
+        bar = "▓" * (pct // 10) + "░" * (10 - pct // 10)
+        try:
+            await safe_edit_text(q, context,
+                f"🩺 Осматриваю отставших: {done}/{total}  {bar} {pct}%\n"
+                f"<i>Онлайн {online_cnt}, отстают {len(lag)}</i>", parse_mode="HTML")
+        except Exception:
+            pass
+
+    async def inspect(cn):
+        nonlocal done
+        async with sem:
+            try:
+                ok, out = await asyncio.to_thread(router_ssh_exec, cn, _LAGGARD_DIAG_CMD, 25)
+            except Exception as e:
+                ok, out = False, str(e)
+        want = _target_version_for(cn, vd)
+        results[cn] = _laggard_verdict(out, want) if ok and "VER:" in out \
+            else ("SSH ✗", (out or "нет ответа")[:80], [])
+        async with lock:
+            done += 1
+            if done % 2 == 0 or done == total:
+                await progress()
+
+    try:
+        await progress()
+        await asyncio.gather(*(inspect(cn) for cn, _, _ in shown))
+    finally:
+        context.user_data.pop('laggards_running', None)
+
+    # Table (monospace, no emoji — they break column widths) + details.
+    rows = [f"{'роутер':<16}{'статус':<16}"]
+    for cn, _, _ in shown:
+        rows.append(f"{cn[:15]:<16}{results[cn][0][:15]:<16}")
+    details = []
+    for cn, before, _ in shown:
+        status, why, log_lines = results[cn]
+        block = f"<b>{escape(cn)}</b> — {escape(before)}\n  {escape(why)}"
+        if log_lines:
+            block += "\n  <code>" + escape(log_lines[-1]) + "</code>"
+        details.append(block)
+    head_txt = (f"🩺 <b>Отставшие роутеры</b>\n"
+                f"Нужна v{latest} · онлайн {online_cnt} · отстают {len(lag)}"
+                + (f" (показаны {total})" if len(lag) > total else "") + "\n\n")
+    text = head_txt + "<pre>" + escape("\n".join(rows)) + "</pre>\n" + "\n\n".join(details)
+
+    # Who can be fixed by simply redeploying the script.
+    fixable = [cn for cn, _, _ in shown if results[cn][0] != "SSH ✗"
+               and results[cn][0] != "версия свежая"]
+    kb = []
+    front = ""
+    try:
+        with open(DEPLOY_FRONT_IP_FILE) as f:
+            front = f.read().strip()
+    except Exception:
+        pass
+    if fixable and front:
+        context.user_data['laggards_fix'] = {"targets": fixable, "front_ip": front}
+        kb.append([InlineKeyboardButton(f"📦 Перезалить скрипт ({len(fixable)}) через {front}",
+                                        callback_data='ssh_laggards_fix')])
+    kb.append([InlineKeyboardButton("🔄 Ещё раз", callback_data='ssh_laggards')])
+    notif_on = _lag_notify_load()["enabled"]
+    kb.append([InlineKeyboardButton(
+        "🔔 Уведомления: вкл (выключить)" if notif_on else "🔕 Уведомления: выкл (включить)",
+        callback_data='lag_notify_toggle')])
+    kb.append([InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')])
+    if len(text) > 3900:
+        plain = re.sub(r"<[^>]+>", "", text)
+        await context.bot.send_document(
+            chat_id=q.message.chat_id, document=plain.encode("utf-8"),
+            filename="laggards.txt",
+            caption=f"🩺 Отставших: {len(lag)}, осмотрено {total}",
+            reply_markup=InlineKeyboardMarkup(kb))
+        return
+    await safe_edit_text(q, context, text, parse_mode="HTML",
+                         reply_markup=InlineKeyboardMarkup(kb))
+
+
+# ---------------------------------------------------------------------
+#  Laggard notifications — with an action button right in the message
+# ---------------------------------------------------------------------
+LAG_NOTIFY_FILE = "/root/monitor_bot/lag_notify.json"
+LAG_NOTIFY_EVERY_S = 30 * 60
+LAG_NOTIFY_BUTTONS = 6   # per-router "update" buttons in one message
+
+
+def _lag_notify_load() -> dict:
+    try:
+        with open(LAG_NOTIFY_FILE) as f:
+            d = json.load(f)
+    except Exception:
+        d = {}
+    d.setdefault("enabled", True)
+    d.setdefault("seen", {})       # cn -> how many checks in a row it lagged
+    d.setdefault("notified", [])   # already reported, until it catches up
+    return d
+
+
+def _lag_notify_save(d: dict):
+    try:
+        atomic_write(LAG_NOTIFY_FILE, json.dumps(d, ensure_ascii=False, indent=1))
+    except Exception as e:
+        logger.warning("lag_notify save failed: %s", e)
+
+
+async def lag_notify_monitor(app):
+    """Every 30 min: tell the admin about routers that fell behind.
+
+    A router must lag on two checks in a row before we say anything. Right
+    after a version bump every router lags for a few minutes while its own
+    cron picks the update up — that is normal and must not produce a storm
+    of messages. Each router is reported once, and again only if it
+    catches up and later falls behind again.
+    """
+    await asyncio.sleep(120)  # let the bot settle after a restart
+    while True:
+        try:
+            st = _lag_notify_load()
+            if st["enabled"]:
+                lag, latest, _ = await asyncio.to_thread(find_laggards)
+                now_lag = {cn: why for cn, why, _ in lag}
+                seen = {cn: st["seen"].get(cn, 0) + 1 for cn in now_lag}
+                notified = [cn for cn in st["notified"] if cn in now_lag]
+                fresh = [cn for cn, n in seen.items() if n >= 2 and cn not in notified]
+                if fresh and latest:
+                    lines = [f"🩺 <b>Отстали от v{latest}</b>: {len(fresh)}"]
+                    for cn in fresh[:20]:
+                        lines.append(f"  • <b>{escape(cn)}</b> — {escape(now_lag[cn])}")
+                    if len(fresh) > 20:
+                        lines.append(f"  … и ещё {len(fresh) - 20}")
+                    kb = [[InlineKeyboardButton(f"📦 Обновить {cn}", callback_data=f"lag_fix_one:{cn}")]
+                          for cn in fresh[:LAG_NOTIFY_BUTTONS] if len(f"lag_fix_one:{cn}") <= 64]
+                    kb.append([InlineKeyboardButton("🩺 Осмотреть по SSH", callback_data='ssh_laggards')])
+                    kb.append([InlineKeyboardButton("🔕 Выключить эти уведомления", callback_data='lag_notify_toggle')])
+                    await app.bot.send_message(ADMIN_ID, "\n".join(lines), parse_mode="HTML",
+                                               reply_markup=InlineKeyboardMarkup(kb))
+                    notified += fresh
+                st["seen"], st["notified"] = seen, notified
+                _lag_notify_save(st)
+        except Exception as e:
+            logger.warning("lag_notify_monitor: %s", e)
+        await asyncio.sleep(LAG_NOTIFY_EVERY_S)
+
+
 def read_version_file():
     """Read version.txt and return dict with version, canary_version, canary_ids."""
     data = {"version": "", "canary_version": "", "canary_ids": ""}
@@ -4602,14 +4916,14 @@ def read_version_file():
 
 def write_version_file(data: dict):
     """Write version.txt preserving all fields + auto-regenerate HMAC."""
-    with open(RR_VERSION_FILE, "w") as f:
-        f.write(f"version={data.get('version', '1')}\n")
-        cv = data.get('canary_version', '')
-        ci = data.get('canary_ids', '')
-        if cv:
-            f.write(f"canary_version={cv}\n")
-        if ci:
-            f.write(f"canary_ids={ci}\n")
+    body = f"version={data.get('version', '1')}\n"
+    cv = data.get('canary_version', '')
+    ci = data.get('canary_ids', '')
+    if cv:
+        body += f"canary_version={cv}\n"
+    if ci:
+        body += f"canary_ids={ci}\n"
+    atomic_write(RR_VERSION_FILE, body)
     # Always regenerate HMAC after writing version.txt
     try:
         rr_write_hmac(RR_VERSION_FILE)
@@ -4674,8 +4988,7 @@ def _patch_self_version(new_ver: int) -> bool:
                 patched = True
                 break
         if patched:
-            with open(script, "w") as f:
-                f.writelines(lines)
+            atomic_write(script, "".join(lines))
             try:
                 rr_write_hmac(RR_SCRIPT_FILE)
             except Exception:
@@ -5013,8 +5326,7 @@ def read_protocol() -> str:
         return "udp"
 
 def write_protocol(proto: str):
-    with open(RR_PROTOCOL_FILE, "w") as f:
-        f.write(proto.strip().lower() + "\n")
+    atomic_write(RR_PROTOCOL_FILE, proto.strip().lower() + "\n")
 
 async def protocol_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -5061,8 +5373,7 @@ def read_pptp_ip() -> str:
         return ""
 
 def write_pptp_ip(ip: str):
-    with open(RR_PPTP_IP_FILE, "w") as f:
-        f.write(ip.strip() + "\n")
+    atomic_write(RR_PPTP_IP_FILE, ip.strip() + "\n")
 
 
 async def pptp_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6763,6 +7074,7 @@ def _ssh_menu_kb(count: int) -> list:
         [InlineKeyboardButton("🔍 Статус роутера", callback_data='ssh_select_status')],
         [InlineKeyboardButton("📦 Залить скрипт", callback_data='ssh_select_deploy'),
          InlineKeyboardButton("📋 Версия", callback_data='ssh_check_ver')],
+        [InlineKeyboardButton("🩺 Отставшие роутеры", callback_data='ssh_laggards')],
         [InlineKeyboardButton("🩹 Лечение", callback_data='ssh_select_heal')],
         [InlineKeyboardButton("🔁 Перезагрузка", callback_data='ssh_select_reboot')],
         [InlineKeyboardButton("💻 Команда", callback_data='ssh_select_cmd')],
@@ -6938,7 +7250,7 @@ async def _reply_kb_gitpull(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _ws_dst = "/var/www/html/router/update_script.sh"
             if os.path.isfile(_ws_src):
                 os.makedirs(os.path.dirname(_ws_dst), exist_ok=True)
-                shutil.copy2(_ws_src, _ws_dst)
+                atomic_write(_ws_dst, open(_ws_src, encoding="utf-8").read())
                 rr_write_hmac(_ws_dst)
             _vt_src = "/opt/remote_refresh/router/version.txt"
             _vt_dst = "/var/www/html/router/version.txt"
@@ -7115,28 +7427,26 @@ async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_T
             # Single router (legacy)
             targets = [target]
             label = target
-        if len(targets) == 1:
-            cn = targets[0]
-            r = routers.get(cn)
-            if not r:
-                await update.message.reply_text("Роутер не найден.")
-                return
-            ip = get_router_ip(cn)
-            if not ip:
-                await update.message.reply_text(f"🔴 {cn} — нет IP.")
-                return
-            msg = await update.message.reply_text(f"💻 Выполняю на <b>{cn}</b>...", parse_mode="HTML")
-            ok, out = router_ssh_exec(cn, cmd)
-            result = f"💻 <b>{cn}</b> ({ip}):\n<pre>{escape(out[:3800])}</pre>"
-            await msg.edit_text(result, parse_mode="HTML")
-        else:
-            msg = await update.message.reply_text(f"💻 Выполняю на {label}...\nЭто может занять время.", parse_mode="HTML")
-            report = await ssh_exec_multi(msg, routers, targets, cmd, context)
-            # Split if too long for Telegram
-            if len(report) > 4000:
-                await msg.edit_text(report[:4000] + "\n\n<i>...обрезано</i>", parse_mode="HTML")
-            else:
-                await msg.edit_text(report, parse_mode="HTML")
+        # The command goes out exactly as typed — silently filtering it would
+        # be worse than running it honestly. The only guard is to ask again
+        # when it is one of the commands that can cut us off from the router.
+        danger = ssh_cmd_danger(cmd)
+        if danger:
+            context.user_data['ssh_cmd_pending'] = {
+                "targets": targets, "cmd": cmd, "label": label}
+            who = (f"<b>{escape(targets[0])}</b>" if len(targets) == 1
+                   else f"<b>{len(targets)}</b> роутеров")
+            await update.message.reply_text(
+                f"⚠️ <b>Опасная команда</b>\n\n"
+                f"<pre>{escape(cmd[:500])}</pre>\n"
+                f"Причина: {danger}\n"
+                f"Выполнить на {who}?",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ Да, выполнить", callback_data='ssh_cmd_confirm'),
+                     InlineKeyboardButton("❌ Отмена", callback_data='ssh_cmd_cancel')]]))
+            return
+        await _ssh_cmd_execute(update.message, context, targets, cmd, label)
         return
     # OVPN EDIT text input
     if context.user_data.get('await_ovpn_edit'):
@@ -7154,8 +7464,7 @@ async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_T
                 # Save backup copy
                 if os.path.exists(path):
                     shutil.copy2(path, path + ".bak")
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write(new_content)
+                atomic_write(path, new_content)
                 fname = os.path.basename(path)
                 await update.message.reply_text(
                     f"\u2705 {fname} обновлён.\nБэкап сохранён в {fname}.bak\n"
@@ -7856,7 +8165,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 _ws_dst = "/var/www/html/router/update_script.sh"
                 if os.path.isfile(_ws_src):
                     os.makedirs(os.path.dirname(_ws_dst), exist_ok=True)
-                    shutil.copy2(_ws_src, _ws_dst)
+                    atomic_write(_ws_dst, open(_ws_src, encoding="utf-8").read())
                     rr_write_hmac(_ws_dst)
                 # version.txt is managed by the bot at runtime — do NOT
                 # overwrite from git (git has a stale copy).  Only seed it
@@ -8221,6 +8530,59 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith('ssh_reboot:'):
         cn = data[len('ssh_reboot:'):]
         await ssh_reboot_router(update, context, cn)
+    elif data == 'ssh_laggards':
+        await ssh_laggards(update, context)
+    elif data.startswith('lag_fix_one:'):
+        cn = data[len('lag_fix_one:'):]
+        front = ""
+        try:
+            with open(DEPLOY_FRONT_IP_FILE) as f:
+                front = f.read().strip()
+        except Exception:
+            pass
+        if not front:
+            await safe_edit_text(q, context,
+                "❌ Не знаю, через какой фронт заливать: сначала сделайте один деплой "
+                "через «📦 Залить скрипт», бот запомнит фронт.")
+        else:
+            await _do_ssh_deploy_multi(q, context, [cn], front)
+    elif data == 'lag_notify_toggle':
+        st = _lag_notify_load()
+        st["enabled"] = not st["enabled"]
+        _lag_notify_save(st)
+        # The query is already answered by the dispatcher, so a popup would
+        # not show — reply with a short message instead.
+        await q.message.reply_text(
+            "🔔 Уведомления об отставших роутерах включены" if st["enabled"]
+            else "🔕 Уведомления об отставших роутерах выключены.\n"
+                 "Включить обратно: SSH Роутеры → 🩺 Отставшие роутеры.")
+    elif data == 'ssh_laggards_fix':
+        pending = context.user_data.pop('laggards_fix', None)
+        if not pending:
+            await safe_edit_text(q, context, "Список устарел, запустите осмотр заново.")
+        else:
+            await _do_ssh_deploy_multi(q, context, pending["targets"], pending["front_ip"])
+    elif data == 'ssh_deploy_retry':
+        pending = context.user_data.pop('deploy_retry', None)
+        if not pending or not pending.get("targets"):
+            await safe_edit_text(q, context, "Список для повтора потерян, запустите деплой заново.")
+        else:
+            await _do_ssh_deploy_multi(q, context, pending["targets"], pending["front_ip"])
+    elif data == 'ssh_cmd_confirm':
+        pending = context.user_data.pop('ssh_cmd_pending', None)
+        if not pending:
+            await safe_edit_text(q, context, "Команда устарела, введите её заново.")
+        else:
+            await safe_edit_text(q, context,
+                f"✅ Подтверждено: <code>{escape(pending['cmd'][:200])}</code>",
+                parse_mode="HTML")
+            await _ssh_cmd_execute(q.message, context, pending["targets"],
+                                   pending["cmd"], pending["label"])
+    elif data == 'ssh_cmd_cancel':
+        context.user_data.pop('ssh_cmd_pending', None)
+        await safe_edit_text(q, context, "❌ Команда отменена, на роутеры ничего не ушло.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀️ SSH Роутеры", callback_data='ssh_routers')]]))
     elif data.startswith('ssh_cmd:'):
         cn = data[len('ssh_cmd:'):]
         context.user_data['await_ssh_cmd'] = cn
@@ -8864,6 +9226,8 @@ async def _do_ssh_deploy_multi(q_or_msg, context, targets: list, front_ip: str):
             f"📦 Деплой на {total} роутеров через <code>{front_ip}</code>...\n0/{total}",
             parse_mode="HTML")
     results = []
+    failed = []       # deploy did not go through — candidates for retry
+    flash_fail = []   # deployed but not saved to flash — lost on reboot
     done = 0
     last_edit = 0
     for cn in targets:
@@ -8883,12 +9247,14 @@ async def _do_ssh_deploy_multi(q_or_msg, context, targets: list, front_ip: str):
                 f"sed -i 's|current_pptp_ip\\.txt|{isp_pptp_files[isp_tag]}|g' /etc/storage/update_script.sh ; "
             )
         deploy_cmd = (
-            f'cat /dev/null > /etc/storage/started_script.sh ; '
-            # Restore tunnel autostart if tunnel.sh exists
-            f'[ -f /etc/storage/tunnel.sh ] && echo "sh /etc/storage/tunnel.sh &" >> /etc/storage/started_script.sh ; '
             f'wget -q -O /tmp/us.sh http://{front_ip}/router/update_script.sh && '
             f'[ "$(grep -c is_reserved_ipv4 /tmp/us.sh)" -ge 3 ] && '
             f"tail -n1 /tmp/us.sh | grep -q '^exit 0' && {{ "
+            # Only now, with a verified script in hand, touch the router.
+            # Clearing started_script.sh before the checks meant a failed
+            # download left the router with its autostart wiped.
+            f'cat /dev/null > /etc/storage/started_script.sh ; '
+            f'[ -f /etc/storage/tunnel.sh ] && echo "sh /etc/storage/tunnel.sh &" >> /etc/storage/started_script.sh ; '
             f'cp /etc/storage/update_script.sh /etc/storage/update_script.sh.bak.$(date +%H%M) 2>/dev/null ; '
             f'mv /tmp/us.sh /etc/storage/update_script.sh && chmod +x /etc/storage/update_script.sh ; '
             f'{isp_sed}'
@@ -8896,14 +9262,22 @@ async def _do_ssh_deploy_multi(q_or_msg, context, targets: list, front_ip: str):
             f'[ -s /tmp/dom.tmp ] && mv /tmp/dom.tmp /etc/storage/remote_domains.list ; '
             f'( crontab -l 2>/dev/null | grep -v "update_script\\.sh" ; echo "*/5 * * * * /etc/storage/update_script.sh" ) | crontab - ; '
             f'nvram set crond_enable=1 >/dev/null 2>&1 ; nvram commit >/dev/null 2>&1 ; '
-            f'mtd_storage.sh save ; '
+            # Did the flash save work? If not, everything above lives only in
+            # RAM and is gone after the next reboot — that needs to be seen.
+            f'mtd_storage.sh save >/dev/null 2>&1 && echo "FLASH_OK" || echo "FLASH_FAIL" ; '
             f'echo "DEPLOY OK" ; '
             f"}} || echo 'ABORTED'"
         )
-        ok, out = router_ssh_exec(cn, deploy_cmd)
+        # In a thread, so one slow router doesn't freeze the bot for everyone.
+        ok, out = await asyncio.to_thread(router_ssh_exec, cn, deploy_cmd)
         if ok and "DEPLOY OK" in out:
-            results.append(f"✅ <b>{cn}</b>")
+            if "FLASH_OK" in out:
+                results.append(f"✅ <b>{cn}</b>")
+            else:
+                flash_fail.append(cn)
+                results.append(f"⚠️ <b>{cn}</b> — залит, но НЕ сохранён во флеш")
         else:
+            failed.append(cn)
             short = out.strip()[:150] if out else "—"
             results.append(f"❌ <b>{cn}</b>: {escape(short)}")
         done += 1
@@ -8918,11 +9292,93 @@ async def _do_ssh_deploy_multi(q_or_msg, context, targets: list, front_ip: str):
                 last_edit = now_t
             except Exception:
                 pass
-    report = "\n".join(results)
-    ok_count = sum(1 for r in results if r.startswith("✅"))
-    await msg.edit_text(
-        f"📦 <b>Деплой завершён</b>: {ok_count}/{total}\n\n{report}",
-        parse_mode="HTML")
+    ok_names = [cn for cn in targets if cn not in failed and cn not in flash_fail
+                and cn in routers]
+    # Successes as one compact line, problems one per line: with 55 routers
+    # a line each would not fit into a Telegram message.
+    parts = [f"📦 <b>Деплой завершён</b>: ✅ {len(ok_names)}/{total}"]
+    if ok_names:
+        parts.append("\n✅ " + ", ".join(ok_names))
+    problems = [r for r in results if not r.startswith("✅")]
+    if problems:
+        parts.append("\n" + "\n".join(problems))
+    if flash_fail:
+        parts.append("\n<i>⚠️ Не перезагружайте их, пока не перезальёте: "
+                     "после перезагрузки изменения пропадут.</i>")
+    text = "\n".join(parts)
+    if len(text) > 4000:
+        text = text[:3990] + "\n..."
+    # Remember who to retry. The bot never reboots anything on its own —
+    # a retry is a button the human presses.
+    retry = failed + flash_fail
+    kb = []
+    if retry:
+        context.user_data['deploy_retry'] = {"targets": retry, "front_ip": front_ip}
+        kb.append([InlineKeyboardButton(f"🔁 Повторить неудачные ({len(retry)})",
+                                        callback_data='ssh_deploy_retry')])
+    kb.append([InlineKeyboardButton("◀️ SSH Роутеры", callback_data='ssh_routers')])
+    await msg.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+# Commands that can reboot the router, wipe its storage or cut the bot off
+# from it. Each entry is (regex, human reason). Most of these come from our
+# own history: radio5_restart reboots the box, and switching the VPN client
+# off is how Ejes_20 ended up needing a site visit.
+_SSH_DANGER = [
+    (r"\b(reboot|poweroff|halt|shutdown)\b", "перезагрузка или выключение роутера"),
+    (r"\bradio5_restart\b", "на Padavan перезагружает весь роутер"),
+    (r"\bmtd_storage\.sh\s+(reset|erase|restore)\b", "сброс или замена /etc/storage"),
+    (r"\b(mtd_write|flash_erase|mtd\s+(erase|write))\b", "запись или стирание флеша"),
+    (r"\bdd\b[^|;&]*\bof=/dev/(mtd|mmc|sd)", "запись прямо в устройство флеша"),
+    (r"\bnvram\s+(erase|clear|reset)\b", "сброс всех настроек роутера"),
+    (r"\bvpnc_enable\s*=", "трогает VPN-клиент — можно потерять доступ к роутеру"),
+    (r"\b(stop_vpn_client|restart_vpn_client)\b", "перезапуск VPN-клиента — туннель упадёт"),
+    (r"\b(http_passwd|http_username)\b|\bpasswd\b", "смена пароля — бот перестанет заходить"),
+    (r"\biptables\s+(-F|--flush|-P\s+\w+\s+DROP)", "сброс фаервола"),
+    (r"\brm\s+(-\w*r\w*f|-\w*f\w*r)\b", "рекурсивное удаление"),
+    (r"\brm\b[^|;&]*/etc/storage", "удаление из /etc/storage"),
+    (r"(^|[^>])>\s*/etc/storage/\S+", "перезапись файла в /etc/storage"),
+    (r"\bkillall\s+(dropbear|sshd|openvpn)\b", "убивает SSH или VPN — потеря доступа"),
+]
+
+
+def ssh_cmd_danger(cmd: str) -> str:
+    """Return why the command is dangerous, or '' if it looks harmless."""
+    for pattern, reason in _SSH_DANGER:
+        if re.search(pattern, cmd, re.I):
+            return reason
+    return ""
+
+
+async def _ssh_cmd_execute(message, context, targets: list, cmd: str, label: str):
+    """Run a shell command on one or many routers and show the output.
+
+    `message` is anything with reply_text (a user message or the message
+    the confirmation buttons sit on)."""
+    routers = load_routers()
+    if len(targets) == 1:
+        cn = targets[0]
+        if cn not in routers:
+            await message.reply_text("Роутер не найден.")
+            return
+        ip = get_router_ip(cn)
+        if not ip and routers[cn].get("vpn_type") != "pptp":
+            await message.reply_text(f"🔴 {cn} — нет IP.")
+            return
+        msg = await message.reply_text(f"💻 Выполняю на <b>{escape(cn)}</b>...", parse_mode="HTML")
+        # In a thread: a slow router must not freeze the whole bot.
+        ok, out = await asyncio.to_thread(router_ssh_exec, cn, cmd)
+        await msg.edit_text(
+            f"💻 <b>{escape(cn)}</b> ({ip or 'PPTP'}):\n<pre>{escape(out[:3800])}</pre>",
+            parse_mode="HTML")
+        return
+    msg = await message.reply_text(
+        f"💻 Выполняю на {label}...\nЭто может занять время.", parse_mode="HTML")
+    report = await ssh_exec_multi(msg, routers, targets, cmd, context)
+    if len(report) > 4000:
+        await msg.edit_text(report[:4000] + "\n\n<i>...обрезано</i>", parse_mode="HTML")
+    else:
+        await msg.edit_text(report, parse_mode="HTML")
+
 
 async def ssh_cmd_mode_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show command target selection: one / several / all."""
@@ -17047,6 +17503,7 @@ def main():
     loop.create_task(check_new_connections(app))
     loop.create_task(auto_ip_monitor(app))
     loop.create_task(domain_monitor(app))
+    loop.create_task(lag_notify_monitor(app))
     app.run_polling()
 
 if __name__ == '__main__':
