@@ -9642,6 +9642,7 @@ def _ensure_speedtest_file(size_mb: int = 5):
 SPEED_SECONDS = 8          # measured window on the router
 SPEED_BIG_FILE = "/var/www/html/speedtest_big.bin"
 SPEED_BIG_MB = 24          # 10 Мбит × 8 с ≈ 10 МБ, so this never runs out
+SPEED_STREAMS = 4          # parallel connections; one alone reads far too low
 
 
 def _ensure_speedtest_big():
@@ -9668,16 +9669,23 @@ def _speed_timed_cmd(url: str, seconds: int) -> str:
     # Backgrounding wget and killing it after N seconds works on both.
     # Output goes through a pipe into wc -c, so nothing is written to the
     # router's RAM or flash.
+    # Several connections at once, like browser speed tests ("Multi" in
+    # Ookla). On the Milan -> Turkmenistan path a single TCP connection
+    # never gets up to speed: an idle office read 0.3-0.6 while the line
+    # really does ~4.5. Diagnostics showed 4 parallel connections land on
+    # the real figure. Each stream writes only its byte count into /tmp,
+    # a few bytes, so nothing big touches the router's RAM or flash.
+    ids = " ".join(str(i) for i in range(1, SPEED_STREAMS + 1))  # no `seq` on BusyBox
     return (
-        f'if command -v curl >/dev/null 2>&1; then '
-        f'curl -o /dev/null -s --max-time {seconds} '
-        f'-w "curl:%{{speed_download}}:%{{time_total}}" "{url}"; '
-        f'else '
-        f'S=$(date +%s); '
-        f'FS=$({{ wget -q -O - "{url}" 2>/dev/null & '
-        f'WP=$!; sleep {seconds}; kill $WP 2>/dev/null; }} | wc -c); '
-        f'E=$(date +%s); '
-        f'echo "wget_time:$((E-S)):$FS"; fi'
+        f'if command -v curl >/dev/null 2>&1; then G="curl -s"; '
+        f'else G="wget -q -O -"; fi; '
+        f'for i in {ids}; do '
+        f'( {{ $G "{url}" 2>/dev/null & WP=$!; sleep {seconds}; '
+        f'kill $WP 2>/dev/null; }} | wc -c > /tmp/_spd_$i ) & '
+        f'done; wait; '
+        f'T=0; for i in {ids}; do v=$(cat /tmp/_spd_$i 2>/dev/null); '
+        f'T=$((T + ${{v:-0}})); rm -f /tmp/_spd_$i; done; '
+        f'echo "wget_time:{seconds}:$T"'
     )
 
 
