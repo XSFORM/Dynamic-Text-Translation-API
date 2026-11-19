@@ -4682,9 +4682,11 @@ def find_laggards():
     online = get_online_clients() | {cn for cn, v in routers.items()
                                      if v.get("vpn_type") == "pptp"}
     beacons = parse_beacon_log()
+    # Routers the admin parked on purpose (e.g. cron switched off to test IPs)
+    ignored = set(_lag_notify_load().get("ignored", []))
     out = []
     for cn in sorted(routers, key=_natural_key):
-        if cn not in online:
+        if cn not in online or cn in ignored:
             continue
         want = _target_version_for(cn, vd)
         b = beacons.get(cn)
@@ -4739,7 +4741,10 @@ def _laggard_verdict(out: str, want: str, expected_id: str = "") -> tuple:
             return "чужой ID", (f"на роутере router_id={rid}, а у бота для него "
                                 f"{expected_id or 'ID ещё не заведён'} — маяк приходит, "
                                 "но не узнаётся"), log_lines
-        return "версия свежая", "скрипт актуален и ID верный, но маяк не доходит — смотри домены/фронт", log_lines
+        note = "скрипт актуален и ID верный, но маяк не доходит — смотри домены/фронт"
+        if info.get("KEY") == "no":
+            note += "; нет HMAC-ключа — следующую версию сам не поставит"
+        return "версия свежая", note, log_lines
     note = f"на роутере v{ver}, цикл жив, но не обновился"
     if info.get("KEY") == "no":
         note += "; нет HMAC-ключа"
@@ -4757,10 +4762,17 @@ async def ssh_laggards(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit_text(q, context, "❌ В version.txt не задана версия — не с чем сравнивать.",
                              reply_markup=back_kb)
         return
+    ignored = _lag_notify_load().get("ignored", [])
+    if ignored:
+        back_kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"👁 Снова следить за всеми ({len(ignored)})",
+                                  callback_data='lag_unignore_all')],
+            [InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')]])
+    ign_line = (f"\n🙈 Не следим: {', '.join(escape(c) for c in ignored)}" if ignored else "")
     if not lag:
         await safe_edit_text(q, context,
             f"🩺 <b>Отставшие роутеры</b>\n\nОнлайн: {online_cnt}\n"
-            f"✅ Все онлайн-роутеры на v{latest} и отмечаются в маяке.",
+            f"✅ Все онлайн-роутеры на v{latest} и отмечаются в маяке.{ign_line}",
             parse_mode="HTML", reply_markup=back_kb)
         return
     shown = lag[:LAGGARD_MAX]
@@ -4839,6 +4851,9 @@ async def ssh_laggards(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['laggards_fix'] = {"targets": fixable, "front_ip": front}
         kb.append([InlineKeyboardButton(f"📦 Перезалить скрипт ({len(fixable)}) через {front}",
                                         callback_data='ssh_laggards_fix')])
+    for cn, _, _ in shown[:6]:
+        if len(f"lag_ignore:{cn}") <= 64:
+            kb.append([InlineKeyboardButton(f"🙈 Не следить за {cn}", callback_data=f"lag_ignore:{cn}")])
     kb.append([InlineKeyboardButton("🔄 Ещё раз", callback_data='ssh_laggards')])
     notif_on = _lag_notify_load()["enabled"]
     kb.append([InlineKeyboardButton(
@@ -4874,6 +4889,7 @@ def _lag_notify_load() -> dict:
     d.setdefault("enabled", True)
     d.setdefault("seen", {})       # cn -> how many checks in a row it lagged
     d.setdefault("notified", [])   # already reported, until it catches up
+    d.setdefault("ignored", [])    # parked on purpose: not inspected, not reported
     return d
 
 
@@ -8616,6 +8632,26 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "через «📦 Залить скрипт», бот запомнит фронт.")
         else:
             await _do_ssh_deploy_multi(q, context, [cn], front)
+    elif data.startswith('lag_ignore:'):
+        cn = data[len('lag_ignore:'):]
+        st = _lag_notify_load()
+        if cn not in st["ignored"]:
+            st["ignored"].append(cn)
+        st["notified"] = [c for c in st["notified"] if c != cn]
+        st["seen"].pop(cn, None)
+        _lag_notify_save(st)
+        await safe_edit_text(q, context,
+            f"🙈 За <b>{escape(cn)}</b> больше не следим: ни в осмотре, ни в уведомлениях.\n"
+            f"Вернуть можно на экране «🩺 Отставшие роутеры».",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🩺 Осмотреть снова", callback_data='ssh_laggards')],
+                [InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')]]))
+    elif data == 'lag_unignore_all':
+        st = _lag_notify_load()
+        st["ignored"] = []
+        _lag_notify_save(st)
+        await ssh_laggards(update, context)
     elif data == 'lag_notify_toggle':
         st = _lag_notify_load()
         st["enabled"] = not st["enabled"]

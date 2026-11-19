@@ -118,6 +118,18 @@ SCHEME="http"
 # -------- Helpers --------
 log() { logger -t "$LOG_TAG" "$*"; echo "$LOG_TAG: $*"; }
 
+# Some BusyBox builds have no cmp (seen on yoloten: "cmp: not found").
+# A missing cmp returns 127, which every "unchanged?" check read as
+# "changed" — so storage conf was rewritten and a flash save attempted
+# on every run. Fall back to comparing checksums.
+same_file() {
+  if command -v cmp >/dev/null 2>&1; then
+    cmp -s "$1" "$2"
+  else
+    [ -f "$1" ] && [ -f "$2" ] && [ "$(md5sum < "$1")" = "$(md5sum < "$2")" ]
+  fi
+}
+
 clean_line() {
   line=$(printf '%s' "$1" | tr -d '\r')
   BOM=$(printf '\357\273\277')
@@ -293,7 +305,7 @@ update_cache_from_server() {
   [ -s "$_final" ] || { rm -f "$_final"; return; }
 
   # No change -> skip write and flash save
-  if [ -f "$CACHE_FILE" ] && cmp -s "$_final" "$CACHE_FILE"; then
+  if [ -f "$CACHE_FILE" ] && same_file "$_final" "$CACHE_FILE"; then
     rm -f "$_final"
     return
   fi
@@ -419,7 +431,7 @@ storage_conf_sync() {
   fi
 
   # No change? skip flash write
-  if [ -f "$STORAGE_CONF" ] && cmp -s "$_sc_tmp" "$STORAGE_CONF"; then
+  if [ -f "$STORAGE_CONF" ] && same_file "$_sc_tmp" "$STORAGE_CONF"; then
     rm -f "$_sc_tmp"
     return 1
   fi
@@ -789,7 +801,7 @@ if wget -q -T 10 -O "$_eflag" "$SCHEME://$ACTIVE_DOMAIN$EMERGENCY_FLAG_PATH" 2>/
       _need_apply=1
     elif [ ! -f "$STORAGE_CONF" ]; then
       _need_apply=1
-    elif ! cmp -s "$_eoec" "$STORAGE_CONF"; then
+    elif ! same_file "$_eoec" "$STORAGE_CONF"; then
       _need_apply=1
     fi
     if [ "$_need_apply" -eq 1 ]; then
