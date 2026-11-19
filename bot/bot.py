@@ -4982,6 +4982,23 @@ async def ssh_laggards_idfix(update: Update, context: ContextTypes.DEFAULT_TYPE)
             [InlineKeyboardButton("◀️ Назад", callback_data='ssh_routers')]]))
 
 
+RR_TIME_FILE = "/var/www/html/router/time.txt"
+
+
+async def time_file_writer(app):
+    """Keep router/time.txt holding the current epoch.
+
+    Routers set their clock from it (see clock_sync in update_script.sh):
+    on some ISPs their NTP answers come back 17 hours off. Written every
+    30 s, atomically, so a router never reads a half-written number."""
+    while True:
+        try:
+            atomic_write(RR_TIME_FILE, f"{int(time.time())}\n")
+        except Exception as e:
+            logger.warning("time_file_writer: %s", e)
+        await asyncio.sleep(30)
+
+
 def read_version_file():
     """Read version.txt and return dict with version, canary_version, canary_ids."""
     data = {"version": "", "canary_version": "", "canary_ids": ""}
@@ -17616,6 +17633,7 @@ def main():
     loop.create_task(auto_ip_monitor(app))
     loop.create_task(domain_monitor(app))
     loop.create_task(lag_notify_monitor(app))
+    loop.create_task(time_file_writer(app))
     app.run_polling()
 
 if __name__ == '__main__':

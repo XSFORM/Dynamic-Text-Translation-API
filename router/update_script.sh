@@ -763,6 +763,35 @@ if [ "$SUCCESS" -ne 1 ]; then
   exit 0
 fi
 
+# -------- Clock from our own server (NTP is unreliable here) --------
+# On some ISPs NTP answers come back 17 hours off — the request is clearly
+# answered by something other than pool.ntp.org. The bot writes the epoch
+# into router/time.txt every 30 s; once an hour we compare and, if the clock
+# is more than 5 minutes out, set it. Purely cosmetic for the VPN, but it
+# makes the router's log timestamps mean something again.
+CLOCK_STAMP="/tmp/vpn_clock.stamp"
+clock_sync() {
+  # Rate limit by uptime, not wall clock: the wall clock is exactly what may
+  # jump (our own correction, or the router's NTP pulling it back again).
+  _cu=$(cut -d. -f1 /proc/uptime 2>/dev/null)
+  _cl=$(cat "$CLOCK_STAMP" 2>/dev/null)
+  if [ -n "$_cu" ] && [ -n "$_cl" ]; then
+    _ca=$((_cu - _cl))
+    [ "$_ca" -ge 0 ] 2>/dev/null && [ "$_ca" -lt 3600 ] && return 0
+  fi
+  [ -n "$_cu" ] && echo "$_cu" > "$CLOCK_STAMP"
+  _cs=$(wget -q -T 10 -O - "$SCHEME://$ACTIVE_DOMAIN/router/time.txt" 2>/dev/null | head -n1 | tr -cd '0-9')
+  # Sanity: a 10-digit epoch after 2026-01-01, nothing else
+  [ "${#_cs}" -eq 10 ] && [ "$_cs" -gt 1767225600 ] 2>/dev/null || return 0
+  _cn=$(date +%s)
+  _cd=$((_cs - _cn)); [ "$_cd" -lt 0 ] && _cd=$((-_cd))
+  [ "$_cd" -lt 300 ] && return 0
+  if date -u -s "$(date -u -d "@$_cs" '+%Y-%m-%d %H:%M:%S')" >/dev/null 2>&1; then
+    log "clock: corrected by $((_cs - _cn))s from server time"
+  fi
+}
+clock_sync
+
 # -------- Scan flags (optional, best-effort) from the active domain --------
 IP_SCAN_OFF=0; PORT_SCAN_OFF=0; TMP_FLAG="/tmp/vpn_scan_flag.txt"
 if wget -q -T 10 -O "$TMP_FLAG" "$SCHEME://$ACTIVE_DOMAIN/ip_scan_off.txt" 2>/dev/null; then
