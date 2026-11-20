@@ -78,9 +78,19 @@ def sha256_file(path: str, chunk: int = 65536) -> str:
             h.update(data)
     return h.hexdigest()
 
+# Hidden entries directly in /root are tool state, not VPN state: .claude
+# (a 288 MB CLI binary plus session transcripts), .npm, .config,
+# .vscode-server, shell history... Each new tool adds one, so instead of
+# chasing them one by one we skip them all and keep only what restore needs.
+ROOT_HIDDEN_KEEP = {".ssh"}
+
+
 def is_excluded(path: str) -> bool:
     norm = os.path.normpath(path)
     if norm in EXCLUDE_PATHS:
+        return True
+    parent, name = os.path.split(norm)
+    if parent == "/root" and name.startswith(".") and name not in ROOT_HIDDEN_KEEP:
         return True
     for suf in EXCLUDE_SUFFIXES:
         if norm.endswith(suf):
