@@ -7444,6 +7444,12 @@ async def _reply_kb_gitpull(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="HTML")
         else:
             shutil.copy2("/opt/remote_refresh/bot/bot.py", "/root/monitor_bot/bot.py")
+            # bot.py imports backup_restore.py from the same folder — copying only
+            # bot.py left the backup fixes stuck in /opt/remote_refresh.
+            for _extra in ("backup_restore.py",):
+                _src = os.path.join("/opt/remote_refresh/bot", _extra)
+                if os.path.isfile(_src):
+                    shutil.copy2(_src, os.path.join("/root/monitor_bot", _extra))
             _ws_src = "/opt/remote_refresh/router/update_script.sh"
             _ws_dst = "/var/www/html/router/update_script.sh"
             if os.path.isfile(_ws_src):
@@ -7465,7 +7471,7 @@ async def _reply_kb_gitpull(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 shutil.copy2(_pr_src, _pr_dst)
             await msg.edit_text(
                 f"📥 <b>Git Pull:</b>\n<pre>{escape(pull_out[:2000])}</pre>\n\n"
-                "✅ bot.py скопирован.\n🔄 Перезапуск бота через 2 сек...",
+                "✅ bot.py и backup_restore.py скопированы.\n🔄 Перезапуск бота через 2 сек...",
                 parse_mode="HTML")
             await asyncio.sleep(2)
             subprocess.Popen(["systemctl", "restart", "remote-refresh-bot"])
@@ -8358,6 +8364,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data='menu_system')]]))
             else:
                 shutil.copy2("/opt/remote_refresh/bot/bot.py", "/root/monitor_bot/bot.py")
+                # bot.py imports backup_restore.py from the same folder — copying only
+                # bot.py left the backup fixes stuck in /opt/remote_refresh.
+                for _extra in ("backup_restore.py",):
+                    _src = os.path.join("/opt/remote_refresh/bot", _extra)
+                    if os.path.isfile(_src):
+                        shutil.copy2(_src, os.path.join("/root/monitor_bot", _extra))
                 # Sync router scripts to webroot
                 _ws_src = "/opt/remote_refresh/router/update_script.sh"
                 _ws_dst = "/var/www/html/router/update_script.sh"
@@ -8383,7 +8395,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     shutil.copy2(_pr_src, _pr_dst)
                 await safe_edit_text(q, context,
                     f"📥 <b>Git Pull:</b>\n<pre>{escape(pull_out[:2000])}</pre>\n\n"
-                    "✅ bot.py скопирован.\n🔄 Перезапуск бота через 2 сек...",
+                    "✅ bot.py и backup_restore.py скопированы.\n🔄 Перезапуск бота через 2 сек...",
                     parse_mode="HTML")
                 await asyncio.sleep(2)
                 subprocess.Popen(["systemctl", "restart", "remote-refresh-bot"])
