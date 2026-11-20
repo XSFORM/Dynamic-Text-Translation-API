@@ -5304,12 +5304,17 @@ async def canary_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def _hmac_deploy_one(cn, key_hex):
     """Synchronous: deploy HMAC key to one router. Returns (cn, result_str)."""
+    # /etc/storage lives in RAM on Padavan until mtd_storage.sh save writes it
+    # to flash. Without the save the key survived only until the next reboot.
     cmd = (f'printf "%s\\n" "{key_hex}" > /etc/storage/rr_key ; '
            f'chmod 600 /etc/storage/rr_key ; '
-           f'[ -f /etc/storage/rr_key ] && echo "KEY_OK" || echo "KEY_FAIL"')
+           f'[ -s /etc/storage/rr_key ] && echo "KEY_OK" || echo "KEY_FAIL" ; '
+           f'mtd_storage.sh save >/dev/null 2>&1 && echo "FLASH_OK" || echo "FLASH_FAIL"')
     ok, out = router_ssh_exec(cn, cmd)
     if ok and "KEY_OK" in out:
-        return cn, f"✅ {cn}"
+        if "FLASH_OK" in out:
+            return cn, f"✅ {cn}"
+        return cn, f"⚠️ {cn}: ключ записан, но не сохранён во флеш — пропадёт после перезагрузки"
     return cn, f"❌ {cn}: {out[:60]}"
 
 
@@ -5406,7 +5411,13 @@ async def hmac_key_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"<b>Без ключа:</b> {', '.join(no_key)}")
     if errors:
         lines.append(f"<b>Ошибки:</b> {', '.join(errors)}")
-    kb = [
+    kb = []
+    # One button per router without a key — no need to touch all 45 to fix one.
+    for cn in no_key[:8]:
+        if len(f"hmac_deploy_one:{cn}") <= 64:
+            kb.append([InlineKeyboardButton(f"🔑 Залить ключ: {cn}",
+                                            callback_data=f"hmac_deploy_one:{cn}")])
+    kb += [
         [InlineKeyboardButton("🔑 Залить ключ на ВСЕ", callback_data='hmac_deploy_all')],
         [InlineKeyboardButton("📦 Версия скрипта", callback_data='script_version')],
         [InlineKeyboardButton("🏠 Меню", callback_data='home')],
@@ -8924,6 +8935,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await hmac_key_status(update, context)
     elif data == 'hmac_deploy_all':
         await hmac_key_deploy(update, context, '__all__')
+    elif data.startswith('hmac_deploy_one:'):
+        await hmac_key_deploy(update, context, data[len('hmac_deploy_one:'):])
     elif data == 'beacon_status':
         await beacon_status(update, context)
     elif data == 'script_ver_bump':
