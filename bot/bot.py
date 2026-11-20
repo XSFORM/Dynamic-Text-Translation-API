@@ -2242,7 +2242,7 @@ def disconnect_client_sessions(client_name: str) -> bool:
         print(f"[mgmt] tcp kill failed {client_name}: {e}")
     if os.path.exists(MGMT_SOCKET):
         try:
-            subprocess.run(f'echo "kill {client_name}" | nc -U {MGMT_SOCKET}', shell=True)
+            subprocess.run(f'echo {shlex.quote("kill " + client_name)} | nc -U {MGMT_SOCKET}', shell=True)
             print(f"[mgmt] unix kill {client_name}")
             return True
         except Exception as e:
@@ -2503,7 +2503,7 @@ def revoke_and_collect(names: List[str]) -> Tuple[List[str], List[str]]:
         if not os.path.exists(cert_path):
             revoked.append(name); continue
         try:
-            subprocess.run(f"cd {EASYRSA_DIR} && ./easyrsa --batch revoke {name}", shell=True, check=True)
+            subprocess.run(f"cd {EASYRSA_DIR} && ./easyrsa --batch revoke {shlex.quote(name)}", shell=True, check=True)
             revoked.append(name)
         except subprocess.CalledProcessError as e:
             failed.append(f"{name}: revoke error {e}")
@@ -3118,6 +3118,13 @@ async def create_key_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if not key_name:
             await update.message.reply_text("Имя пустое. Введите имя:")
             return
+        # The name ends up in file paths and in easyrsa shell commands, so a
+        # space, slash or ; would break things or run something unintended.
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,59}", key_name):
+            await update.message.reply_text(
+                "Имя может содержать только латинские буквы, цифры, _ . - "
+                "(без пробелов, до 60 знаков). Введите другое имя:")
+            return
         ovpn_file = os.path.join(KEYS_DIR, f"{key_name}.ovpn")
         if os.path.exists(ovpn_file):
             await update.message.reply_text("Такой клиент существует, введите другое имя.")
@@ -3163,7 +3170,9 @@ async def create_key_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 "Конфликт имён (существуют): " + ", ".join(collisions) +
                 "\nВведите другое базовое имя /start → Создать ключ"
             )
-            context.user_data.clear()
+            # Only this flow's keys — clear() also wiped unrelated state (running jobs, retry lists).
+            for _k in ('await_key_name', 'await_key_expiry', 'await_key_quantity', 'new_key_name', 'new_key_expiry'):
+                context.user_data.pop(_k, None)
             return
 
         created = []
@@ -3202,7 +3211,9 @@ async def create_key_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             if len(errors) > 10: err_txt += f"\n... ещё {len(errors)-10}"
             await update.message.reply_text(f"Ошибки:\n{err_txt}")
 
-        context.user_data.clear()
+        # Only this flow's keys — clear() also wiped unrelated state (running jobs, retry lists).
+        for _k in ('await_key_name', 'await_key_expiry', 'await_key_quantity', 'new_key_name', 'new_key_expiry'):
+            context.user_data.pop(_k, None)
         return
 
 # =====================================================================
@@ -3277,7 +3288,9 @@ async def renew_key_expiry_handler(update: Update, context: ContextTypes.DEFAULT
         await update.message.reply_text("Некорректное число дней."); return
     iso = set_client_expiry_days_from_now(key_name, days)
     await update.message.reply_text(f"Логический срок для {key_name} установлен до: {iso} (~{days} дн). Клиент разблокирован.")
-    context.user_data.clear()
+    # Only this flow's keys — clear() also wiped unrelated state (running jobs, retry lists).
+    for _k in ('await_renew_number', 'await_renew_expiry', 'renew_keys_order', 'renew_key_name'):
+        context.user_data.pop(_k, None)
 
 # =====================================================================
 #  OPENVPN — Log, Traffic, Status parsing

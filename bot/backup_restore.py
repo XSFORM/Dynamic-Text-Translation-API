@@ -195,9 +195,32 @@ def save_manifest(manifest: Dict, target_dir: str):
         json.dump(manifest, f, indent=2, ensure_ascii=False)
     return path
 
+def safe_extract(tar: "tarfile.TarFile", dest: str) -> None:
+    """extractall() that refuses to write outside `dest`.
+
+    A crafted archive with members like ../../etc/x or /etc/x, or a link
+    pointing out of the tree, would otherwise overwrite arbitrary files
+    during restore. Device files and FIFOs are skipped as well."""
+    dest_real = os.path.realpath(dest)
+    safe = []
+    for m in tar.getmembers():
+        target = os.path.realpath(os.path.join(dest_real, m.name))
+        if os.path.commonpath([dest_real, target]) != dest_real:
+            raise RuntimeError(f"Небезопасный путь в архиве: {m.name}")
+        if m.issym() or m.islnk():
+            link_target = os.path.realpath(os.path.join(os.path.dirname(target), m.linkname)) \
+                if m.issym() else os.path.realpath(os.path.join(dest_real, m.linkname))
+            if os.path.commonpath([dest_real, link_target]) != dest_real:
+                raise RuntimeError(f"Ссылка наружу в архиве: {m.name} -> {m.linkname}")
+        if m.isdev() or m.isfifo():
+            continue
+        safe.append(m)
+    tar.extractall(dest, members=safe)
+
+
 def load_manifest_from_archive(archive_path: str, extract_to: str) -> Dict:
     with tarfile.open(archive_path, "r:gz") as tar:
-        tar.extractall(extract_to)
+        safe_extract(tar, extract_to)
     manifest_path = os.path.join(extract_to, MANIFEST_NAME)
     if not os.path.exists(manifest_path):
         raise RuntimeError("В архиве отсутствует manifest.json")
