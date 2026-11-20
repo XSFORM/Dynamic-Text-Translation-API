@@ -5327,9 +5327,14 @@ async def hmac_key_deploy(update: Update, context: ContextTypes.DEFAULT_TYPE,
     key_hex = rr_get_hmac_key().hex()
     routers = load_routers()
     if targets == '__all__':
-        cns = sorted(routers.keys(), key=_natural_key)
+        # Only routers that are online — offline ones would just time out.
+        online = _hmac_online_set()
+        cns = sorted((cn for cn in routers if cn in online), key=_natural_key)
     else:
         cns = [targets]
+    if not cns:
+        await safe_edit_text(q, context, "Нет онлайн-роутеров для заливки ключа.")
+        return
     results = []
     total_cns = len(cns)
     loop = asyncio.get_event_loop()
@@ -5360,15 +5365,30 @@ async def hmac_key_deploy(update: Update, context: ContextTypes.DEFAULT_TYPE,
     else:
         await update.message.reply_text(text, parse_mode="HTML")
 
-def _hmac_check_one(cn):
-    """Synchronous: check one router for HMAC key. Returns (cn, 'has'|'no'|'err')."""
-    cmd = '[ -s /etc/storage/rr_key ] && echo "HAS_KEY" || echo "NO_KEY"'
+def _hmac_check_one(cn, want_md5: str = ""):
+    """Synchronous: check one router for HMAC key.
+
+    Returns (cn, 'has'|'old'|'no'|'err'). 'old' means a key is there but it
+    is not the current one — such a router fails every signature check."""
+    cmd = ('if [ -s /etc/storage/rr_key ]; then '
+           'echo "HAS_KEY:$(md5sum < /etc/storage/rr_key | cut -d" " -f1)"; '
+           'else echo "NO_KEY"; fi')
     ok, out = router_ssh_exec(cn, cmd)
     if ok and "HAS_KEY" in out:
+        got = out.split("HAS_KEY:", 1)[-1].strip()[:32]
+        if want_md5 and got and got != want_md5:
+            return cn, "old"
         return cn, "has"
     elif ok and "NO_KEY" in out:
         return cn, "no"
     return cn, "err"
+
+
+def _hmac_online_set() -> set:
+    """Routers reachable right now: OpenVPN online plus PPTP ones."""
+    routers = load_routers()
+    return get_online_clients() | {cn for cn, v in routers.items()
+                                   if v.get("vpn_type") == "pptp"}
 
 
 async def hmac_key_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5377,43 +5397,63 @@ async def hmac_key_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     await safe_edit_text(q, context, "🔍 Проверяю ключи...")
     routers = load_routers()
-    has_key = []
-    no_key = []
-    errors = []
+    has_key, old_key, no_key, errors = [], [], [], []
+    online = _hmac_online_set()
     all_cns = sorted(routers.keys(), key=_natural_key)
-    total = len(all_cns)
-    loop = asyncio.get_event_loop()
-    for idx, cn in enumerate(all_cns, 1):
-        # Progress update every 3 routers
-        if idx % 3 == 1 or idx == total:
-            pct = int(idx / total * 100)
-            bar_fill = pct // 10
-            bar = "▓" * bar_fill + "░" * (10 - bar_fill)
-            try:
-                await safe_edit_text(q, context,
-                    f"🔍 Проверяю ключи... {idx}/{total}\n{bar} {pct}%")
-            except Exception:
-                pass
-        _cn, status = await loop.run_in_executor(
-            None, _hmac_check_one, cn)
-        if status == "has":
-            has_key.append(cn)
-        elif status == "no":
-            no_key.append(cn)
-        else:
-            errors.append(cn)
-    total = len(routers)
+    # Offline routers are listed, not polled: an SSH timeout per router
+    # only slowed the screen down and showed up as a scary "error".
+    offline = [cn for cn in all_cns if cn not in online]
+    check = [cn for cn in all_cns if cn in online]
+    try:
+        want_md5 = hashlib.md5((rr_get_hmac_key().hex() + "\n").encode()).hexdigest()
+    except Exception:
+        want_md5 = ""
+    total = len(check)
+    done = 0
+    sem = asyncio.Semaphore(4)
+    lock = asyncio.Lock()
+    status_of = {}
+
+    async def one(cn):
+        nonlocal done
+        async with sem:
+            _cn, st = await asyncio.to_thread(_hmac_check_one, cn, want_md5)
+        status_of[cn] = st
+        async with lock:
+            done += 1
+            if done % 4 == 0 or done == total:
+                pct = done * 100 // max(total, 1)
+                bar = "▓" * (pct // 10) + "░" * (10 - pct // 10)
+                try:
+                    await safe_edit_text(q, context,
+                        f"🔍 Проверяю ключи... {done}/{total}\n{bar} {pct}%")
+                except Exception:
+                    pass
+
+    await asyncio.gather(*(one(cn) for cn in check))
+    for cn in check:
+        {"has": has_key, "old": old_key, "no": no_key}.get(status_of.get(cn), errors).append(cn)
     lines = [f"🔑 <b>Статус HMAC ключей</b>\n",
-             f"✅ Есть: <b>{len(has_key)}</b>/{total}",
-             f"❌ Нет: <b>{len(no_key)}</b>",
-             f"⚠️ Ошибки: <b>{len(errors)}</b>\n"]
+             f"✅ Есть: <b>{len(has_key)}</b>/{len(check)} онлайн"]
+    if old_key:
+        lines.append(f"🔄 Старый ключ: <b>{len(old_key)}</b>")
+    lines.append(f"❌ Нет: <b>{len(no_key)}</b>")
+    if errors:
+        lines.append(f"⚠️ Не ответили по SSH: <b>{len(errors)}</b>")
+    if offline:
+        lines.append(f"📴 Оффлайн (не проверялись): <b>{len(offline)}</b>")
+    lines.append("")
+    if old_key:
+        lines.append(f"<b>Старый ключ:</b> {', '.join(old_key)}")
     if no_key:
         lines.append(f"<b>Без ключа:</b> {', '.join(no_key)}")
     if errors:
-        lines.append(f"<b>Ошибки:</b> {', '.join(errors)}")
+        lines.append(f"<b>Не ответили:</b> {', '.join(errors)}")
+    if offline:
+        lines.append(f"<b>Оффлайн:</b> {', '.join(offline)}")
     kb = []
-    # One button per router without a key — no need to touch all 45 to fix one.
-    for cn in no_key[:8]:
+    # One button per router without a (current) key — no need to touch all.
+    for cn in (old_key + no_key)[:8]:
         if len(f"hmac_deploy_one:{cn}") <= 64:
             kb.append([InlineKeyboardButton(f"🔑 Залить ключ: {cn}",
                                             callback_data=f"hmac_deploy_one:{cn}")])
