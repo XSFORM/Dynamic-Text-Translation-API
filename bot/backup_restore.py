@@ -37,15 +37,27 @@ TMP_STAGING_PREFIX = "/tmp/restore_staging_"
 EXCLUDE_PATHS = {
     "/root/.bash_history",
     "/root/.cache",
-    "/root/backups/.tmp",
-    "/root/monitor_bot/config.py",
+    "/root/.local",
+    "/root/snap",
+    "/root/backups",              # the archives themselves and key history
+    "/root/monitor_bot/config.py",  # bot token — must never be in a backup
+    "/root/monitor_bot/venv",     # rebuilt by the installer, tens of MB
+    "/root/monitor_bot/__pycache__",
 }
 
 EXCLUDE_SUFFIXES = {
     ".pyc",
     ".log",
     ".swp",
+    ".tar.gz",   # older backups lying around must not end up inside new ones
+    ".tgz",
+    ".zip",
 }
+
+# Per-key history copies made before every "change remote" (name.ovpn.bak_TS)
+EXCLUDE_CONTAINS = (
+    ".ovpn.bak_",
+)
 
 STRICT_PURGE = True            # удаляем всё лишнее в roots
 AUTO_REGEN_CRL = True
@@ -72,6 +84,10 @@ def is_excluded(path: str) -> bool:
         return True
     for suf in EXCLUDE_SUFFIXES:
         if norm.endswith(suf):
+            return True
+    base = os.path.basename(norm)
+    for part in EXCLUDE_CONTAINS:
+        if part in base:
             return True
     return False
 
@@ -201,13 +217,25 @@ def create_backup() -> str:
     os.makedirs(staging_dir, exist_ok=True)
     save_manifest(manifest, staging_dir)
 
-    with tarfile.open(archive_path, "w:gz") as tar:
-        tar.add(os.path.join(staging_dir, MANIFEST_NAME), arcname=MANIFEST_NAME)
-        for root in BACKUP_ROOTS:
-            if os.path.exists(root):
-                # arcname без ведущего /
-                tar.add(root, arcname=root.lstrip('/'))
-    shutil.rmtree(staging_dir, ignore_errors=True)
+    # Add exactly the files listed in the manifest. Adding whole roots with
+    # tar.add(root) ignored EXCLUDE_PATHS completely — config.py with the
+    # bot token, the venv, pip cache and even the archive being written
+    # (it lives under /root) all went in. The manifest is built by
+    # iter_files(), which applies the excludes, so it is the source of truth.
+    # Write to a temp name first so a half-written archive never looks real.
+    tmp_path = archive_path + ".part"
+    try:
+        with tarfile.open(tmp_path, "w:gz") as tar:
+            tar.add(os.path.join(staging_dir, MANIFEST_NAME), arcname=MANIFEST_NAME)
+            for f in manifest.get("files", []):
+                p = f["path"]
+                if os.path.lexists(p):
+                    tar.add(p, arcname=p.lstrip('/'), recursive=False)
+        os.replace(tmp_path, archive_path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        shutil.rmtree(staging_dir, ignore_errors=True)
     return archive_path
 
 # ---------- Diff ----------

@@ -2585,20 +2585,16 @@ def _restore_hidden_root_backup_stuff(moved: List[Tuple[str, str, str]]):
             print(f"[backup exclude] cannot restore {src}: {e}")
 
 def create_backup_in_root_excluding_archives() -> str:
-    moved = _temporarily_hide_root_backup_stuff()
-    try:
-        path = br_create_backup()
-        if not path or not os.path.exists(path):
-            raise RuntimeError("Backup creation failed (no path returned)")
-        dest = os.path.join("/root", os.path.basename(path))
-        if os.path.abspath(path) != os.path.abspath(dest):
-            if os.path.exists(dest): os.remove(dest)
-            shutil.move(path, dest)
-        else:
-            dest = path
-        return dest
-    finally:
-        _restore_hidden_root_backup_stuff(moved)
+    """Create an OpenVPN backup in /root/backups (BACKUP_OUTPUT_DIR).
+
+    The name is historical. It used to shuffle old archives out of /root,
+    build the backup and then move it INTO /root. Archives and /root/backups
+    are now excluded by backup_restore itself, so none of that is needed and
+    the backup stays where it belongs."""
+    path = br_create_backup()
+    if not path or not os.path.exists(path):
+        raise RuntimeError("Backup creation failed (no path returned)")
+    return path
 
 # =====================================================================
 #  OPENVPN — Bulk handlers (delete/send/enable/disable)
@@ -2975,6 +2971,28 @@ def replace_remote_line_in_text(text: str, new_host: str, new_port: str) -> str:
         lines.append(f"remote {new_host} {new_port}")
     return "\n".join(lines) + "\n"
 
+OVPN_HISTORY_DIR = "/root/backups/ovpn_history"
+OVPN_HISTORY_KEEP = 3
+
+
+def _ovpn_history_copy(path: str) -> None:
+    """Keep a copy of a key/template before it is rewritten.
+
+    Copies used to sit next to the keys in /root as name.ovpn.bak_TS — one
+    more per key on every remote change, never cleaned up. Now they go to
+    /root/backups/ovpn_history and only the last few per file are kept."""
+    os.makedirs(OVPN_HISTORY_DIR, exist_ok=True)
+    base = os.path.basename(path)
+    ts = datetime.now(timezone.utc).replace(tzinfo=None).strftime("%Y%m%d%H%M%S")
+    shutil.copy2(path, os.path.join(OVPN_HISTORY_DIR, f"{base}.bak_{ts}"))
+    old = sorted(glob.glob(os.path.join(OVPN_HISTORY_DIR, glob.escape(base) + ".bak_*")))
+    for p in old[:-OVPN_HISTORY_KEEP]:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
 def update_template_and_ovpn(new_host: str, new_port: str) -> Dict[str, int]:
     stats = {"template_updated": 0, "ovpn_updated": 0, "errors": 0}
     tpl = find_client_template_path()
@@ -2983,8 +3001,7 @@ def update_template_and_ovpn(new_host: str, new_port: str) -> Dict[str, int]:
             with open(tpl, "r") as f: old = f.read()
             new = replace_remote_line_in_text(old, new_host, new_port)
             if new != old:
-                backup = tpl + ".bak_" + datetime.now(timezone.utc).replace(tzinfo=None).strftime("%Y%m%d%H%M%S")
-                shutil.copy2(tpl, backup)
+                _ovpn_history_copy(tpl)
                 with open(tpl, "w") as f: f.write(new)
                 stats["template_updated"] = 1
         except Exception as e:
@@ -2997,8 +3014,7 @@ def update_template_and_ovpn(new_host: str, new_port: str) -> Dict[str, int]:
             with open(path, "r") as fr: oldc = fr.read()
             newc = replace_remote_line_in_text(oldc, new_host, new_port)
             if newc != oldc:
-                bak = path + ".bak_" + datetime.now(timezone.utc).replace(tzinfo=None).strftime("%Y%m%d%H%M%S")
-                shutil.copy2(path, bak)
+                _ovpn_history_copy(path)
                 with open(path, "w") as fw: fw.write(newc)
                 stats["ovpn_updated"] += 1
         except Exception as e:
@@ -3855,7 +3871,12 @@ async def alert_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #  OPENVPN — Backup / Restore UI
 # =====================================================================
 def list_backups() -> List[str]:
-    return sorted([os.path.basename(p) for p in glob.glob("/root/openvpn_full_backup_*.tar.gz")], reverse=True)
+    """Backups from /root/backups, plus older ones still lying in /root."""
+    names = set()
+    for d in (BACKUP_OUTPUT_DIR, "/root"):
+        for p in glob.glob(os.path.join(d, "openvpn_full_backup_*.tar.gz")):
+            names.add(os.path.basename(p))
+    return sorted(names, reverse=True)
 
 async def perform_backup_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
@@ -3872,8 +3893,9 @@ async def perform_backup_and_send(update: Update, context: ContextTypes.DEFAULT_
         await update.callback_query.edit_message_text(f"Ошибка бэкапа: {e}")
 
 async def send_backup_file(update: Update, context: ContextTypes.DEFAULT_TYPE, fname: str):
-    full = os.path.join("/root", fname)
-    if not os.path.exists(full):
+    fname = os.path.basename(fname)
+    full = locate_backup(fname)
+    if not full:
         await safe_edit_text(update.callback_query, context, "Файл не найден."); return
     with open(full, "rb") as f:
         await context.bot.send_document(chat_id=update.effective_chat.id, document=InputFile(f), filename=fname)
@@ -3887,13 +3909,20 @@ async def show_backup_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_edit_text(update.callback_query, context, "Список бэкапов:", reply_markup=InlineKeyboardMarkup(kb))
 
 async def show_backup_info(update: Update, context: ContextTypes.DEFAULT_TYPE, fname: str):
-    full = os.path.join("/root", fname)
+    fname = os.path.basename(fname)
+    full = locate_backup(fname)
+    if not full:
+        await safe_edit_text(update.callback_query, context, "Файл не найден."); return
     staging = f"/tmp/info_{int(time.time())}"
     os.makedirs(staging, exist_ok=True)
     try:
         import tarfile
+        # Only the manifest is needed here — no point unpacking the whole archive.
         with tarfile.open(full, "r:gz") as tar:
-            tar.extractall(staging)
+            try:
+                tar.extract(MANIFEST_NAME, staging)
+            except KeyError:
+                pass
         manifest_path = os.path.join(staging, MANIFEST_NAME)
         if not os.path.exists(manifest_path):
             await safe_edit_text(update.callback_query, context, "manifest.json отсутствует."); return
@@ -3962,8 +3991,9 @@ async def restore_apply(update: Update, context: ContextTypes.DEFAULT_TYPE, fnam
         await safe_edit_text(update.callback_query, context, f"Ошибка restore: {e}\n{tb[-400:]}", parse_mode="HTML")
 
 async def backup_delete_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE, fname: str):
-    full = os.path.join("/root", fname)
-    if not os.path.exists(full):
+    fname = os.path.basename(fname)
+    full = locate_backup(fname)
+    if not full:
         await safe_edit_text(update.callback_query, context, "Файл не найден."); return
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Да, удалить", callback_data=f"backup_delete_confirm_{fname}")],
@@ -3972,9 +4002,10 @@ async def backup_delete_prompt(update: Update, context: ContextTypes.DEFAULT_TYP
     await safe_edit_text(update.callback_query, context, f"Удалить бэкап <b>{fname}</b>?", parse_mode="HTML", reply_markup=kb)
 
 async def backup_delete_apply(update: Update, context: ContextTypes.DEFAULT_TYPE, fname: str):
-    full = os.path.join("/root", fname)
+    fname = os.path.basename(fname)
+    full = locate_backup(fname)
     try:
-        if os.path.exists(full):
+        if full and fname.startswith("openvpn_full_backup_") and os.path.exists(full):
             os.remove(full)
             await safe_edit_text(update.callback_query, context, "🗑️ Бэкап удалён.")
             await show_backup_list(update, context)
@@ -12394,7 +12425,9 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not fname.endswith(".tar.gz") and not fname.endswith(".tgz"):
             await update.message.reply_text("Ожидается файл .tar.gz")
             return
-        dest = os.path.join("/root", fname)
+        fname = os.path.basename(fname)
+        os.makedirs(BACKUP_OUTPUT_DIR, exist_ok=True)
+        dest = os.path.join(BACKUP_OUTPUT_DIR, fname)
         await update.message.reply_text(f"Скачиваю {fname}...")
         tg_file = await context.bot.get_file(doc.file_id)
         await tg_file.download_to_drive(dest)
