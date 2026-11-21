@@ -1502,6 +1502,102 @@ def _tunnel_cleanup_port(port: int) -> Tuple[bool, str]:
     )
 
 
+# ---------------------------------------------------------------------
+#  Tunnel watchdog — bring dead tunnels back without anyone noticing first
+# ---------------------------------------------------------------------
+# A router can come back online (internet paid again, ISP outage over)
+# with tunnel.sh no longer running. Autostart only fires on boot, so the
+# tunnel stays down until someone tries to open the web panel. Here: one
+# SSH call to the tunnel server lists the ports that are listening; any
+# online router with a deployed tunnel whose port is missing gets its
+# tunnel started over SSH.
+TUNNEL_WATCH_EVERY_S = 30 * 60
+
+_TUNNEL_START_CMD = (
+    "grep -q 'tunnel.sh' /etc/storage/started_script.sh 2>/dev/null || "
+    "{ echo 'sh /etc/storage/tunnel.sh &' >> /etc/storage/started_script.sh; "
+    "mtd_storage.sh save >/dev/null 2>&1; echo AUTOSTART_FIXED; }; "
+    "if ps | grep -q '[t]unnel.sh'; then echo RUNNING; "
+    "else rm -f /tmp/tunnel.pid; sh /etc/storage/tunnel.sh </dev/null >/dev/null 2>&1 & echo STARTED; fi"
+)
+
+
+def _tunnel_listening_ports():
+    """Ports currently listening on the tunnel server, or None on failure."""
+    ts = load_tunnel_server()
+    if not ts.get("ip") or not os.path.exists(TUNNEL_KEY_FILE):
+        return None
+    ok, out = ssh_exec_key(ts["ip"], int(ts.get("ssh_port", 22)),
+                           ts.get("ssh_user", "root"), TUNNEL_KEY_FILE,
+                           "ss -ltn 2>/dev/null || netstat -ltn 2>/dev/null")
+    if not ok:
+        return None
+    ports = set()
+    for m in re.finditer(r"[:\]](\d{2,5})\s", out):
+        ports.add(int(m.group(1)))
+    return ports
+
+
+async def tunnel_watchdog(app):
+    """Every 30 min: restart tunnels of online routers whose port is not up."""
+    await asyncio.sleep(300)
+    reported_fail = set()
+    stuck_count = {}   # cn -> passes in a row: tunnel.sh running, port still down
+    reported_stuck = set()
+    while True:
+        try:
+            routers = load_routers()
+            online = get_online_clients() | {cn for cn, v in routers.items()
+                                             if v.get("vpn_type") == "pptp"}
+            want = {cn: int(v["tunnel_port"]) for cn, v in routers.items()
+                    if v.get("tunnel_deployed") and v.get("tunnel_port") and cn in online}
+            listening = await asyncio.to_thread(_tunnel_listening_ports) if want else None
+            if listening is not None:
+                missing = [cn for cn, port in want.items() if port not in listening]
+                started, autostart_fixed, failed = [], [], []
+                for cn in sorted(missing, key=_natural_key):
+                    try:
+                        ok, out = await asyncio.to_thread(router_ssh_exec, cn, _TUNNEL_START_CMD, 25)
+                    except Exception as e:
+                        ok, out = False, str(e)
+                    if ok and "AUTOSTART_FIXED" in out:
+                        autostart_fixed.append(cn)
+                    if ok and "STARTED" in out:
+                        started.append(cn)
+                    elif ok and "RUNNING" in out:
+                        # Running but no port: may just be between retries
+                        # (30 s). Two passes in a row means it really can't
+                        # connect — wrong key, port taken, server refusing.
+                        stuck_count[cn] = stuck_count.get(cn, 0) + 1
+                    else:
+                        failed.append(cn)
+                stuck_count = {cn: n for cn, n in stuck_count.items() if cn in missing}
+                stuck = [cn for cn, n in stuck_count.items() if n >= 2]
+                new_stuck = [cn for cn in stuck if cn not in reported_stuck]
+                reported_stuck = set(stuck)
+                new_fail = [cn for cn in failed if cn not in reported_fail]
+                reported_fail = {cn for cn in reported_fail if cn in missing} | set(failed)
+                if started or new_fail or new_stuck:
+                    lines = ["🔗 <b>Сторож туннелей</b>"]
+                    if started:
+                        lines.append(f"▶️ Туннель был не запущен, поднял: "
+                                     f"{', '.join(escape(c) for c in started)}")
+                    if autostart_fixed:
+                        lines.append(f"🔧 Заодно прописал автозапуск: "
+                                     f"{', '.join(escape(c) for c in autostart_fixed)}")
+                    if new_fail:
+                        lines.append(f"❌ Не смог зайти по SSH: "
+                                     f"{', '.join(escape(c) for c in new_fail)}")
+                    if new_stuck:
+                        lines.append(f"⚠️ Туннель запущен, но не подключается уже час: "
+                                     f"{', '.join(escape(c) for c in new_stuck)} — "
+                                     f"проверь ключ на туннельном сервере или «Залить на роутер»")
+                    await app.bot.send_message(ADMIN_ID, "\n".join(lines), parse_mode="HTML")
+        except Exception as e:
+            logger.warning("tunnel_watchdog: %s", e)
+        await asyncio.sleep(TUNNEL_WATCH_EVERY_S)
+
+
 async def rtunnel_ports(update: Update, context: ContextTypes.DEFAULT_TYPE, show_filter: str = "all"):
     """Show tunnel port assignments for all routers."""
     q = update.callback_query
@@ -1641,13 +1737,16 @@ async def rtunnel_deploy_one(update: Update, context: ContextTypes.DEFAULT_TYPE,
     ssh_port = ts.get("ssh_port", 22)
     ssh_user = ts.get("ssh_user", "root")
 
-    # Build tunnel.sh script
+    # Build tunnel.sh script.
+    # The PID-file check looks at /proc/PID/cmdline, not just "is PID alive":
+    # after a long uptime the old number can belong to an unrelated process,
+    # and tunnel.sh would then exit silently forever (seen on merjen-10).
     tunnel_sh = (
         '#!/bin/sh\n'
         'PIDFILE="/tmp/tunnel.pid"\n'
         'if [ -f "$PIDFILE" ]; then\n'
         '  OLDPID=$(cat "$PIDFILE" 2>/dev/null)\n'
-        '  if [ -n "$OLDPID" ] && kill -0 "$OLDPID" 2>/dev/null; then\n'
+        '  if [ -n "$OLDPID" ] && grep -q tunnel.sh /proc/$OLDPID/cmdline 2>/dev/null; then\n'
         '    exit 0\n'
         '  fi\n'
         'fi\n'
@@ -1822,7 +1921,7 @@ async def rtunnel_deploy_all(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 'PIDFILE="/tmp/tunnel.pid"\n'
                 'if [ -f "$PIDFILE" ]; then\n'
                 '  OLDPID=$(cat "$PIDFILE" 2>/dev/null)\n'
-                '  if [ -n "$OLDPID" ] && kill -0 "$OLDPID" 2>/dev/null; then\n'
+                '  if [ -n "$OLDPID" ] && grep -q tunnel.sh /proc/$OLDPID/cmdline 2>/dev/null; then\n'
                 '    exit 0\n'
                 '  fi\n'
                 'fi\n'
@@ -17823,6 +17922,7 @@ def main():
     loop.create_task(domain_monitor(app))
     loop.create_task(lag_notify_monitor(app))
     loop.create_task(time_file_writer(app))
+    loop.create_task(tunnel_watchdog(app))
     app.run_polling()
 
 if __name__ == '__main__':
